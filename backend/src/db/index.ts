@@ -133,7 +133,9 @@ const LOG_QUERIES = process.env.LOG_QUERIES === 'true';
  *    '2026-10-07 …' 截成 2026（探针实测），文本参数必须原样保留。
  * 3. `= ANY($n)` → `IN (SELECT value FROM json_each(?))`（配合数组参数 JSON 化）
  * 4. `NOW()` → `CURRENT_TIMESTAMP`
- * 5. `NOW() ± INTERVAL 'N unit'` → `datetime('now', '±N unit')`
+ * 5. `<expr> ± INTERVAL 'N unit'` → `datetime(<expr>, '±N unit')`——NOW()/CURRENT_TIMESTAMP
+ *    专属规则先行，通用规则兜底 `?::timestamptz - INTERVAL '6 hours'` 这类参数/列运算
+ *    （v2.30 用药剂量查询，冒烟实测漏网）
  * 6. `ILIKE` → `LIKE`（SQLite LIKE 对 ASCII 默认不区分大小写，语义一致）
  * 7. `date_trunc('unit', expr)` / `to_char(expr, 'YYYY-MM-DD')` → strftime 系列
  *
@@ -148,11 +150,20 @@ const PG_TEXTISH_CAST_TYPES = String.raw`text|boolean|bool|jsonb|json|timestampt
 
 function convertPgIntervalToSqlite(sql: string): string {
   // NOW() / CURRENT_TIMESTAMP ± INTERVAL 'N unit' → datetime('now', '±N unit')
-  return sql.replace(
+  let out = sql.replace(
     /(?:NOW\(\)|CURRENT_TIMESTAMP)\s*(-|\+)\s*INTERVAL\s+'(\d+)\s*(second|minute|hour|day|week|month|year)s?'/gi,
     (_m, sign: string, n: string, unit: string) =>
       `datetime('now', '${sign === '-' ? '-' : '+'}${n} ${unit.toLowerCase()}${Number(n) === 1 ? '' : 's'}')`,
   );
+
+  // 通用兜底：参数/列 ± INTERVAL（如 `?::timestamptz - interval '6 hours'`——cast 已在
+  // 前面被剥成 ?）。expr 只匹配单 token 形态（?、col、tbl.col）；复杂表达式需手工改写。
+  out = out.replace(
+    /(\?|[\w."]+(?:\(\))?)\s*(-|\+)\s*INTERVAL\s+'(\d+)\s*(second|minute|hour|day|week|month|year)s?'/gi,
+    (_m, expr: string, sign: string, n: string, unit: string) =>
+      `datetime(${expr}, '${sign === '-' ? '-' : '+'}${n} ${unit.toLowerCase()}${Number(n) === 1 ? '' : 's'}')`,
+  );
+  return out;
 }
 
 /**

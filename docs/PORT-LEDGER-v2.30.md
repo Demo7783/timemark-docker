@@ -73,7 +73,7 @@
   - scheduler.ts 新增：digest daily/weekly（每 15 分钟探测，isDigestDue+同期号查重幂等）+ agent-scheduler-tick（每 10 分钟，CAS+幂等键防重）——vercel 外部 cron 职责内化；agent worker drain 留 HTTP 端点（无独立服务函数，避免改上游路由文件）
   - 三端 build 全绿（shared tsc / frontend vite 2.27s / backend tsc）
 - [x] D 迁移 v34→v81 SQLite 化 ✅（代理第三次执行成功）：migrate.ts 重写 2608 行（docker 旧结构 + v2→v33 原样 + 48 条翻译 + tryExec 辅助 + PROFILE_AWARE_TABLES）；probe-migrate-chain.mjs **首轮 ALL PASS**（MAX=81、14 关键表、totp_recovery_codes/digest_daily_enabled 列、零 "Migration failed"）；tsc 0 错误。关键翻译决策：`UPDATE...FROM`（SQLite 3.33+ 原生）、v41 补 FK 以「新链路无悬挂值+回填」等价、v53/57 pg_trgm+pgvector 整条删（占位保链号）、v54 行锁剥除（单连接，lease_token 保并发）、v70 CHECK 建表即终态（SQLite 无 DROP CONSTRAINT）、migrateEncryptionKey 合入上游 session_data 守卫。**附带修复**：v4/v5/v10 裸 ALTER 在新库必 duplicate column（旧文件一直失败但无实害）照 v32 先例移 tryExec。**退役 26 个 migration-vNN 测试**（vercel PG 方言静态标记断言，对 SQLite 翻译不适用；探针=真引擎真链路端到端，覆盖更强）。**适配 4 个**：migration-chain（78 版/缺口 66/68/v15 已分配）、migration-selfcheck（同上）、search-semantic（钉 v53 占位+无 vector_dims）、trigger-log-persistence（钉 v51 占位+无 ALTER COLUMN TYPE）
-- [ ] E 测试语料分诊（进行中）：
+- [x] E 测试语料分诊 ✅ **最终：后端 1680/1681（0 失败，含 1 skipped）+ 前端 319/319 + tsc 0**：
   - **前端 319/319 全绿**（零修复，React19/Tailwind4 换装成立）
   - 后端首轮 1749/1813（96.5%）——mock 层语料基本直接可用
   - 修复：db 层补**非参数位 cast**（`COUNT(*)::int`/`col::text`）与 **jsonb_*→json_*** 转换；db 层补**读取侧 JSON 自动解析**（PG jsonb 经 node-pg 自动 parse，sql.js 返回 TEXT——v2.30 服务直接 Array.isArray 会拿不到数组，calendar-sync 等 35 个失败同根因）
@@ -81,8 +81,9 @@
   - 退役 3 个断言旧轮换机制的测试（session-refresh/auth-refresh-cookie/auth-middleware-token-type）——v2.30 刷新机制重构（typ 闸门+renewRememberedSession），上游 session-renewal/jwt-token-type 测试已覆盖新契约
   - docker 加固在 v2.30 的存活性核对：originMatchesHost（LAN 同 Host）上游已有；allowed-origins 恢复 docker 清洗语义（含 `*` 条目剔除，v2.30 会把混合列表变凭据全放行）；https-enforcement/webauthn-config/security-headers 恢复 docker 版（v2.30 直连 HTTP 放行/转发头不校验/HSTS 无协议门控会复现 LAN 白屏）；app.ts httpsEnforcement 改回全局挂载；evaluateIpBlock 补 ::1/::ffff:127.0.0.1 回环族短路（v2.30 只认字面 127.0.0.1）
   - **子代理发现的疑似上游 bug**：①CalDAV 接受 3xx 响应体（已修：>=300 continue，恢复 v2.16 拒绝重定向）②URL userinfo 凭据可能进 errors/日志（v2.30 isSafePublicUrl 不查 userinfo，暂记账）③parseIcsEvents 接受不可能日期 20260230（上游宽容设计，暂记账）
+- [x] F 新 SQLite 库 boot 冒烟 ✅（backend/scripts/probe-boot-smoke.mjs **12/12 PASS**）：冷启动迁移链到 v81、health version 2.30.0、管理员创建、Cookie 登录（v2.30 authMode='cookie'，token 走 HttpOnly Set-Cookie）、事件 CRUD（列表直接返回数组）、渠道目录 69 含 whatsapp/nostr、/api/v1 坏 token 401、digest cron 守卫 401、storage.local 日志、调度器 11 任务。**冒烟抓到一个转换器真 bug**：`<param> ± INTERVAL` 通用形式漏网（用药剂量 `?::timestamptz - interval '6 hours'` 语法错）→ 加通用兜底规则（NOW 专属规则先行），队列探针回归通过。**脚本侧教训**：Windows shell:true 下 kill 只杀 cmd.exe 不杀 node 孙进程——8791 残留旧服制造假 500/假缺日志，必须 taskkill /T /F 杀进程树。
 - [x] G 渠道资产：8 个 docker 独有渠道接入 v2.30 注册表（nostr 复用上游保留条目 + 7 插件渠道回植，wechats-openclaw 维持休眠）；**isSupportedChannel 运行时区分**（isServerlessRuntime() 动态判断，VERCEL 才过滤插件渠道）；test-connection 补 imessage（BlueBubbles /api/v1/server/info）；channel-integrity 测试 (d)/(f) 改运行时感知（69=61+8）
-- [ ] H 版本 2.30.0 + CHANGELOG + README + Docker 镜像构建 + push
+- [x] H 版本 2.30.0 + CHANGELOG + README + DEPLOYMENT ✅（Docker 镜像构建待 CI；push 见下）
 
 ## 决策记录
 
