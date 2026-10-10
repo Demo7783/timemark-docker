@@ -3,7 +3,7 @@
  * 云端部署仅支持 webhook / token 类 HTTP 渠道
  */
 
-import { isSupportedChannel } from './supported-channels.js';
+import { isSupportedChannel, IS_SERVERLESS_RUNTIME } from './supported-channels.js';
 import { CHANNEL_METADATA } from './channels.metadata.js';
 
 export type ChannelConfigMethod = 'webhook' | 'token' | 'plugin';
@@ -1761,11 +1761,194 @@ const CHANNEL_CATEGORY_MAP: Record<string, ChannelCategory> = {
   homeassistant: 'smart', apprise: 'smart', awtrix: 'smart', generic_webhook: 'smart',
   // 自动化平台
   ifttt: 'automation', notifiarr: 'automation',
+  // docker 独有插件渠道（自托管常驻进程）
+  nostr: 'im', wechat_personal: 'im', whatsapp: 'im', qq_bot: 'im', signal: 'im',
+  imessage: 'im', zalo: 'im', clawbot: 'im',
 };
 
 export function getChannelCategory(id: string): ChannelCategory {
   return CHANNEL_CATEGORY_MAP[id] ?? 'other';
 }
+
+// ============ docker 独有插件渠道（自托管常驻进程可用，vercel 已删） ============
+// 来源：docker v2.16 渠道目录（双语/分类等元数据由 applyChannelMetadata 统一注入）。
+// wechat-openclaw 服务文件保留但历史上无注册表条目，维持休眠。
+
+const dockerPluginChannels: ChannelTemplate[] = [
+  {
+    id: 'wechat_personal',
+    name: '微信个人号',
+    description: '微信个人号消息推送（扫码登录）',
+    icon: 'Smartphone',
+    configMethod: 'plugin',
+    isBuiltIn: true,
+    pluginPackage: 'wechaty',
+    fields: [
+      {
+        name: 'session_data',
+        label: '认证会话',
+        type: 'textarea',
+        required: false,
+        description: '扫码登录后自动填充的会话数据'
+      }
+    ],
+    docsUrl: 'https://wechaty.js.org/'
+  },
+  {
+    id: 'whatsapp',
+    name: 'WhatsApp',
+    description: 'WhatsApp 消息推送（扫码配对）',
+    icon: 'Phone',
+    configMethod: 'plugin',
+    isBuiltIn: true,
+    pluginPackage: '@whiskeysockets/baileys',
+    fields: [
+      {
+        name: 'session_data',
+        label: '认证会话',
+        type: 'textarea',
+        required: false,
+        description: '扫码配对后自动填充的会话数据'
+      }
+    ],
+    docsUrl: 'https://github.com/WhiskeySockets/Baileys'
+  },
+  {
+    id: 'qq_bot',
+    name: 'QQ Bot',
+    description: 'QQ 机器人消息推送（扫码登录）',
+    icon: 'MessageCircle',
+    configMethod: 'plugin',
+    isBuiltIn: true,
+    pluginPackage: 'oicq',
+    fields: [
+      {
+        name: 'token',
+        label: 'QQ 号码',
+        type: 'text',
+        required: true,
+        placeholder: '123456789',
+        description: '机器人的 QQ 号码'
+      },
+      {
+        name: 'session_data',
+        label: '认证会话',
+        type: 'textarea',
+        required: false,
+        description: '扫码登录后自动填充的会话数据'
+      }
+    ],
+    docsUrl: 'https://oicqjs.github.io/oicq/'
+  },
+  {
+    id: 'signal',
+    name: 'Signal',
+    description: 'Signal 消息推送（需安装 signal-cli）',
+    icon: 'Shield',
+    configMethod: 'plugin',
+    isBuiltIn: true,
+    pluginPackage: 'signal-cli',
+    pluginInstallCommand: '# 需安装 signal-cli 命令行工具',
+    fields: [
+      {
+        name: 'token',
+        label: '电话号码',
+        type: 'text',
+        required: true,
+        placeholder: '+86138xxxxxxxx',
+        description: 'Signal 注册的手机号码'
+      },
+      {
+        name: 'session_data',
+        label: '认证会话',
+        type: 'textarea',
+        required: false,
+        description: '验证后自动填充的会话数据'
+      }
+    ],
+    docsUrl: 'https://github.com/AsamK/signal-cli'
+  },
+  {
+    id: 'imessage',
+    name: 'iMessage',
+    description: 'iMessage 消息推送（需 BlueBubbles 服务器）',
+    icon: 'MessageSquare',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'webhook',
+        label: 'BlueBubbles 服务器 URL',
+        type: 'text',
+        required: true,
+        placeholder: 'https://your-bluebubbles-server.com',
+        description: 'BlueBubbles 服务器地址'
+      },
+      {
+        name: 'token',
+        label: 'API 密钥',
+        type: 'password',
+        required: true,
+        description: 'BlueBubbles 服务器的 API 密钥'
+      },
+      {
+        name: 'chat_id',
+        label: '接收人 ID',
+        type: 'text',
+        required: true,
+        placeholder: 'iMessage 地址或电话号码',
+        description: 'iMessage 接收人地址（邮箱或电话号码）'
+      }
+    ],
+    docsUrl: 'https://bluebubbles.app/'
+  },
+  {
+    id: 'zalo',
+    name: 'Zalo',
+    description: 'Zalo 消息推送（越南版微信）',
+    icon: 'MessageCircle',
+    configMethod: 'plugin',
+    isBuiltIn: true,
+    pluginPackage: 'zalo-messenger',
+    pluginInstallCommand: 'npm install axios',
+    fields: [
+      {
+        name: 'token',
+        label: 'Access Token',
+        type: 'password',
+        required: true,
+        description: 'Zalo OA 后台获取的 Access Token'
+      },
+      {
+        name: 'session_data',
+        label: '认证会话',
+        type: 'textarea',
+        required: false,
+        description: '扫码登录后自动填充的会话数据'
+      }
+    ],
+    docsUrl: 'https://developers.zalo.com/'
+  },
+  {
+    id: 'clawbot',
+    name: '微信龙虾 (ClawBot)',
+    description: '微信龙虾机器人消息推送（扫码登录）',
+    icon: 'Bot',
+    configMethod: 'plugin',
+    isBuiltIn: true,
+    pluginPackage: 'ilink-clawbot-api',
+    fields: [
+      {
+        name: 'session_data',
+        label: '认证会话',
+        type: 'textarea',
+        required: false,
+        description: '扫码登录后自动填充的会话数据'
+      }
+    ],
+    docsUrl: 'https://github.com/nicepkg/wechat-clawbot'
+  }
+];
 
 // ============ All Channel Templates ============
 
@@ -1791,13 +1974,19 @@ function applyChannelMetadata(template: ChannelTemplate): ChannelTemplate {
   };
 }
 
+// nostr 在 v2.30 仅 serverless 装配时排除；docker 常驻进程可用，插件渠道同理由
+// isSupportedChannel 在运行时区分（serverless 过滤 / docker 放行）。
 export const allChannelTemplates: ChannelTemplate[] = [
   ...webhookChannels,
-  ...tokenChannels.filter((c) => c.id !== 'nostr'),
+  ...(IS_SERVERLESS_RUNTIME ? tokenChannels.filter((c) => c.id !== 'nostr') : tokenChannels),
+  ...(IS_SERVERLESS_RUNTIME ? [] : dockerPluginChannels),
 ].map(applyChannelMetadata);
 
 export function getSupportedChannelTemplates(): ChannelTemplate[] {
-  return allChannelTemplates.filter((c) => c.configMethod !== 'plugin' && isSupportedChannel(c.id));
+  // docker：插件渠道（configMethod 'plugin'）在常驻进程上受支持
+  return allChannelTemplates.filter(
+    (c) => (IS_SERVERLESS_RUNTIME ? c.configMethod !== 'plugin' : true) && isSupportedChannel(c.id),
+  );
 }
 
 export function getSupportedChannelsByMethod(method: ChannelConfigMethod): ChannelTemplate[] {

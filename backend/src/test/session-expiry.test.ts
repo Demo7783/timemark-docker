@@ -3,8 +3,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({ query: vi.fn() }));
 
-vi.mock('../db/index.js', () => ({ query: mocks.query }));
+vi.mock('../db/index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../db/index.js')>();
+  return { ...actual, query: mocks.query };
+});
 
+import { convertPgToSqliteInner } from '../db/index.js';
 import { getSessionByToken } from '../services/session.service.js';
 
 describe('session expiry checks', () => {
@@ -24,11 +28,14 @@ describe('session expiry checks', () => {
     )`);
     db.run(
       'INSERT INTO sessions (user_id, token, device_fingerprint, is_trusted, expires_at, refresh_token_id) VALUES (?, ?, ?, ?, ?, ?)',
-      [7, 'expired-session', 'device', 0, `${new Date().toISOString().slice(0, 10)}T00:00:00.000Z`, 'refresh-current'],
+      // expires_at 走 db 层生产同款空格格式（UTC）：raw db.run 不经过 query() 的
+      // 参数归一化，插 ISO-T 会因 'T' > ' ' 在字典序上永不过期
+      [7, 'expired-session', 'device', 0, new Date(Date.now() - 3600_000).toISOString().replace('T', ' ').replace(/Z$/, ''), 'refresh-current'],
     );
 
     mocks.query.mockImplementation(async (sql: string, params: unknown[] = []) => {
-      const sqliteSql = sql.replace(/\$\d+/g, '?');
+      // v2.30 服务层 SQL 是 PG 方言（NOW() 等）——mock 用与生产一致的中心转换器
+      const sqliteSql = convertPgToSqliteInner(sql);
       if (/^\s*SELECT\b/i.test(sql)) {
         const statement = db.prepare(sqliteSql);
         statement.bind(params);

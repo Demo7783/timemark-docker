@@ -425,6 +425,32 @@ async function testTokenChannel(
     
     case 'nostr':
       return await testNostrChannel(webhook!, token);
+
+    // docker 独有：iMessage via BlueBubbles（token 型：服务器地址 + API 密钥）
+    case 'imessage': {
+      if (!webhook || !token) {
+        return { success: false, message: 'BlueBubbles 服务器地址与 API 密钥都不能为空' };
+      }
+      const startImsg = Date.now();
+      try {
+        const res = await axios.get(`${webhook.replace(/\/+$/, '')}/api/v1/server/info`, {
+          params: { password: token },
+          timeout: 10000,
+        });
+        const latency = Date.now() - startImsg;
+        if (res.status === 200) {
+          return { success: true, message: 'BlueBubbles 服务器连接成功', latency };
+        }
+        return { success: false, message: `HTTP ${res.status}`, latency };
+      } catch (error: any) {
+        const latency = Date.now() - startImsg;
+        if (error.response?.status === 401) {
+          return { success: false, message: 'API 密钥无效', latency };
+        }
+        const diag = diagnoseError(error);
+        return { success: false, message: diag.message, latency, details: diag.details };
+      }
+    }
     
     case 'serverchan':
       return await testServerChanChannel(token);

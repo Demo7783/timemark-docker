@@ -42,6 +42,15 @@ import { sendZulipNotification } from './zulip.service.js';
 import { sendRocketChatNotification } from './rocketchat.service.js';
 import { sendFcmNotification } from './fcm.service.js';
 import { sendTwilioWhatsAppNotification } from './twilio-whatsapp.service.js';
+// docker 独有插件渠道（自托管常驻进程可用，vercel v2.17 清理时删除服务文件）
+import { sendNostrNotification } from './nostr.service.js';
+import { sendClawBotNotification } from './clawbot.service.js';
+import { sendNotification as sendWechatNotification } from './wechaty.service.js';
+import { sendNotification as sendWhatsappNotification } from './whatsapp.service.js';
+import { sendNotification as sendQQNotification } from './qqbot.service.js';
+import { sendNotification as sendSignalNotification } from './signal.service.js';
+import { sendNotification as sendZaloNotification } from './zalo.service.js';
+import { sendNotification as sendBlueBubblesNotification } from './bluebubbles.service.js';
 // v78 batch 3: WhatsApp Cloud API / Kook / Fanbook / Home Assistant
 import {
   sendWhatsAppCloudNotification,
@@ -297,6 +306,15 @@ export const channelToAccountType: Record<string, string> = {
   'messagebird': 'messagebird',
   'alertzy': 'alertzy',
   'awtrix': 'awtrix',
+  // docker 独有插件渠道（自托管常驻进程可用）
+  'nostr': 'nostr',
+  'wechat_personal': 'wechat_personal',
+  'whatsapp': 'whatsapp',
+  'qq_bot': 'qq_bot',
+  'signal': 'signal',
+  'imessage': 'imessage',
+  'zalo': 'zalo',
+  'clawbot': 'clawbot',
 };
 
 /**
@@ -370,6 +388,15 @@ export const DISPATCHABLE_CHANNELS = new Set<string>([
   'messagebird',
   'alertzy',
   'awtrix',
+  // docker 独有插件渠道（自托管常驻进程可用）
+  'nostr',
+  'wechat_personal',
+  'whatsapp',
+  'qq_bot',
+  'signal',
+  'imessage',
+  'zalo',
+  'clawbot',
   // Browser Web Push (checkbox 84) — VAPID, per-user subscriptions
   'web_push',
   // Legacy aliases（旧事件里可能仍存有这些渠道 ID）
@@ -449,6 +476,15 @@ export const FALLBACK_DISPATCHABLE_CHANNELS = new Set<string>([
   'messagebird',
   'alertzy',
   'awtrix',
+  // docker 独有插件渠道（自托管常驻进程可用）
+  'nostr',
+  'wechat_personal',
+  'whatsapp',
+  'qq_bot',
+  'signal',
+  'imessage',
+  'zalo',
+  'clawbot',
   // Browser Web Push (checkbox 84) — VAPID, per-user subscriptions
   'web_push',
   // Legacy aliases（旧事件里可能仍存有这些渠道 ID）
@@ -713,6 +749,33 @@ function getChannelConfigFromAccount(
         : null;
     case 'alertzy':
       return account.token ? { token: account.token } : null;
+
+    // docker 独有插件渠道（自托管常驻进程）
+    case 'nostr':
+      return (account.token && account.chat_id)
+        ? { token: account.token, chat_id: account.chat_id, webhook: account.webhook }
+        : null;
+    case 'wechat_personal':
+    case 'whatsapp':
+    case 'qq_bot':
+    case 'signal':
+    case 'clawbot':
+    case 'zalo':
+      return (account.session_data || account.token)
+        ? {
+            sessionData: account.session_data || account.token,
+            toUser: account.chat_id
+          }
+        : null;
+    // iMessage via BlueBubbles
+    case 'imessage':
+      return (account.webhook && account.token && account.chat_id)
+        ? {
+            webhook: account.webhook,
+            token: account.token,
+            chat_id: account.chat_id
+          }
+        : null;
 
     default:
       return null;
@@ -1598,6 +1661,49 @@ async function sendSingleChannel(ch: string, chConfig: any, mappedEvent: any, ev
     await sendTwitchNotification(mappedEvent, chConfig.webhook);
   else if (genericWebhookChannels.has(ch) && chConfig.webhook)
     await sendGenericWebhookNotification(mappedEvent, chConfig.webhook, ch);
+  // docker 独有插件渠道（自托管常驻进程可用，派发语义与 v2.16 一致）
+  else if (ch === 'nostr' && chConfig.token && chConfig.chat_id)
+    await sendNostrNotification(mappedEvent, chConfig.token, chConfig.chat_id, chConfig.webhook);
+  else if (ch === 'wechat_personal' && chConfig.sessionData) {
+    const toUser = chConfig.toUser || mappedEvent.personName || 'me';
+    await sendWechatNotification(mappedEvent, chConfig.sessionData, toUser);
+  }
+  else if (ch === 'whatsapp' && chConfig.sessionData) {
+    const toUser = chConfig.toUser || mappedEvent.personName || '';
+    await sendWhatsappNotification(mappedEvent, chConfig.sessionData, toUser);
+  }
+  else if (ch === 'qq_bot' && chConfig.sessionData) {
+    const toUser = chConfig.toUser || mappedEvent.personName || '';
+    await sendQQNotification(mappedEvent, chConfig.sessionData, toUser);
+  }
+  else if (ch === 'signal' && chConfig.sessionData) {
+    const toUser = chConfig.toUser || mappedEvent.personName || '';
+    await sendSignalNotification(mappedEvent, chConfig.sessionData, toUser);
+  }
+  else if (ch === 'zalo' && chConfig.sessionData) {
+    const toUser = chConfig.toUser || mappedEvent.personName || '';
+    await sendZaloNotification(mappedEvent, chConfig.sessionData, toUser);
+  }
+  else if (ch === 'imessage' && chConfig.webhook && chConfig.token && chConfig.chat_id) {
+    // iMessage via BlueBubbles
+    const sessionData = {
+      serverUrl: chConfig.webhook,
+      password: chConfig.token,
+      sessionId: 'direct'
+    };
+    await sendBlueBubblesNotification(mappedEvent, sessionData, chConfig.chat_id);
+  }
+  else if (ch === 'clawbot' && chConfig.sessionData) {
+    const sessionObj = typeof chConfig.sessionData === 'string'
+      ? JSON.parse(chConfig.sessionData)
+      : chConfig.sessionData;
+    const botToken = sessionObj.bot_token;
+    const baseUrl = sessionObj.baseUrl || 'https://ilinkai.weixin.qq.com';
+    const toUser = chConfig.toUser || '';
+    if (botToken && toUser) {
+      await sendClawBotNotification(mappedEvent, botToken, toUser, baseUrl);
+    }
+  }
   else throw new Error(`No valid config for channel ${ch}`);
 }
 

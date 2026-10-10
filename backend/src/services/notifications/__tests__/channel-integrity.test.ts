@@ -126,7 +126,18 @@ describe('channel integrity: supported channels are fully wired (checkbox 27)', 
   it('(d) UNSUPPORTED_CHANNEL_IDS and the supported templates never intersect', async () => {
     const supported = await loadSupportedTemplates();
     const overlap = supported.map((c) => c.id).filter((id) => UNSUPPORTED_CHANNEL_IDS.has(id));
-    expect(overlap, 'blocked channel ids must never be advertised as supported').toEqual([]);
+    // docker 变基：自托管常驻进程支持插件渠道（nostr/扫码系），它们同时留在
+    // UNSUPPORTED_CHANNEL_IDS 里作为 serverless 语义的记录。仅在 serverless
+    // 运行时要求不相交；docker 上允许这 8 个插件 id 同时出现在两侧。
+    const isServerless = !!process.env.VERCEL;
+    if (isServerless) {
+      expect(overlap, 'blocked channel ids must never be advertised as supported').toEqual([]);
+    } else {
+      const unexpected = overlap.filter(
+        (id) => !['nostr', 'wechat_personal', 'whatsapp', 'qq_bot', 'signal', 'imessage', 'zalo', 'clawbot'].includes(id),
+      );
+      expect(unexpected, 'non-plugin blocked ids must never be advertised as supported').toEqual([]);
+    }
   });
 
   it('(e) the two dispatch registries stay in sync with each other', async () => {
@@ -142,7 +153,9 @@ describe('channel integrity: supported channels are fully wired (checkbox 27)', 
 
   it('(f) the supported catalogue and the blocklist still have their authoritative sizes', async () => {
     const supported = await loadSupportedTemplates();
-    expect(supported.length, 'supported channel count').toBe(61);
+    // docker 变基：61（vercel v2.30 目录）+ 8（docker 独有插件渠道）= 69
+    const expectedCount = process.env.VERCEL ? 61 : 69;
+    expect(supported.length, 'supported channel count').toBe(expectedCount);
     expect(UNSUPPORTED_CHANNEL_IDS.size, 'blocked channel count').toBe(8);
   });
 });

@@ -42,9 +42,10 @@ const {
   };
 });
 
-const { warnMock, errorMock } = vi.hoisted(() => ({
+const { warnMock, errorMock, infoMock } = vi.hoisted(() => ({
   warnMock: vi.fn(),
   errorMock: vi.fn(),
+  infoMock: vi.fn(),
 }));
 
 vi.mock('@vercel/blob', () => ({
@@ -57,7 +58,7 @@ vi.mock('@vercel/blob', () => ({
 }));
 
 vi.mock('../utils/logger.js', () => ({
-  createLogger: () => ({ warn: warnMock, error: errorMock, info: vi.fn(), debug: vi.fn() }),
+  createLogger: () => ({ warn: warnMock, error: errorMock, info: infoMock, debug: vi.fn() }),
 }));
 
 import {
@@ -77,6 +78,7 @@ const ENV_KEYS = [
   'NODE_ENV',
   'VERCEL',
   'ATTACHMENT_LOCAL_DIR',
+  'ATTACHMENT_REQUIRE_BLOB',
 ] as const;
 
 const savedEnv: Record<string, string | undefined> = {};
@@ -91,11 +93,13 @@ beforeEach(() => {
   presignUrlMock.mockReset();
   warnMock.mockReset();
   errorMock.mockReset();
+  infoMock.mockReset();
 
   tempDir = mkdtempSync(join(tmpdir(), 'timemark-storage-'));
   process.env.ATTACHMENT_LOCAL_DIR = tempDir;
   delete process.env.BLOB_READ_WRITE_TOKEN;
   delete process.env.VERCEL;
+  delete process.env.ATTACHMENT_REQUIRE_BLOB;
   process.env.NODE_ENV = 'test';
 });
 
@@ -256,9 +260,13 @@ describe('local fallback (no token, non-production)', () => {
   });
 });
 
-describe('production without a token refuses instead of writing to disk', () => {
+// docker 变基：容器文件系统是持久卷，本地磁盘是合法生产存储（ATTACHMENT_LOCAL_DIR
+// 或 data 卷），不再复刻 vercel「生产无 token 拒写」的临时盘语义。需要旧语义时设
+// ATTACHMENT_REQUIRE_BLOB=1。启动日志相应降为 info；unconfigured 仅在显式要求时出现。
+describe('no token + ATTACHMENT_REQUIRE_BLOB=1 refuses instead of writing to disk', () => {
   it('resolves unconfigured and refuses every operation with StorageNotConfiguredError', async () => {
     process.env.NODE_ENV = 'production';
+    process.env.ATTACHMENT_REQUIRE_BLOB = '1';
     expect(resolveStorageMode()).toBe('unconfigured');
 
     const bytes = new Uint8Array([1, 2, 3]);
@@ -274,33 +282,32 @@ describe('production without a token refuses instead of writing to disk', () => 
     expect(readdirSync(tempDir)).toHaveLength(0);
   });
 
-  it('treats VERCEL as production even when NODE_ENV is not production', async () => {
-    process.env.NODE_ENV = 'test';
-    process.env.VERCEL = '1';
-    expect(resolveStorageMode()).toBe('unconfigured');
-    await expect(putObject(KEY, new Uint8Array([1]), 'application/pdf')).rejects.toBeInstanceOf(
-      StorageNotConfiguredError,
-    );
-    expect(readdirSync(tempDir)).toHaveLength(0);
+  it('defaults to local disk even in production (docker persistent volume)', async () => {
+    process.env.NODE_ENV = 'production';
+    expect(resolveStorageMode()).toBe('local');
+    await putObject(KEY, new Uint8Array([1, 2, 3]), 'application/pdf');
+    expect(readdirSync(tempDir)).toHaveLength(1);
   });
 });
 
 describe('startup status logging', () => {
-  it('warns loudly for the dev-only local fallback', () => {
+  it('logs info for the local-disk mode (docker 持久卷生产形态)', () => {
     logStorageStartupStatus();
-    expect(warnMock).toHaveBeenCalledTimes(1);
+    expect(infoMock).toHaveBeenCalledTimes(1);
     expect(errorMock).not.toHaveBeenCalled();
-    const [context, message] = warnMock.mock.calls[0];
-    expect(context.event).toBe('storage.local_fallback');
+    expect(warnMock).not.toHaveBeenCalled();
+    const [context, message] = infoMock.mock.calls[0];
+    expect(context.event).toBe('storage.local');
     expect(context.dir).toBe(tempDir);
     expect(String(message)).toContain('BLOB_READ_WRITE_TOKEN');
   });
 
-  it('logs an error (not just a warning) when production has no token', () => {
+  it('logs an error only when unconfigured is forced via ATTACHMENT_REQUIRE_BLOB', () => {
     process.env.NODE_ENV = 'production';
+    process.env.ATTACHMENT_REQUIRE_BLOB = '1';
     logStorageStartupStatus();
     expect(errorMock).toHaveBeenCalledTimes(1);
-    expect(warnMock).not.toHaveBeenCalled();
+    expect(infoMock).not.toHaveBeenCalled();
     expect(errorMock.mock.calls[0][0].event).toBe('storage.unconfigured');
   });
 

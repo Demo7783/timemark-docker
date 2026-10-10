@@ -227,6 +227,14 @@ export function convertPgToSqliteInner(text: string): string {
   sql = sql.replace(new RegExp(String.raw`\?::\s*(` + PG_CAST_TYPES + String.raw`)\b`, 'gi'),
     (_m, t: string) => `CAST(? AS ${t.toUpperCase()})`);
 
+  // 非参数位 cast（COUNT(*)::int、col::text 等）：标识符/闭括号/星号结尾的表达式。
+  // 文本类类型直接剥掉，数值类包 CAST——与参数位规则同一套语义。
+  const exprTail = String.raw`[\w*')\]]+`;
+  sql = sql.replace(new RegExp(String.raw`(` + exprTail + String.raw`)\s*::\s*(` + PG_TEXTISH_CAST_TYPES + String.raw`)\b`, 'gi'),
+    (_m, expr: string) => expr);
+  sql = sql.replace(new RegExp(String.raw`(` + exprTail + String.raw`)\s*::\s*(` + PG_CAST_TYPES + String.raw`)\b`, 'gi'),
+    (_m, expr: string, t: string) => `CAST(${expr} AS ${t.toUpperCase()})`);
+
   // = ANY(?) / <> ANY(?) / != ANY(?) → IN / NOT IN (SELECT value FROM json_each(?))
   sql = sql.replace(/(=|<>|!=)\s*ANY\s*\(\s*(\?)\s*\)/gi, (m, op: string, ph: string) => {
     if (op === '=') return `IN (SELECT value FROM json_each(${ph}))`;
@@ -255,6 +263,9 @@ export function convertPgToSqliteInner(text: string): string {
 
   // ILIKE → LIKE（SQLite 默认 ASCII 大小写不敏感）
   sql = sql.replace(/\bILIKE\b/g, 'LIKE');
+
+  // jsonb_* 函数族 → json_*（jsonb_array_length/jsonb_extract 等；SQLite json1 同名无 b）
+  sql = sql.replace(/\bjsonb_(array_length|extract|each|set|insert|object|agg|tuple)\b/gi, 'json_$1');
 
   return sql;
 }
@@ -298,9 +309,31 @@ function normalizeTimestampOut(value: unknown): unknown {
   return value;
 }
 
+/**
+ * 读取侧 JSON 自动解析（PG jsonb 语义补齐）：
+ * node-pg 会把 jsonb/json 列自动 parse 成 JS 对象/数组，sql.js 只返回原始 TEXT。
+ * v2.30 服务层大量直接 `Array.isArray(row.col)` / `row.col.map(...)`，不补这一层
+ * 会把 JSON 字符串当标量用（探针外最隐蔽的一类运行时崩坏）。
+ * 策略：形如 { 或 [ 开头且 JSON.parse 成功的字符串才解析，失败原样返回。
+ */
+function normalizeJsonOut(value: unknown): unknown {
+  if (typeof value === 'string') {
+    const head = value[0];
+    if ((head === '{' || head === '[') && value.length > 1) {
+      try {
+        return JSON.parse(value);
+      } catch {
+        return value;
+      }
+    }
+  }
+  return value;
+}
+
 function normalizeRow(row: Record<string, unknown>): Record<string, unknown> {
   for (const key of Object.keys(row)) {
-    row[key] = normalizeTimestampOut(row[key]);
+    const v = normalizeTimestampOut(row[key]);
+    row[key] = normalizeJsonOut(v);
   }
   return row;
 }
