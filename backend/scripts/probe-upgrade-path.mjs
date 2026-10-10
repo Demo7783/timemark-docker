@@ -85,4 +85,10 @@ const cj = await query(`SELECT name FROM sqlite_master WHERE type='table' AND na
 check('cron_job_status exists (v80)', cj.rows.length === 1);
 
 console.log(failures === 0 ? 'UPGRADE PATH OK' : `UPGRADE PATH FAILED: ${failures}`);
+
+// 自清理：物化的 v2.16 migrate.ts 副本是临时脚手架（Mimosa 会对磁盘上残留的
+// 历史 SQL 代码误报「命令注入」——其 db.exec() 是 sql.js 的 SQLite 语句执行，
+// 不是 shell；跑完即删，探针库一并清理保持工作区干净）
+rmSync(SCRATCH, { recursive: true, force: true });
+rmSync('./data/probe-upgrade.db', { force: true });
 process.exit(failures === 0 ? 0 : 1);
