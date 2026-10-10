@@ -60,6 +60,6 @@ describe('GET /api/channels/templates (checkbox 22)', () => {
     for (const id of [...NEW_CHANNEL_IDS, ...WAVE4_CHANNEL_IDS]) {
       expect(ids, `templates endpoint is missing ${id}`).toContain(id);
     }
-    expect(ids).toHaveLength(61);
+    expect(ids).toHaveLength(process.env.VERCEL ? 61 : 69); // docker: 61 + 8 独有插件渠道
   });
 });

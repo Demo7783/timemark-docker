@@ -67,12 +67,19 @@ function reminderEvent(accountIds: number[]) {
 
 describe('sendNotifications unresolved channel reporting (checkbox 12)', () => {
   beforeEach(() => {
+    // 本文件的语义锚点是 serverless 过滤（unsupported_channel）；docker 常驻进程
+    // 放行插件渠道，须显式模拟 VERCEL 运行时
+    process.env.VERCEL = '1';
     vi.mocked(getUserConfig).mockResolvedValue({});
     vi.mocked(getRelationshipMappings).mockResolvedValue([]);
     vi.mocked(getEventTemplate).mockResolvedValue(null);
     vi.mocked(getNotificationAccounts).mockResolvedValue([]);
     vi.mocked(query).mockClear();
     vi.mocked(axios.post).mockClear();
+  });
+
+  afterEach(() => {
+    delete process.env.VERCEL;
   });
 
   it('reports every requested channel and marks unresolved ones as no_configuration', async () => {

@@ -5,8 +5,12 @@ const { queryMock } = vi.hoisted(() => ({
   queryMock: vi.fn(),
 }));
 
-vi.mock('../db/index.js', () => ({ query: queryMock }));
+vi.mock('../db/index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../db/index.js')>();
+  return { ...actual, query: queryMock };
+});
 
+import { convertPgToSqliteInner } from '../db/index.js';
 import { evaluateIpBlock } from '../services/auth.service.js';
 
 let database: Database;
@@ -29,7 +33,8 @@ afterAll(() => database.close());
 beforeEach(() => {
   queryMock.mockReset();
   queryMock.mockImplementation(async (sql: string, params: unknown[] = []) => {
-    const statement = database.prepare(sql.replace(/\$\d+/g, '?'));
+    // v2.30 服务层 SQL 是 PG 方言（COUNT(*)::int / NOW() 等）——用生产同款转换器
+    const statement = database.prepare(convertPgToSqliteInner(sql));
     statement.bind(params as any);
     const rows: Record<string, unknown>[] = [];
     while (statement.step()) rows.push(statement.getAsObject());

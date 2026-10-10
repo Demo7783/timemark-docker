@@ -59,7 +59,8 @@ describe('application HTTPS enforcement', () => {
     const response = await request('/health');
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ status: 'ok' });
+    // v2.30 起 /health 返回 { status, platform }（docker 上 platform='local'）
+    expect(await response.json()).toMatchObject({ status: 'ok' });
   });
 
   it('allows CORS for an exact same-origin request', async () => {

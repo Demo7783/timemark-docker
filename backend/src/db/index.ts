@@ -227,9 +227,10 @@ export function convertPgToSqliteInner(text: string): string {
   sql = sql.replace(new RegExp(String.raw`\?::\s*(` + PG_CAST_TYPES + String.raw`)\b`, 'gi'),
     (_m, t: string) => `CAST(? AS ${t.toUpperCase()})`);
 
-  // 非参数位 cast（COUNT(*)::int、col::text 等）：标识符/闭括号/星号结尾的表达式。
+  // 非参数位 cast（COUNT(*)::int、fn(col)::text、col::text 等）。
   // 文本类类型直接剥掉，数值类包 CAST——与参数位规则同一套语义。
-  const exprTail = String.raw`[\w*')\]]+`;
+  // 表达式尾部三种形态：聚合/函数调用（含 COUNT(*)）、点路径/下标、裸标识符。
+  const exprTail = String.raw`\w+\([^()]*\)|[\w."]+\]|[\w."]+`;
   sql = sql.replace(new RegExp(String.raw`(` + exprTail + String.raw`)\s*::\s*(` + PG_TEXTISH_CAST_TYPES + String.raw`)\b`, 'gi'),
     (_m, expr: string) => expr);
   sql = sql.replace(new RegExp(String.raw`(` + exprTail + String.raw`)\s*::\s*(` + PG_CAST_TYPES + String.raw`)\b`, 'gi'),

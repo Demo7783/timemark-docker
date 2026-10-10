@@ -32,6 +32,7 @@ import { httpsEnforcement } from './middleware/https-enforcement.js';
 import { csrfProtection } from './middleware/csrf.js';
 import { apiRateLimit, rateLimit } from './middleware/rate-limit.js';
 import { getConfiguredOrigins, isAllowedOrigin } from './utils/allowed-origins.js';
+import { getRequestOrigin } from './utils/client-ip.js';
 import { query } from './db/index.js';
 import { isTurnstileEnabled, getTurnstileSiteKey } from './utils/turnstile.js';
 import { getClockOffsetMs, getLastTimeSyncResult, scheduleTimeSync, DEFAULT_SYNC_TIMEZONE } from './utils/ntp.js';
@@ -180,14 +181,18 @@ app.onError((err, c) => {
 
 app.use('*', async (c, next) => (isTelegramWebhook(c) ? next() : zeroTrustGuard(c, next)));
 app.use('*', securityHeaders);
-app.use('/api/*', httpsEnforcement);
+// docker：全局 HTTPS 强制（v2.16 加固语义，/health 由中间件自身豁免；NAS 场景用
+// ALLOW_INSECURE_HTTP=true 显式放行）。vercel 版只挂 /api/*，因其静态资源走 CDN。
+app.use('*', httpsEnforcement);
 
 const configuredOrigins = getConfiguredOrigins();
 
 app.use('*', cors({
-  origin: (origin) => {
+  origin: (origin, c) => {
     if (!origin) return configuredOrigins[0] ?? 'http://localhost:5173';
-    if (isAllowedOrigin(origin, undefined, configuredOrigins)) return origin;
+    // docker/LAN：用请求元数据（转发头/socket/URL）构建完整请求 Origin，
+    // scheme+host+port 全匹配才算同源（dd75c7c 语义，NAS 部署不配 CORS_ORIGIN 也能用）
+    if (isAllowedOrigin(origin, getRequestOrigin(c), configuredOrigins)) return origin;
     return null;
   },
   credentials: true,

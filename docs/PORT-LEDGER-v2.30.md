@@ -72,10 +72,16 @@
   - docker 独有测试 6 处适配：app-http（createApp 工厂）、jwt（typ 闸门新断言）、session-expiry（rotate 机制随上游退役）、https-enforcement（cookie TTL 参数）、client-ip（旧 API 名随 master 版 client-ip 恢复而复活）、telegram-escape（**退役**——6d5b4cd 的 MarkdownV2 转义修复已被上游独立吸收，内联于 telegram.service.ts）
   - scheduler.ts 新增：digest daily/weekly（每 15 分钟探测，isDigestDue+同期号查重幂等）+ agent-scheduler-tick（每 10 分钟，CAS+幂等键防重）——vercel 外部 cron 职责内化；agent worker drain 留 HTTP 端点（无独立服务函数，避免改上游路由文件）
   - 三端 build 全绿（shared tsc / frontend vite 2.27s / backend tsc）
-- [ ] D 迁移 v34→v81 SQLite 化（后台代理执行中：6c14f3e 版 migrate.ts 为基底 + 48 条翻译 + probe-migrate-chain.mjs 链式验证到 81）+ 新库冷启动通过
-- [ ] E vitest 语料跑通分诊（vercel 163 文件 + docker 适配后 18 文件）
-- [ ] F 新 SQLite 库 boot 冒烟（health/login/events/channels/digest/api-portal）
-- [ ] G 9 渠道注册表决策落地（blessings 导入已修为 @timemark/shared/blessings，注册表对接待做）
+- [ ] D 迁移 v34→v81 SQLite 化（后台代理重试中：6c14f3e 版 migrate.ts 为基底 + 48 条翻译 + probe-migrate-chain.mjs 链式验证到 81）+ 新库冷启动通过
+- [ ] E 测试语料分诊（进行中）：
+  - **前端 319/319 全绿**（零修复，React19/Tailwind4 换装成立）
+  - 后端首轮 1749/1813（96.5%）——mock 层语料基本直接可用
+  - 修复：db 层补**非参数位 cast**（`COUNT(*)::int`/`col::text`）与 **jsonb_*→json_*** 转换；db 层补**读取侧 JSON 自动解析**（PG jsonb 经 node-pg 自动 parse，sql.js 返回 TEXT——v2.30 服务直接 Array.isArray 会拿不到数组，calendar-sync 等 35 个失败同根因）
+  - auth-ip-block/session-expiry 的测试 harness 改用生产同款 convertPgToSqliteInner；storage-service 测试改到 docker 语义（本地盘=合法生产形态/REQUIRE_BLOB=1 恢复拒写）；calendar-sync/ics-parser/calendar-import/caldav-sync 4 文件 53 用例由子代理全量适配 v2.30 契约（桩点迁到 url-safety+fetch）
+  - 退役 3 个断言旧轮换机制的测试（session-refresh/auth-refresh-cookie/auth-middleware-token-type）——v2.30 刷新机制重构（typ 闸门+renewRememberedSession），上游 session-renewal/jwt-token-type 测试已覆盖新契约
+  - docker 加固在 v2.30 的存活性核对：originMatchesHost（LAN 同 Host）上游已有；allowed-origins 恢复 docker 清洗语义（含 `*` 条目剔除，v2.30 会把混合列表变凭据全放行）；https-enforcement/webauthn-config/security-headers 恢复 docker 版（v2.30 直连 HTTP 放行/转发头不校验/HSTS 无协议门控会复现 LAN 白屏）；app.ts httpsEnforcement 改回全局挂载；evaluateIpBlock 补 ::1/::ffff:127.0.0.1 回环族短路（v2.30 只认字面 127.0.0.1）
+  - **子代理发现的疑似上游 bug**：①CalDAV 接受 3xx 响应体（已修：>=300 continue，恢复 v2.16 拒绝重定向）②URL userinfo 凭据可能进 errors/日志（v2.30 isSafePublicUrl 不查 userinfo，暂记账）③parseIcsEvents 接受不可能日期 20260230（上游宽容设计，暂记账）
+- [x] G 渠道资产：8 个 docker 独有渠道接入 v2.30 注册表（nostr 复用上游保留条目 + 7 插件渠道回植，wechats-openclaw 维持休眠）；**isSupportedChannel 运行时区分**（isServerlessRuntime() 动态判断，VERCEL 才过滤插件渠道）；test-connection 补 imessage（BlueBubbles /api/v1/server/info）；channel-integrity 测试 (d)/(f) 改运行时感知（69=61+8）
 - [ ] H 版本 2.30.0 + CHANGELOG + README + Docker 镜像构建 + push
 
 ## 决策记录

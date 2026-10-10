@@ -3,7 +3,7 @@
  * 云端部署仅支持 webhook / token 类 HTTP 渠道
  */
 
-import { isSupportedChannel, IS_SERVERLESS_RUNTIME } from './supported-channels.js';
+import { isSupportedChannel, isServerlessRuntime } from './supported-channels.js';
 import { CHANNEL_METADATA } from './channels.metadata.js';
 
 export type ChannelConfigMethod = 'webhook' | 'token' | 'plugin';
@@ -1978,14 +1978,14 @@ function applyChannelMetadata(template: ChannelTemplate): ChannelTemplate {
 // isSupportedChannel 在运行时区分（serverless 过滤 / docker 放行）。
 export const allChannelTemplates: ChannelTemplate[] = [
   ...webhookChannels,
-  ...(IS_SERVERLESS_RUNTIME ? tokenChannels.filter((c) => c.id !== 'nostr') : tokenChannels),
-  ...(IS_SERVERLESS_RUNTIME ? [] : dockerPluginChannels),
+  ...(isServerlessRuntime() ? tokenChannels.filter((c) => c.id !== 'nostr') : tokenChannels),
+  ...(isServerlessRuntime() ? [] : dockerPluginChannels),
 ].map(applyChannelMetadata);
 
 export function getSupportedChannelTemplates(): ChannelTemplate[] {
   // docker：插件渠道（configMethod 'plugin'）在常驻进程上受支持
   return allChannelTemplates.filter(
-    (c) => (IS_SERVERLESS_RUNTIME ? c.configMethod !== 'plugin' : true) && isSupportedChannel(c.id),
+    (c) => (isServerlessRuntime() ? c.configMethod !== 'plugin' : true) && isSupportedChannel(c.id),
   );
 }
 

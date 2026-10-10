@@ -111,11 +111,18 @@ describe('resolveReminderChannels - active-account fallback', () => {
   });
 
   it('filters unsupported account types out of the fallback', async () => {
-    installDb({ accountTypes: ['generic_webhook', 'wechat_personal'] });
+    // serverless 语义才过滤插件渠道；docker 常驻进程放行（wechat_personal 可用）。
+    // isServerlessRuntime() 动态读取，用例内模拟 VERCEL 运行时。
+    process.env.VERCEL = '1';
+    try {
+      installDb({ accountTypes: ['generic_webhook', 'wechat_personal'] });
 
-    const channels = await resolveReminderChannels(1, [], 7);
+      const channels = await resolveReminderChannels(1, [], 7);
 
-    expect(channels).toEqual(['generic_webhook']);
+      expect(channels).toEqual(['generic_webhook']);
+    } finally {
+      delete process.env.VERCEL;
+    }
   });
 
   it('returns [] when the user has no active account (nothing can be delivered)', async () => {

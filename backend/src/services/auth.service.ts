@@ -286,7 +286,9 @@ export async function getIpBlockStatus(ip: string): Promise<{ isBlocked: boolean
 
 /** 统计该 IP 近 1 小时失败次数，超阈值则封禁 */
 export async function evaluateIpBlock(ip: string): Promise<void> {
-  if (!ip || ip === '127.0.0.1') return;
+  // 回环族全部短路（::1 / ::ffff:127.0.0.1 同样是本机自身，绝不能进封禁计数，
+  // 否则本地浏览器连续失败会把 loopback 封掉，本机再也登不上）
+  if (!ip || ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return;
 
   const countResult = await query(
     `SELECT COUNT(*)::int AS count FROM login_logs

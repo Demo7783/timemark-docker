@@ -24,11 +24,16 @@ export const UNSUPPORTED_CHANNEL_IDS = new Set([
   'nostr',
 ]);
 
-/** serverless 运行时（Vercel 函数）才需要插件渠道过滤；docker 常驻进程不过滤 */
-export const IS_SERVERLESS_RUNTIME = !!process.env.VERCEL;
+/**
+ * serverless 运行时（Vercel 函数）才需要插件渠道过滤；docker 常驻进程不过滤。
+ * 每次调用动态读取（模块加载期取值会让测试无法切换运行时语义）。
+ */
+export function isServerlessRuntime(): boolean {
+  return !!process.env.VERCEL;
+}
 
 export function isSupportedChannel(channelId: string): boolean {
-  if (!IS_SERVERLESS_RUNTIME) return true;
+  if (!isServerlessRuntime()) return true;
   return checkChannelSuitability(channelId).suitable;
 }
 

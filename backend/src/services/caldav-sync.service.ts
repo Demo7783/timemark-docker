@@ -45,7 +45,10 @@ export async function syncAllCalDavSubscriptions(): Promise<{ synced: number }> 
         headers: { Accept: 'text/calendar' },
         validateStatus: (s) => s < 500,
       });
-      if (res.status >= 400) continue;
+      // docker 加固（v2.16 语义）：拒绝重定向——maxRedirects:0 下 3xx 响应体不是
+      // 日历本体，跟随重定向应由管理员显式配置最终地址（v2.30 原为 >=400，会把
+      // 302 的 HTML 页面当 ICS 解析导入）
+      if (res.status >= 300) continue;
       const body = String(res.data || '');
       const events = parseIcsEvents(body);
       const userId = row.user_id as number;
