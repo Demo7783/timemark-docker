@@ -192,6 +192,30 @@ export default function TriggerLogs() {
     }
   };
 
+  // error_details 在 vercel（TEXT 列）读回是 JSON 字符串；docker 读侧会把 JSON 文本
+  // 自动解析成对象（{channel_type, account_id, details: [{channel, error}]}）。
+  // 两种语义都归一成可渲染文本（fullchain 实测：直接渲染对象会炸 React）。
+  const formatErrorDetails = (raw: unknown): string => {
+    if (typeof raw === 'string') return raw;
+    if (raw && typeof raw === 'object') {
+      const obj = raw as { channel_type?: unknown; details?: unknown };
+      if (Array.isArray(obj.details)) {
+        return obj.details
+          .map((d) => {
+            const item = d as { channel?: unknown; error?: unknown };
+            return `${String(item.channel ?? '?')}: ${String(item.error ?? '未知错误')}`;
+          })
+          .join('\n');
+      }
+      try {
+        return JSON.stringify(raw, null, 2);
+      } catch {
+        return String(raw);
+      }
+    }
+    return String(raw);
+  };
+
   const [retryingId, setRetryingId] = useState<number | null>(null);
   const [retryingAll, setRetryingAll] = useState(false);
 
@@ -424,7 +448,7 @@ export default function TriggerLogs() {
                                   重试错误详情
                                 </summary>
                                 <pre className="mt-1 whitespace-pre-wrap break-words rounded-lg bg-slate-50 dark:bg-slate-800/60 px-2 py-1 max-h-32 overflow-y-auto overscroll-contain text-red-400">
-                                  {log.error_details}
+                                  {formatErrorDetails(log.error_details)}
                                 </pre>
                               </details>
                             )}

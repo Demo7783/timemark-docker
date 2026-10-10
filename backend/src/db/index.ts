@@ -298,6 +298,10 @@ function normalizeSqliteParam(p: unknown): unknown {
     return p.replace('T', ' ').replace(/Z$/, '');
   }
   if (Array.isArray(p)) return JSON.stringify(p);
+  // 普通 object → JSON 文本（对齐 node-pg prepareValue 语义：TEXT 列存 JSON 字符串，
+  // 读回是字符串。缺这条时 sql.js 把对象按未知类型处理，读回形状与 vercel 不一致——
+  // fullchain 实测在 error_details 上炸了 React 渲染）
+  if (p !== null && typeof p === 'object') return JSON.stringify(p);
   return p;
 }
 
