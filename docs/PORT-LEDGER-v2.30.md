@@ -60,13 +60,22 @@
 
 ## 阶段门禁
 
-- [ ] A 账本 + 分支 `port/vercel-v2.30`
-- [ ] B 树换装：vercel@v2.30 三树覆盖 + 40 独有文件回植 + package.json 合并（-pg/@vercel/* +sql.js）+ 依赖重装
-- [ ] C 编译归零：shim 三件 + Hono 接管 + 143 文件方言面 + tsc/vite build 绿
-- [ ] D 迁移 v34→v81 SQLite 化 + 新库冷启动通过
-- [ ] E vitest 语料跑通分诊（vercel 163 + docker 21）
+- [x] A 账本 + 分支（注：分支乌龙——并行调用 cwd 竞争把 checkout -b 开到了 vercel 仓库，docker 的提交实际落在 master，ahead 3；工作内容无损，保持 master 线）
+- [x] B 树换装：vercel@v2.30 三树覆盖 + 33 独有文件回植 + package.json 四件合并（**保留** @vercel/blob、@vercel/functions——纯 JS 包 docker 可用且 blob 模式对自托管多实例有用；剔除 pg/@types/pg）+ .gitignore 关键 un-ignore（shared/src/data 中文日数据集、PWA sw.js/install-prompt.js）+ pnpm-lock 重生成 + React19/Tailwind4/Vite8 配置换装
+- [x] C 编译归零：
+  - db/index.ts：恢复 sql.js 适配层 + `withTransaction`（txDepth 防事务中途落盘）+ **中心方言转换器**（$n乱序重排 / 数值cast保留+文本类cast丢弃 / = ANY→json_each / NOW()、INTERVAL、make_interval→datetime / ILIKE→LIKE / date_trunc、to_char→strftime / FOR UPDATE 剥离 / 数组参数 JSON 化 / 布尔→0/1 / **读取侧 space→ISO-Z 归一化**防 8 小时偏移）
+  - 转换器经 backend/scripts/probe-queue-sql.mjs 全链路探针验证（agent_jobs 入队/幂等/认领/续租/完成/重试/回收，仓库最难的 PG SQL）——踩雷三连：`CAST('2026…' AS TIMESTAMPTZ)` 被截成 2026（文本类 cast 必须丢弃）；`ON CONFLICT (cols) WHERE … DO` 在 SQLite 3.35+ 合法勿剥离；`now()+make_interval` 组合被独立规则拆开后残留文本+文本=0（lease 算到公元 4052 年）→ 规则顺序=函数组最先
+  - index.ts 拆分：app.ts（Hono 应用构造 + createApp() 工厂，docker 测试宿主惯例）+ index.ts（密钥/迁移/管理员/调度器/serve/进程守卫）；scheduler 接真版 croner 调度器（vercel 的 stub 路径保留未用）
+  - storage.service：本地磁盘升格为 docker 合法生产形态（ATTACHMENT_REQUIRE_BLOB=1 可恢复 vercel 语义）
+  - 强制保留的 docker 加固：url-safety（DNS 钉扎版 SSRF 守卫，vercel 版有 TOCTOU 窗口）、client-ip（TRUSTED_PROXIES CIDR 校验版，vercel 版无条件信任 cf-connecting-ip 可被伪造绕过 IP 封禁）、auth-cookies（secure 按请求协议判定，NAS/LAN 明文部署不炸登录）——三者均已验证与 v2.30 调用方接口兼容
+  - vercel 平台件：vercel-init.ts 整体保留（ensureAdminUser 密码策略上游更严，docker 采用）；`import type {PoolClient} from 'pg'` 3 处 → DbClient 别名；stats.ts /scheduler 端点恢复（docker 有真调度器）
+  - docker 独有测试 6 处适配：app-http（createApp 工厂）、jwt（typ 闸门新断言）、session-expiry（rotate 机制随上游退役）、https-enforcement（cookie TTL 参数）、client-ip（旧 API 名随 master 版 client-ip 恢复而复活）、telegram-escape（**退役**——6d5b4cd 的 MarkdownV2 转义修复已被上游独立吸收，内联于 telegram.service.ts）
+  - scheduler.ts 新增：digest daily/weekly（每 15 分钟探测，isDigestDue+同期号查重幂等）+ agent-scheduler-tick（每 10 分钟，CAS+幂等键防重）——vercel 外部 cron 职责内化；agent worker drain 留 HTTP 端点（无独立服务函数，避免改上游路由文件）
+  - 三端 build 全绿（shared tsc / frontend vite 2.27s / backend tsc）
+- [ ] D 迁移 v34→v81 SQLite 化（后台代理执行中：6c14f3e 版 migrate.ts 为基底 + 48 条翻译 + probe-migrate-chain.mjs 链式验证到 81）+ 新库冷启动通过
+- [ ] E vitest 语料跑通分诊（vercel 163 文件 + docker 适配后 18 文件）
 - [ ] F 新 SQLite 库 boot 冒烟（health/login/events/channels/digest/api-portal）
-- [ ] G 9 渠道注册表决策落地
+- [ ] G 9 渠道注册表决策落地（blessings 导入已修为 @timemark/shared/blessings，注册表对接待做）
 - [ ] H 版本 2.30.0 + CHANGELOG + README + Docker 镜像构建 + push
 
 ## 决策记录
@@ -74,3 +83,7 @@
 - 2026-10-07 定策略变基。渠道数以 vercel 61 + docker 独有 9 = 目标 70 为上限，至少保 61。
 - 2026-10-07 vercel `->>` 运算符 SQLite 3.38+ 原生支持（sql.js 1.11 为 3.45+），方言面主敌是 `::cast` 与 INTERVAL/NOW()/gen_random_uuid。
 - 2026-10-07 模板串编辑一律走 Edit/Write 工具（heredoc 吃 \n 的教训）。
+- 2026-10-07 **探针三课**：①文本类 `::cast` 必须丢弃（NUMERIC affinity 截断）；②PG 部分索引 conflict target 的 `ON CONFLICT (cols) WHERE … DO` SQLite 3.35+ 原生支持，剥离反而坏；③`now()+make_interval` 与裸函数改写的规则顺序——函数组最先，否则文本+文本=0。
+- 2026-10-07 **读取侧 UTC 归一化**进 db 层：DB 写 'YYYY-MM-DD HH:MM:SS'，JS new Date 按本地时区解析——v2.30 全链路 8 小时偏移 bug 的系统级修复（v2.27 同类教训：改 SQL 端 epoch；本次选读出侧转 ISO-Z）。
+- 2026-10-07 vercel 测试语料绝大多数 vi.mock db 层，可随变基直接搬迁；docker CI 门禁维持 install+build，测试为本地质量门。
+- 2026-10-07 vercel 仓库 master 有 10 个未推送提交（push-via-api 时代的分叉），已原样保留勿动；误开的 port/vercel-v2.30 分支残留其中（与 master 同指针，无害）。

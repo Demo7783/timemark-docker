@@ -4,6 +4,8 @@ import { query } from '../db/index.js';
 import { createLogger } from '../utils/logger.js';
 import { purgeOldTodoCompletions } from '../services/todo.service.js';
 import { processNotificationRetries, purgeOldQueueEntries } from '../services/notification-retry.service.js';
+import { sendDigestsForAllUsers, type DigestPeriod } from '../services/digest.service.js';
+import { pumpSchedulerChain } from '../services/agent/scheduler.workflow.js';
 
 const log = createLogger('scheduler');
 
@@ -104,6 +106,33 @@ export async function startScheduler(): Promise<void> {
     await runJob('notification-queue-purge', async () => {
       const count = await purgeOldQueueEntries();
       log.info({ count }, 'Purged old notification queue entries');
+    });
+  }));
+
+  // v2.30 方向 A：AI 日报/周报。每 15 分钟探测一次到点情况——sendDigestsForAllUsers
+  // 内部按用户本地时区判断 daily/weekly 是否到点（isDigestDue）+ digest_archive 同期号
+  // 查重，未到点/已发送都是 no-op，所以高频探测是安全幂等的。
+  // vercel 上由外部 cron 打 /api/cron/digest?period=…；docker 由常驻调度器内化。
+  for (const period of ['daily', 'weekly'] as const) {
+    jobs.push(new Cron('*/15 * * * *', { timezone: 'Asia/Shanghai', name: `digest-${period}` }, async () => {
+      await runJob(`digest-${period}`, async () => {
+        const stats = await sendDigestsForAllUsers(period as DigestPeriod);
+        if (stats.sent > 0) {
+          log.info({ period, sent: stats.sent, skipped: stats.skipped }, 'Digest sent');
+        }
+      });
+    }));
+  }
+
+  // v2.21 后台 AI 调度链：单 tick 推进（CAS on last_tick_at + 幂等键去重，天然防重）。
+  // vercel 由外部 cron 每 10 分钟打 /api/agent/scheduler/start；docker 内化同职责。
+  // 后台 AI 默认关闭（AGENT_* 未配置时 pumpSchedulerChain 为 no-op），开启用户零配置生效。
+  jobs.push(new Cron('*/10 * * * *', { timezone: 'Asia/Shanghai', name: 'agent-scheduler-tick' }, async () => {
+    await runJob('agent-scheduler-tick', async () => {
+      const result = await pumpSchedulerChain();
+      if (result && result.ticked) {
+        log.info({ result }, 'Agent scheduler tick');
+      }
     });
   }));
 
