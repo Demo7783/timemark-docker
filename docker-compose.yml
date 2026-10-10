@@ -18,6 +18,36 @@ services:
       TRUSTED_PROXIES: "${TRUSTED_PROXIES:-}"
       # LAN IP 登录 403 时（旧版镜像），可临时加： CORS_ORIGIN=http://192.168.x.x:3808
       # 新版已支持 Origin 与请求 scheme/host/port 完全一致时自动放行，无需手动设置 CORS_ORIGIN
+      # —— v2.30 可选功能变量（完整清单见 .env.example）——
+      # 密钥（强烈建议显式设置；缺失时 JWT 生产硬失败、MASTER_KEY 自动生成落盘）
+      JWT_SECRET: "${JWT_SECRET:-}"
+      MASTER_KEY: "${MASTER_KEY:-}"
+      # 外部触发 /api/cron/* 的 Bearer（不配则 cron 端点 fail-closed）
+      CRON_SECRET: "${CRON_SECRET:-}"
+      # 人机验证（两个都配才生效）
+      TURNSTILE_SITE_KEY: "${TURNSTILE_SITE_KEY:-}"
+      TURNSTILE_SECRET_KEY: "${TURNSTILE_SECRET_KEY:-}"
+      # 附件存储：默认本地持久卷；设 BLOB_READ_WRITE_TOKEN 切远程 Blob
+      BLOB_READ_WRITE_TOKEN: "${BLOB_READ_WRITE_TOKEN:-}"
+      # AI 助手（OpenAI 兼容 / Ollama；留空即禁用）
+      AI_BASE_URL: "${AI_BASE_URL:-}"
+      AI_API_KEY: "${AI_API_KEY:-}"
+      AI_MODEL: "${AI_MODEL:-}"
+      # OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-}"
+      # OLLAMA_MODEL: "${OLLAMA_MODEL:-}"
+      # 语义检索（默认关闭）
+      # EMBEDDINGS_ENABLED: "${EMBEDDINGS_ENABLED:-}"
+      # 浏览器 Web Push
+      PUSH_VAPID_PUBLIC_KEY: "${PUSH_VAPID_PUBLIC_KEY:-}"
+      PUSH_VAPID_PRIVATE_KEY: "${PUSH_VAPID_PRIVATE_KEY:-}"
+      # Telegram 双向机器人（也可在设置页加密存储）
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_WEBHOOK_SECRET: "${TELEGRAM_WEBHOOK_SECRET:-}"
+      # 后台 AI / MCP / Agent（默认关闭）
+      # AGENT_TOOLS_ENABLED: "${AGENT_TOOLS_ENABLED:-false}"
+      # MCP_ENABLED: "${MCP_ENABLED:-false}"
+      # 深度健康信息（detailed=1 + token）
+      # HEALTH_DETAIL_TOKEN: "${HEALTH_DETAIL_TOKEN:-}"
     dns:
       - 223.5.5.5
       - 8.8.8.8

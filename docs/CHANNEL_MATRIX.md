@@ -4,9 +4,9 @@
 > 唯一数据源：`backend/src/services/notifications/channels.config.ts`（`getSupportedChannelTemplates()`）。
 > 连接测试列由 `test-connection.ts` 的真实分支解析得到；官方地址优先取模板 `officialUrl`，缺省回退 `docsUrl`。
 
-**云端可用渠道：61 个**（webhook 17 · token 44）· **Serverless 不可用：8 个** · **当前 schema：v80**
+**云端可用渠道：69 个**（webhook 17 · token 46）· **Serverless 不可用：8 个** · **当前 schema：v81**
 
-## 1. 云端渠道总表（61）
+## 1. 云端渠道总表（69）
 
 | # | ID | 名称 | configMethod | 必填字段 → DB 列 | 真实连接测试 | 官方地址 |
 |---|----|------|--------------|------------------|--------------|----------|
@@ -31,48 +31,56 @@
 | 19 | `mattermost` | Mattermost / Mattermost | `token` | `webhook` → `webhook`、`token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://docs.mattermost.com/guides/mattermost-operator-guide.html> |
 | 20 | `msteams` | Microsoft Teams / Microsoft Teams | `token` | `token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://learn.microsoft.com/en-us/microsoftteams/platform/> |
 | 21 | `nextcloud_talk` | Nextcloud Talk | `token` | `webhook` → `webhook`、`token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://nextcloud-talk.readthedocs.io/en/latest/> |
-| 22 | `wxpusher` | WxPusher / WeChat Push (WxPusher) | `token` | `token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://wxpusher.zjiecode.com/> |
-| 23 | `qmsg` | Qmsg / Qmsg QQ | `token` | `token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://qmsg.zendee.cn/> |
-| 24 | `serverchan` | Server酱 (ServerChan) | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://sct.ftqq.com/> |
-| 25 | `pushplus` | PushPlus | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.pushplus.plus/doc/> |
-| 26 | `bark` | Bark | `token` | `webhook` → `webhook`、`token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://bark.day.app/> |
-| 27 | `gotify` | Gotify | `token` | `webhook` → `webhook`、`token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://gotify.net/docs/> |
-| 28 | `meow` | 喵推送 (Meow) | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://meopush.com/> |
-| 29 | `pushme` | PushMe | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://push.i-i.me/> |
-| 30 | `pushdeer` | PushDeer | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.pushdeer.com/> |
-| 31 | `twilio` | Twilio SMS | `token` | `token` → `token`、`secret` → `secret`、`webhook` → `webhook`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.twilio.com/docs/sms> |
-| 32 | `wecomapp` | 企微应用 (WeComApp) | `token` | `token` → `token`、`secret` → `secret`、`chat_id` → `chat_id`、`webhook` → `webhook` | ✅ `test-connection.ts` → `testTokenChannel` | <https://developer.work.weixin.qq.com/document/path/90236> |
-| 33 | `ntfy` | Ntfy | `token` | `webhook` → `webhook`、`token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://docs.ntfy.sh/> |
-| 34 | `pushover` | Pushover | `token` | `token` → `token`、`secret` → `secret` | ✅ `test-connection.ts` → `testTokenChannel` | <https://pushover.net/api> |
-| 35 | `apprise` | Apprise | `token` | `webhook` → `webhook` | ✅ `test-connection.ts` → `testTokenChannel` | <https://github.com/caronc/apprise-api> |
-| 36 | `serverchan3` | Server酱³ (SC3) | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://sct.ftqq.com/compare/> |
-| 37 | `xizhi` | 息知 (XiZhi) | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://xz.qqoq.net/> |
-| 38 | `anpush` | AnPush | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://anpush.com/> |
-| 39 | `chanify` | Chanify | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://github.com/chanify/chanify-ios> |
-| 40 | `pushback` | Pushback | `token` | `token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://pushback.io/docs/getting-started> |
-| 41 | `simplepush` | SimplePush | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://simplepush.io/> |
-| 42 | `zulip` | Zulip | `token` | `webhook` → `webhook`、`token` → `token`、`chat_id` → `chat_id`、`secret` → `secret` | ✅ `test-connection.ts` → `testTokenChannel` | <https://zulip.com/api/send-message> |
-| 43 | `fcm` | Firebase 推送 (FCM) | `token` | `token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://firebase.google.com/docs/cloud-messaging/send/v1-api> |
-| 44 | `twilio_whatsapp` | Twilio WhatsApp | `token` | `token` → `token`、`secret` → `secret`、`webhook` → `webhook`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.twilio.com/docs/whatsapp/api> |
-| 45 | `whatsapp_cloud` | WhatsApp 官方 | `token` | `token` → `token`、`secret` → `secret`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://developers.facebook.com/docs/whatsapp/cloud-api> |
-| 46 | `kook` | Kook | `webhook` | `webhook` → `webhook` | ✅ `test-connection.ts` → `testWebhookChannel` | <https://developer.kookapp.cn/doc/intro> |
-| 47 | `fanbook` | Fanbook | `webhook` | `webhook` → `webhook` | ✅ `test-connection.ts` → `testWebhookChannel` | <https://fanbook.zhizhoui.com/> |
-| 48 | `homeassistant` | Home Assistant | `token` | `webhook` → `webhook`、`token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.home-assistant.io/integrations/notify/> |
-| 49 | `pushbullet` | PushBullet / PushBullet | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.pushbullet.com/#settings/account> |
-| 50 | `join` | Join / Join | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://joinjoaomgcd.appspot.com/> |
-| 51 | `pushsafer` | PushSafer / PushSafer | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.pushsafer.com/> |
-| 52 | `guilded` | Guilded / Guilded | `webhook` | `webhook` → `webhook` | ✅ `test-connection.ts` → `testWebhookChannel` | <https://www.guilded.gg/> |
-| 53 | `ifttt` | IFTTT / IFTTT | `token` | `token` → `token`、`webhook` → `webhook` | ✅ `test-connection.ts` → `testTokenChannel` | <https://ifttt.com/maker_webhooks> |
-| 54 | `revolt` | Revolt / Revolt | `token` | `token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://revolt.chat/> |
-| 55 | `onesignal` | OneSignal / OneSignal | `token` | `token` → `token`、`secret` → `secret` | ✅ `test-connection.ts` → `testTokenChannel` | <https://onesignal.com/> |
-| 56 | `sendgrid` | SendGrid / SendGrid | `token` | `token` → `token`、`secret` → `secret`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://sendgrid.com/> |
-| 57 | `mailgun` | Mailgun / Mailgun | `token` | `token` → `token`、`webhook` → `webhook`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.mailgun.com/> |
-| 58 | `vonage_sms` | Vonage SMS / Vonage SMS | `token` | `token` → `token`、`secret` → `secret`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.vonage.com/communications-apis/sms/> |
-| 59 | `messagebird` | MessageBird / MessageBird | `token` | `token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.messagebird.com/> |
-| 60 | `alertzy` | Alertzy / Alertzy | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://alertzy.app/> |
-| 61 | `awtrix` | Awtrix 3 / Awtrix 3 | `webhook` | `webhook` → `webhook` | ✅ `test-connection.ts` → `testWebhookChannel` | <https://blueforcer.github.io/awtrix3/> |
+| 22 | `nostr` | Nostr | `token` | `token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://github.com/nostr-protocol/nostr> |
+| 23 | `wxpusher` | WxPusher / WeChat Push (WxPusher) | `token` | `token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://wxpusher.zjiecode.com/> |
+| 24 | `qmsg` | Qmsg / Qmsg QQ | `token` | `token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://qmsg.zendee.cn/> |
+| 25 | `serverchan` | Server酱 (ServerChan) | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://sct.ftqq.com/> |
+| 26 | `pushplus` | PushPlus | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.pushplus.plus/doc/> |
+| 27 | `bark` | Bark | `token` | `webhook` → `webhook`、`token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://bark.day.app/> |
+| 28 | `gotify` | Gotify | `token` | `webhook` → `webhook`、`token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://gotify.net/docs/> |
+| 29 | `meow` | 喵推送 (Meow) | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://meopush.com/> |
+| 30 | `pushme` | PushMe | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://push.i-i.me/> |
+| 31 | `pushdeer` | PushDeer | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.pushdeer.com/> |
+| 32 | `twilio` | Twilio SMS | `token` | `token` → `token`、`secret` → `secret`、`webhook` → `webhook`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.twilio.com/docs/sms> |
+| 33 | `wecomapp` | 企微应用 (WeComApp) | `token` | `token` → `token`、`secret` → `secret`、`chat_id` → `chat_id`、`webhook` → `webhook` | ✅ `test-connection.ts` → `testTokenChannel` | <https://developer.work.weixin.qq.com/document/path/90236> |
+| 34 | `ntfy` | Ntfy | `token` | `webhook` → `webhook`、`token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://docs.ntfy.sh/> |
+| 35 | `pushover` | Pushover | `token` | `token` → `token`、`secret` → `secret` | ✅ `test-connection.ts` → `testTokenChannel` | <https://pushover.net/api> |
+| 36 | `apprise` | Apprise | `token` | `webhook` → `webhook` | ✅ `test-connection.ts` → `testTokenChannel` | <https://github.com/caronc/apprise-api> |
+| 37 | `serverchan3` | Server酱³ (SC3) | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://sct.ftqq.com/compare/> |
+| 38 | `xizhi` | 息知 (XiZhi) | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://xz.qqoq.net/> |
+| 39 | `anpush` | AnPush | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://anpush.com/> |
+| 40 | `chanify` | Chanify | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://github.com/chanify/chanify-ios> |
+| 41 | `pushback` | Pushback | `token` | `token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://pushback.io/docs/getting-started> |
+| 42 | `simplepush` | SimplePush | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://simplepush.io/> |
+| 43 | `zulip` | Zulip | `token` | `webhook` → `webhook`、`token` → `token`、`chat_id` → `chat_id`、`secret` → `secret` | ✅ `test-connection.ts` → `testTokenChannel` | <https://zulip.com/api/send-message> |
+| 44 | `fcm` | Firebase 推送 (FCM) | `token` | `token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://firebase.google.com/docs/cloud-messaging/send/v1-api> |
+| 45 | `twilio_whatsapp` | Twilio WhatsApp | `token` | `token` → `token`、`secret` → `secret`、`webhook` → `webhook`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.twilio.com/docs/whatsapp/api> |
+| 46 | `whatsapp_cloud` | WhatsApp 官方 | `token` | `token` → `token`、`secret` → `secret`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://developers.facebook.com/docs/whatsapp/cloud-api> |
+| 47 | `kook` | Kook | `webhook` | `webhook` → `webhook` | ✅ `test-connection.ts` → `testWebhookChannel` | <https://developer.kookapp.cn/doc/intro> |
+| 48 | `fanbook` | Fanbook | `webhook` | `webhook` → `webhook` | ✅ `test-connection.ts` → `testWebhookChannel` | <https://fanbook.zhizhoui.com/> |
+| 49 | `homeassistant` | Home Assistant | `token` | `webhook` → `webhook`、`token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.home-assistant.io/integrations/notify/> |
+| 50 | `pushbullet` | PushBullet / PushBullet | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.pushbullet.com/#settings/account> |
+| 51 | `join` | Join / Join | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://joinjoaomgcd.appspot.com/> |
+| 52 | `pushsafer` | PushSafer / PushSafer | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.pushsafer.com/> |
+| 53 | `guilded` | Guilded / Guilded | `webhook` | `webhook` → `webhook` | ✅ `test-connection.ts` → `testWebhookChannel` | <https://www.guilded.gg/> |
+| 54 | `ifttt` | IFTTT / IFTTT | `token` | `token` → `token`、`webhook` → `webhook` | ✅ `test-connection.ts` → `testTokenChannel` | <https://ifttt.com/maker_webhooks> |
+| 55 | `revolt` | Revolt / Revolt | `token` | `token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://revolt.chat/> |
+| 56 | `onesignal` | OneSignal / OneSignal | `token` | `token` → `token`、`secret` → `secret` | ✅ `test-connection.ts` → `testTokenChannel` | <https://onesignal.com/> |
+| 57 | `sendgrid` | SendGrid / SendGrid | `token` | `token` → `token`、`secret` → `secret`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://sendgrid.com/> |
+| 58 | `mailgun` | Mailgun / Mailgun | `token` | `token` → `token`、`webhook` → `webhook`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.mailgun.com/> |
+| 59 | `vonage_sms` | Vonage SMS / Vonage SMS | `token` | `token` → `token`、`secret` → `secret`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.vonage.com/communications-apis/sms/> |
+| 60 | `messagebird` | MessageBird / MessageBird | `token` | `token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://www.messagebird.com/> |
+| 61 | `alertzy` | Alertzy / Alertzy | `token` | `token` → `token` | ✅ `test-connection.ts` → `testTokenChannel` | <https://alertzy.app/> |
+| 62 | `awtrix` | Awtrix 3 / Awtrix 3 | `webhook` | `webhook` → `webhook` | ✅ `test-connection.ts` → `testWebhookChannel` | <https://blueforcer.github.io/awtrix3/> |
+| 63 | `wechat_personal` | 微信个人号 | `plugin` | — | ✅ `test-connection.ts` → `testPluginChannel` | <https://wechaty.js.org/> |
+| 64 | `whatsapp` | WhatsApp | `plugin` | — | ✅ `test-connection.ts` → `testPluginChannel` | <https://github.com/WhiskeySockets/Baileys> |
+| 65 | `qq_bot` | QQ Bot | `plugin` | `token` → `token` | ✅ `test-connection.ts` → `testPluginChannel` | <https://oicqjs.github.io/oicq/> |
+| 66 | `signal` | Signal | `plugin` | `token` → `token` | ✅ `test-connection.ts` → `testPluginChannel` | <https://github.com/AsamK/signal-cli> |
+| 67 | `imessage` | iMessage | `token` | `webhook` → `webhook`、`token` → `token`、`chat_id` → `chat_id` | ✅ `test-connection.ts` → `testTokenChannel` | <https://bluebubbles.app/> |
+| 68 | `zalo` | Zalo | `plugin` | `token` → `token` | ✅ `test-connection.ts` → `testPluginChannel` | <https://developers.zalo.com/> |
+| 69 | `clawbot` | 微信龙虾 (ClawBot) | `plugin` | — | ✅ `test-connection.ts` → `testPluginChannel` | <https://github.com/nicepkg/wechat-clawbot> |
 
-## 2. 字段 → notification_accounts 列（含可选字段，共 123 项）
+## 2. 字段 → notification_accounts 列（含可选字段，共 138 项）
 
 | 渠道 | 字段 | → DB 列 | 必填 | 标签 | 英文标签 |
 |------|------|---------|------|------|----------|
@@ -113,6 +121,9 @@
 | `nextcloud_talk` | `webhook` | `webhook` | 是 | Nextcloud URL | — |
 | `nextcloud_talk` | `token` | `token` | 是 | App Password | — |
 | `nextcloud_talk` | `chat_id` | `chat_id` | 是 | Talk 房间 Token | — |
+| `nostr` | `token` | `token` | 是 | 私钥 (hex) | — |
+| `nostr` | `chat_id` | `chat_id` | 是 | 目标公钥 (hex) | — |
+| `nostr` | `webhook` | `webhook` | 否 | 中继地址 (可选) | — |
 | `wxpusher` | `token` | `token` | 是 | AppToken | App Token |
 | `wxpusher` | `chat_id` | `chat_id` | 是 | UID | User UID |
 | `qmsg` | `token` | `token` | 是 | Qmsg Key | Key |
@@ -199,6 +210,18 @@
 | `messagebird` | `chat_id` | `chat_id` | 是 | 收件人手机号 | To Phone Number |
 | `alertzy` | `token` | `token` | 是 | Account Key | Account Key |
 | `awtrix` | `webhook` | `webhook` | 是 | 设备地址 | Device URL |
+| `wechat_personal` | `session_data` | `—` | 否 | 认证会话 | — |
+| `whatsapp` | `session_data` | `—` | 否 | 认证会话 | — |
+| `qq_bot` | `token` | `token` | 是 | QQ 号码 | — |
+| `qq_bot` | `session_data` | `—` | 否 | 认证会话 | — |
+| `signal` | `token` | `token` | 是 | 电话号码 | — |
+| `signal` | `session_data` | `—` | 否 | 认证会话 | — |
+| `imessage` | `webhook` | `webhook` | 是 | BlueBubbles 服务器 URL | — |
+| `imessage` | `token` | `token` | 是 | API 密钥 | — |
+| `imessage` | `chat_id` | `chat_id` | 是 | 接收人 ID | — |
+| `zalo` | `token` | `token` | 是 | Access Token | — |
+| `zalo` | `session_data` | `—` | 否 | 认证会话 | — |
+| `clawbot` | `session_data` | `—` | 否 | 认证会话 | — |
 
 ## 3. Serverless 不可用渠道（8）
 
@@ -217,9 +240,9 @@
 
 | 项 | 值 |
 |----|----|
-| 云端渠道总数 | 61 |
+| 云端渠道总数 | 69 |
 | webhook 渠道 | 17 |
-| token 渠道 | 44 |
-| 有 provider 专属连接测试 | 61 |
+| token 渠道 | 46 |
+| 有 provider 专属连接测试 | 69 |
 | Serverless 不可用 | 8 |
-| schema 版本 | v80 |
+| schema 版本 | v81 |

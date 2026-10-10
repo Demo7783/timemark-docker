@@ -1,5 +1,9 @@
 # Channel Compatibility Matrix
 
+> **⚠️ 存档（v2.16 时代审计，39 渠道 / node:20 口径）**：权威渠道目录已迁移到
+> [CHANNEL_MATRIX.md](CHANNEL_MATRIX.md)（69 渠道 / 分类 / 连接测试覆盖）；
+> 依赖清单以 `backend/package.json` 为准（现基镜像 node:22-alpine）。本文保留作历史审计记录。
+
 > Auto-generated audit of all 39 notification channel services.
 > Base image: `node:20.18-alpine`
 > System packages installed: `dumb-init`, `ca-certificates`, `icu-data-full`

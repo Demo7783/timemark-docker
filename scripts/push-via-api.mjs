@@ -96,15 +96,23 @@ for (const sha of unpushed) {
     }
   }
 
-  // 2. 以远端当前提交的树为 base 建新树
-  const baseTree = api(`/repos/${REPO}/git/commits/${remoteCommitSha}`).tree.sha;
-  const tree = api('/repos/' + REPO + '/git/trees', JSON.stringify({ base_tree: baseTree, tree: treeEntries }));
+  // 2. 以远端当前提交的树为 base 建新树。条目多时（树换装提交 855 条）一次性建树
+  //    会服务端超时（HTTP 422 建议增量建树）——按 200 条分块链式 base_tree。
+  const CHUNK = 200;
+  let baseTree = api(`/repos/${REPO}/git/commits/${remoteCommitSha}`).tree.sha;
+  let treeSha = baseTree;
+  for (let i = 0; i < treeEntries.length; i += CHUNK) {
+    const chunk = treeEntries.slice(i, i + CHUNK);
+    const t = api('/repos/' + REPO + '/git/trees', JSON.stringify({ base_tree: baseTree, tree: chunk }));
+    treeSha = t.sha;
+    baseTree = t.sha;
+  }
 
   // 3. 建提交（GitHub 会规范化 message 与时区——之后本地按远端重建对齐）
   const commitMessage = execFileSync('git', ['log', '-1', '--format=%B', sha], { encoding: 'buffer', maxBuffer: BIG_BUFFER }).toString('utf8');
   const commit = api('/repos/' + REPO + '/git/commits', JSON.stringify({
     message: commitMessage,
-    tree: tree.sha,
+    tree: treeSha,
     parents: [remoteCommitSha],
   }));
 

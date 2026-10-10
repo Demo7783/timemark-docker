@@ -1,6 +1,6 @@
-# 免费部署补充（Docker · v2.16.0）
+# 免费部署补充（Docker · v2.30.0）
 
-> Docker 版无需 Vercel 免费额度，直接 docker compose up -d 即可。定时提醒由容器内 Croner 每分钟执行，无需 cron-job.org。
+> Docker 版无需 Vercel 免费额度，直接 docker compose up -d 即可。定时提醒（含 AI 日报/周报、后台 AI 调度链）由容器内置调度器执行，无需 cron-job.org。
 >
 > 参考 vercel 的 [FREE_TIER_DEPLOY.md](https://github.com/WXFffff666/timemark-vercel/blob/master/FREE_TIER_DEPLOY.md) 了解 Vercel 免费部署；Docker 版对应概念：
 >

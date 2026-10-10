@@ -559,10 +559,10 @@ server {
 | `TZ` | `Asia/Shanghai` | 时区设置（常用自定义项） |
 | `DB_PATH` | `/app/data/timemark.db` | SQLite 数据库文件路径 |
 | `NODE_ENV` | `production` | 运行环境 |
-| `JWT_SECRET` | 内置默认值 | JWT 签名密钥，公网部署建议自定义 |
-| `MASTER_KEY` | 内置默认值 | 主密钥（通知凭证 AES 加密），公网部署建议自定义 |
+| `JWT_SECRET` | 无；生产缺失/弱密钥**硬失败启动** | JWT 签名密钥（≥32 字符随机值，v2.30 起生产强制） |
+| `MASTER_KEY` | 缺失时自动生成落盘 `data/.env` | 主密钥（通知凭证 AES 加密），公网部署建议显式设置 |
 | `DEFAULT_ADMIN_USERNAME` | `admin` | 初始管理员用户名 |
-| `DEFAULT_ADMIN_PASSWORD` | 无；空数据库首次启动必填 | 初始管理员密码；不提供内置默认值 |
+| `DEFAULT_ADMIN_PASSWORD` | 无；空数据库首次启动必填 | 初始管理员密码；**生产至少 12 位**（v2.30 起对齐上游策略） |
 | `ALLOW_INSECURE_HTTP` | `false` | 是否显式允许明文 HTTP；公网部署必须保持 `false` |
 | `TRUSTED_PROXIES` | 无 | 逗号分隔的可信反向代理 IP/CIDR；仅其转发头会被信任 |
 | `LOG_QUERIES` | `false` | 是否打印 SQL 查询日志（调试用） |
@@ -571,6 +571,22 @@ server {
 | `TURNSTILE_SECRET_KEY` | 无 | Turnstile 服务端密钥，**仅 Production 需要**（勿提交到 Git） |
 | `WEBAUTHN_RP_ID` | 无 | Passkey RP ID，与正式域名一致 |
 | `WEBAUTHN_ORIGIN` | 无 | 固定 Passkey Origin，如 `https://timemark.example.com`；设置后优先于请求的 Origin/Referer |
+
+### v2.30 新增变量（均可选，完整清单见 `.env.example`）
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `CRON_SECRET` | 无（cron 端点 fail-closed） | 外部触发 `/api/cron/*` 与「立即运行」白名单端点的 Bearer |
+| `HEALTH_DETAIL_TOKEN` | 无 | `/api/health?detailed=1` 深度健康信息的访问令牌 |
+| `ATTACHMENT_LOCAL_DIR` | `<数据卷>/.data/attachments` | 附件本地存储目录（v2.30 起本地磁盘为合法生产形态） |
+| `ATTACHMENT_REQUIRE_BLOB` | 未设 | 设 `1` 恢复「无 Blob token 拒写附件」语义（对齐 vercel） |
+| `BLOB_READ_WRITE_TOKEN` | 无 | Vercel Blob 远程附件存储（多实例/异地备份场景） |
+| `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` | 无 | AI 助手（OpenAI 兼容）；备用 `AI_FALLBACK_*` |
+| `OLLAMA_BASE_URL` / `OLLAMA_MODEL` | 无 | 本地模型（Ollama/LM Studio）OpenAI 兼容端点 |
+| `EMBEDDINGS_ENABLED` / `EMBEDDINGS_MODEL` | 关闭 | 语义检索（开启后文本才会发往嵌入服务） |
+| `PUSH_VAPID_PUBLIC_KEY` / `PUSH_VAPID_PRIVATE_KEY` | 无 | 浏览器 Web Push（`npx web-push generate-vapid-keys`） |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_WEBHOOK_SECRET` | 无 | Telegram 双向机器人（也可在设置页加密存储） |
+| `AGENT_TOOLS_ENABLED` / `MCP_ENABLED` / `WORKFLOWS_ENABLED` | `false` | 后台 AI 工具 / MCP 服务端 / Workflows（默认关闭） |
 
 > 💡 **公网部署建议**：自定义 `JWT_SECRET` 和 `MASTER_KEY` 以增强安全性。更换 MASTER_KEY 后，已加密的通知渠道凭证需要重新配置。
 > 🔐 **生产安全**：`CORS_ORIGIN` / `TURNSTILE_SECRET_KEY` 等敏感变量**仅 Production 需配置**（Docker 部署无需区分 Preview，但公网勿暴露默认密钥；参考 vercel 仅 Production 勾选原则）。
