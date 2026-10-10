@@ -308,12 +308,15 @@ beforeEach(() => {
 });
 
 describe('schema <-> migration reconciliation (checkbox 164)', () => {
-  it('a fresh install from schema.pg.sql declares trigger_date TEXT, the same shape v51 casts to', () => {
+  it('a fresh install declares trigger_date TEXT end to end (docker: 无需 v51 ALTER)', () => {
     // The re-scoped fix: the schema file must match the migrated end state, otherwise a fresh
     // DB starts as DATE and only becomes TEXT after runMigrations().
+    // docker 差异：SQLite 列本就是 TEXT，v51 的 ALTER COLUMN TYPE 已在翻译中删除
+    //（版本占位保留）——schema 与迁移终态天然一致。
     expect(SCHEMA_SOURCE).toMatch(/trigger_date TEXT NOT NULL/);
     expect(SCHEMA_SOURCE).not.toMatch(/trigger_date DATE NOT NULL/);
-    expect(MIGRATE_SOURCE).toContain('ALTER TABLE event_trigger_logs ALTER COLUMN trigger_date TYPE TEXT USING trigger_date::text');
+    expect(MIGRATE_SOURCE).toMatch(/version:\s*51,/);
+    expect(MIGRATE_SOURCE).not.toContain('ALTER COLUMN trigger_date TYPE');
     // The plain-btree index is still the right access path for an exact-equality TEXT lookup.
     expect(SCHEMA_SOURCE).toContain('CREATE INDEX IF NOT EXISTS idx_trigger_logs_date ON event_trigger_logs(trigger_date)');
   });

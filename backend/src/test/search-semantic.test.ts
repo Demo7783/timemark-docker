@@ -492,9 +492,12 @@ describe('failure cases', () => {
       }),
     ).rejects.toThrow(/2048/);
 
-    // DDL-level backstop: the v53 CHECK is what a direct INSERT would hit.
+    // DDL-level backstop: vercel 用 v53 的 `CHECK (vector_dims(embedding) <= 2048)`。
+    // docker SQLite 翻译无 pgvector（v53 整条 SQL 删除，语义搜索由 EMBEDDINGS_ENABLED
+    // 服务层门控 + 上面的 2048 维校验兜底），这里钉住 migrate.ts 的链号占位仍存在。
     const migrateSource = readFileSync(new URL('../db/migrate.ts', import.meta.url), 'utf8');
-    expect(migrateSource).toContain('CHECK (vector_dims(embedding) <= 2048)');
+    expect(migrateSource).toMatch(/version:\s*53,/);
+    expect(migrateSource).not.toContain('vector_dims');
   });
 
   it('rejects the semantic route with 400 and the clear message for an oversized dims config', async () => {

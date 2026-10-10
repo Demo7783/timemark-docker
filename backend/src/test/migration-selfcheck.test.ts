@@ -62,8 +62,9 @@ describe('schema health', () => {
   });
 
   it('records the versions this project never allocated', () => {
-    // v1 is the base schema (shared/src/schema.pg.sql); 15/66/68 were skipped.
-    expect([...UNALLOCATED_MIGRATION_VERSIONS]).toEqual([15, 66, 68]);
+    // v1 是基础 schema（docker 为 docker/schema.sql）；66/68 被跳过。
+    // docker 差异：v15（quiet_hours）已分配——与 vercel 的「15 未分配」不同。
+    expect([...UNALLOCATED_MIGRATION_VERSIONS]).toEqual([66, 68]);
   });
 
   it('reports up_to_date when every registered version is present', () => {

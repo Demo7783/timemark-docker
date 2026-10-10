@@ -72,7 +72,7 @@
   - docker 独有测试 6 处适配：app-http（createApp 工厂）、jwt（typ 闸门新断言）、session-expiry（rotate 机制随上游退役）、https-enforcement（cookie TTL 参数）、client-ip（旧 API 名随 master 版 client-ip 恢复而复活）、telegram-escape（**退役**——6d5b4cd 的 MarkdownV2 转义修复已被上游独立吸收，内联于 telegram.service.ts）
   - scheduler.ts 新增：digest daily/weekly（每 15 分钟探测，isDigestDue+同期号查重幂等）+ agent-scheduler-tick（每 10 分钟，CAS+幂等键防重）——vercel 外部 cron 职责内化；agent worker drain 留 HTTP 端点（无独立服务函数，避免改上游路由文件）
   - 三端 build 全绿（shared tsc / frontend vite 2.27s / backend tsc）
-- [ ] D 迁移 v34→v81 SQLite 化（后台代理重试中：6c14f3e 版 migrate.ts 为基底 + 48 条翻译 + probe-migrate-chain.mjs 链式验证到 81）+ 新库冷启动通过
+- [x] D 迁移 v34→v81 SQLite 化 ✅（代理第三次执行成功）：migrate.ts 重写 2608 行（docker 旧结构 + v2→v33 原样 + 48 条翻译 + tryExec 辅助 + PROFILE_AWARE_TABLES）；probe-migrate-chain.mjs **首轮 ALL PASS**（MAX=81、14 关键表、totp_recovery_codes/digest_daily_enabled 列、零 "Migration failed"）；tsc 0 错误。关键翻译决策：`UPDATE...FROM`（SQLite 3.33+ 原生）、v41 补 FK 以「新链路无悬挂值+回填」等价、v53/57 pg_trgm+pgvector 整条删（占位保链号）、v54 行锁剥除（单连接，lease_token 保并发）、v70 CHECK 建表即终态（SQLite 无 DROP CONSTRAINT）、migrateEncryptionKey 合入上游 session_data 守卫。**附带修复**：v4/v5/v10 裸 ALTER 在新库必 duplicate column（旧文件一直失败但无实害）照 v32 先例移 tryExec。**退役 26 个 migration-vNN 测试**（vercel PG 方言静态标记断言，对 SQLite 翻译不适用；探针=真引擎真链路端到端，覆盖更强）。**适配 4 个**：migration-chain（78 版/缺口 66/68/v15 已分配）、migration-selfcheck（同上）、search-semantic（钉 v53 占位+无 vector_dims）、trigger-log-persistence（钉 v51 占位+无 ALTER COLUMN TYPE）
 - [ ] E 测试语料分诊（进行中）：
   - **前端 319/319 全绿**（零修复，React19/Tailwind4 换装成立）
   - 后端首轮 1749/1813（96.5%）——mock 层语料基本直接可用
