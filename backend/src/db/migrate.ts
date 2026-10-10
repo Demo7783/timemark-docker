@@ -1,26 +1,77 @@
-import { createHash } from 'crypto';
-import { query } from './index.js';
+import fs from 'fs';
+import path from 'path';
+import { createHash, randomBytes } from 'crypto';
+import { fileURLToPath } from 'url';
+import { getDb, waitForDb, query } from './index.js';
 import { encrypt, decrypt } from '@timemark/shared/crypto';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 /**
- * Auto-migration: applies incremental schema migrations at startup.
- * Full schema application (CREATE TABLE / initial data) is handled by
- * scripts/migrate-db.ts using shared/src/schema.pg.sql.
+ * Auto-migration: ensures database schema is up to date on startup.
+ * Reads schema.sql and executes it (all statements are idempotent with IF NOT EXISTS).
+ * Tracks schema version for future incremental migrations.
  *
- * This function only handles version-to-version migrations for existing
- * deployments that need new columns / tables added over time.
+ * 链路构成（docker 变基 v2.30）：
+ * - schema.sql：基础表结构（SQLite 方言，幂等，勿在此追加新表）；
+ * - v2→v33：docker 历史链（SQLite 方言，除 5 处必要修复外原样保留，见各条目注释）；
+ * - v34→v81：自 timemark-vercel migrate.ts（PG 方言）翻译而来。PG 专属对象
+ *   （pg_trgm GIN、pgvector、ALTER COLUMN TYPE、ADD CONSTRAINT、FOR UPDATE 行锁）
+ *   按既定规则降级/删除，语义不可等价处见条目注释与 docs/PORT-LEDGER-v2.30.md。
  */
 export async function runMigrations(): Promise<void> {
   console.log('[DB] Running migrations...');
 
+  // Ensure database is ready
+  await waitForDb();
+  const db = getDb();
+
+  // Find schema.sql - check multiple possible locations
+  const possiblePaths = [
+    path.resolve('./docker/schema.sql'),
+    path.resolve('../docker/schema.sql'),
+    path.resolve(__dirname, '../../../docker/schema.sql'),
+    path.resolve(__dirname, '../../../../docker/schema.sql'),
+  ];
+
+  let schemaPath: string | null = null;
+  for (const p of possiblePaths) {
+    if (fs.existsSync(p)) {
+      schemaPath = p;
+      break;
+    }
+  }
+
+  if (!schemaPath) {
+    console.warn('[DB] schema.sql not found, skipping migrations. Searched:', possiblePaths);
+    return;
+  }
+
+  const schemaSql = fs.readFileSync(schemaPath, 'utf-8');
+
+  // Execute schema (all CREATE TABLE IF NOT EXISTS, so idempotent)
+  try {
+    db.exec(schemaSql);
+    console.log('[DB] Schema applied successfully');
+  } catch (error) {
+    console.error('[DB] Failed to apply schema:', error);
+    throw error;
+  }
+
   // Check current schema version
   try {
-    const result = await query('SELECT MAX(version) as version FROM schema_version');
-    const currentVersion = (result.rows[0]?.version as number) || 0;
+    const stmt = db.prepare('SELECT MAX(version) as version FROM schema_version');
+    const rows: any[] = [];
+    while (stmt.step()) {
+      rows.push(stmt.getAsObject());
+    }
+    stmt.free();
+    const currentVersion = rows[0]?.version || 0;
     console.log(`[DB] Current schema version: ${currentVersion}`);
 
     // Apply incremental migrations
-    await applyIncrementalMigrations(currentVersion);
+    await applyIncrementalMigrations(db, currentVersion);
   } catch (error) {
     console.error('[DB] Failed to check schema version:', error);
   }
@@ -41,55 +92,71 @@ const PROFILE_AWARE_TABLES = [
   'habits',
 ] as const;
 
-export async function applyIncrementalMigrations(currentVersion: number): Promise<void> {
-  const migrations: Array<{
-    version: number;
-    name: string;
-    sql: string;
-    postMigrate?: () => Promise<void>;
-  }> = [
+/**
+ * SQLite 没有 ADD COLUMN IF NOT EXISTS / DROP CONSTRAINT（PG 方言特性），
+ * 且 db.exec 多语句会在第一条报错处截断。照 v32 先例：逐条 try/catch，
+ * 失败（典型为 schema.sql 重叠或更早迁移已建列）仅警告跳过，不拖垮整条迁移链。
+ * 统一走 query()（与 postMigrate 钩子同一通道，享受集中方言转换）。
+ */
+async function tryExec(label: string, sql: string): Promise<void> {
+  try {
+    await query(sql);
+  } catch (e: any) {
+    console.warn(`[DB] ${label} skipped: ${e?.message ?? e}`);
+  }
+}
+
+export async function applyIncrementalMigrations(dbOrVersion: any, currentVersion?: number): Promise<void> {
+  // 双形态签名：docker 运行时传 (db, currentVersion)；单参形态兼容 vercel 上游/既有测试的
+  // (currentVersion) 调用习惯（此时经 getDb() 取库）。
+  const db: any = currentVersion === undefined ? getDb() : dbOrVersion;
+  const fromVersion: number = currentVersion === undefined ? Number(dbOrVersion) || 0 : currentVersion;
+  const migrations: Array<{ version: number; name: string; sql: string; postMigrate?: (db: any) => void | Promise<void> }> = [
     {
+      // SQLite 不支持 ADD COLUMN IF NOT EXISTS（PG 方言特性，sql.js 实测语法报错）。
+      // api_key 不在 schema.sql 中，去掉该子句即可；版本号门闩保证只执行一次。
       version: 2,
       name: 'add_api_key_column',
-      sql: `ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS api_key TEXT;`
+      sql: `ALTER TABLE user_configs ADD COLUMN api_key TEXT;`
     },
     {
       version: 3,
       name: 'add_notification_queue',
       sql: `CREATE TABLE IF NOT EXISTS notification_queue (
-        id SERIAL PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_id INTEGER REFERENCES events(id) ON DELETE CASCADE,
         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
         channel TEXT NOT NULL,
         status TEXT DEFAULT 'pending',
         retry_count INTEGER DEFAULT 0,
         max_retries INTEGER DEFAULT 3,
-        next_retry_at TIMESTAMP,
+        next_retry_at TEXT,
         error_message TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
       );
       CREATE INDEX IF NOT EXISTS idx_notification_queue_status ON notification_queue(status);
       CREATE INDEX IF NOT EXISTS idx_notification_queue_user ON notification_queue(user_id);`
     },
     {
+      // schema.sql 的 events 已含 recurring_config（历史演进造成的重叠）：裸 ALTER 会报
+      // duplicate column 并在 db.exec 多语句处截断。照 v32 先例走 postMigrate tryExec：
+      // 列缺失时补建，已存在时仅警告，版本号照常落账（消除每次启动重跑报错的历史噪音）。
       version: 4,
       name: 'add_recurring_events',
-      sql: `ALTER TABLE events ADD COLUMN IF NOT EXISTS recurring_config TEXT;`
+      sql: `SELECT 1;`,
+      postMigrate: async () => {
+        await tryExec('v4 events.recurring_config', 'ALTER TABLE events ADD COLUMN recurring_config TEXT');
+      },
     },
     {
-      // D5 (checkbox 97): this statement used to say `next_occurrence TEXT`, but the
-      // `events` table is created by `shared/src/schema.pg.sql` (the full schema applied by
-      // scripts/migrate-db.ts BEFORE runMigrations) with `next_occurrence DATE`, and the
-      // incremental chain starts at v2 - no migration ever created `events`. So the TEXT
-      // intent never took effect anywhere: on every real database the column already exists
-      // with DATE and `ADD COLUMN IF NOT EXISTS` is a no-op. `event.service.ts` passes
-      // JS date strings, `digest.service.ts` compares it as a date and `og.ts` types it
-      // `Date | string | null` - all DATE-compatible. Aligned to DATE so the two sources
-      // of truth agree; no live column type is altered (a real DB is already DATE).
+      // 同 v4：next_occurrence 已在 schema.sql 中。
       version: 5,
       name: 'add_next_occurrence',
-      sql: `ALTER TABLE events ADD COLUMN IF NOT EXISTS next_occurrence DATE;`
+      sql: `SELECT 1;`,
+      postMigrate: async () => {
+        await tryExec('v5 events.next_occurrence', 'ALTER TABLE events ADD COLUMN next_occurrence TEXT');
+      },
     },
     {
       version: 6,
@@ -100,34 +167,39 @@ export async function applyIncrementalMigrations(currentVersion: number): Promis
       version: 7,
       name: 'add_push_subscriptions',
       sql: `CREATE TABLE IF NOT EXISTS push_subscriptions (
-        id SERIAL PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
         endpoint TEXT NOT NULL,
         keys_p256dh TEXT,
         keys_auth TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TEXT DEFAULT (datetime('now')),
         UNIQUE(user_id, endpoint)
       );
       CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id);`
     },
     {
+      // 同 v2：SQLite 不支持 ADD COLUMN IF NOT EXISTS；timezone 不在 schema.sql 中，去子句即可。
       version: 8,
       name: 'add_timezone_column',
-      sql: `ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'Asia/Shanghai';`
+      sql: `ALTER TABLE user_configs ADD COLUMN timezone TEXT DEFAULT 'Asia/Shanghai';`
     },
     {
       version: 9,
       name: 'hash_existing_api_keys',
       sql: `SELECT 1;`,
-      postMigrate: async () => {
+      postMigrate: (db: any) => {
         // Hash existing plaintext API keys in-place (SHA-256)
-        const result = await query('SELECT user_id, api_key FROM user_configs WHERE api_key IS NOT NULL');
-        const rows = result.rows as Array<{ user_id: number; api_key: string }>;
+        const stmt = db.prepare('SELECT user_id, api_key FROM user_configs WHERE api_key IS NOT NULL');
+        const rows: Array<{ user_id: number; api_key: string }> = [];
+        while (stmt.step()) {
+          rows.push(stmt.getAsObject() as any);
+        }
+        stmt.free();
         for (const row of rows) {
           // Skip if already hashed (64 hex chars = SHA-256 hash)
           if (row.api_key.length === 64 && /^[0-9a-f]+$/.test(row.api_key)) continue;
           const hash = createHash('sha256').update(row.api_key).digest('hex');
-          await query('UPDATE user_configs SET api_key = $1 WHERE user_id = $2', [hash, row.user_id]);
+          db.run('UPDATE user_configs SET api_key = ? WHERE user_id = ?', [hash, row.user_id]);
         }
         if (rows.length > 0) {
           console.log(`[DB] Hashed ${rows.length} existing API key(s)`);
@@ -135,21 +207,25 @@ export async function applyIncrementalMigrations(currentVersion: number): Promis
       },
     },
     {
+      // 同 v4：channel_results 已在 schema.sql 的 event_trigger_logs 中，走 postMigrate tryExec。
       version: 10,
       name: 'add_channel_results_column',
-      sql: `ALTER TABLE event_trigger_logs ADD COLUMN IF NOT EXISTS channel_results TEXT;`
+      sql: `SELECT 1;`,
+      postMigrate: async () => {
+        await tryExec('v10 event_trigger_logs.channel_results', 'ALTER TABLE event_trigger_logs ADD COLUMN channel_results TEXT');
+      },
     },
     {
       version: 11,
       name: 'add_plugin_sessions',
       sql: `CREATE TABLE IF NOT EXISTS plugin_sessions (
-        id SERIAL PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         channel_type TEXT NOT NULL,
         session_id TEXT UNIQUE NOT NULL,
         session_data TEXT,
         status TEXT DEFAULT 'pending',
-        expires_at TIMESTAMP NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        expires_at TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
       );
       CREATE INDEX IF NOT EXISTS idx_plugin_sessions_id ON plugin_sessions(session_id);
       CREATE INDEX IF NOT EXISTS idx_plugin_sessions_expires ON plugin_sessions(expires_at);`
@@ -157,38 +233,45 @@ export async function applyIncrementalMigrations(currentVersion: number): Promis
     {
       version: 12,
       name: 'add_trigger_log_failure_details',
-      sql: `ALTER TABLE event_trigger_logs ADD COLUMN IF NOT EXISTS error_details TEXT;
-ALTER TABLE event_trigger_logs ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0;
-ALTER TABLE event_trigger_logs ADD COLUMN IF NOT EXISTS channel_type TEXT;
-ALTER TABLE event_trigger_logs ADD COLUMN IF NOT EXISTS account_id INTEGER;`
+      sql: `ALTER TABLE event_trigger_logs ADD COLUMN error_details TEXT;
+ALTER TABLE event_trigger_logs ADD COLUMN retry_count INTEGER DEFAULT 0;
+ALTER TABLE event_trigger_logs ADD COLUMN channel_type TEXT;
+ALTER TABLE event_trigger_logs ADD COLUMN account_id INTEGER;`
     },
     {
       version: 13,
       name: 'add_connection_status',
-      sql: `ALTER TABLE notification_accounts ADD COLUMN IF NOT EXISTS connection_status TEXT;`
+      sql: `ALTER TABLE notification_accounts ADD COLUMN connection_status TEXT;`
     },
     {
       version: 14,
       name: 'add_test_result_columns',
-      sql: `ALTER TABLE notification_accounts ADD COLUMN IF NOT EXISTS last_test_result TEXT;
-ALTER TABLE notification_accounts ADD COLUMN IF NOT EXISTS last_test_at TEXT;`
+      sql: `ALTER TABLE notification_accounts ADD COLUMN last_test_result TEXT;
+ALTER TABLE notification_accounts ADD COLUMN last_test_at TEXT;`
     },
+    {
+      version: 15,
+      name: 'add_quiet_hours',
+      sql: `ALTER TABLE user_configs ADD COLUMN quiet_hours_start TEXT;
+ALTER TABLE user_configs ADD COLUMN quiet_hours_end TEXT;`
+    },
+    // v16-32 粗略移植自 vercel backend/src/db/migrate.ts (Approach B: JSONB->TEXT, SERIAL->INTEGER, TIMESTAMP->TEXT, BOOLEAN->INTEGER, jsonb_build_object->json_object)
     {
       version: 16,
       name: 'vercel_free_tier_features',
-      sql: `ALTER TABLE events ADD COLUMN IF NOT EXISTS tags JSONB DEFAULT '[]';
-ALTER TABLE events ADD COLUMN IF NOT EXISTS share_token TEXT;
-ALTER TABLE events ADD COLUMN IF NOT EXISTS event_photo_url TEXT;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP;
-ALTER TABLE event_trigger_logs ADD COLUMN IF NOT EXISTS read_at TIMESTAMP;
+      sql: `ALTER TABLE events ADD COLUMN tags TEXT DEFAULT '[]';
+ALTER TABLE events ADD COLUMN share_token TEXT;
+ALTER TABLE events ADD COLUMN event_photo_url TEXT;
+ALTER TABLE user_configs ADD COLUMN password_changed_at TEXT;
+ALTER TABLE event_trigger_logs ADD COLUMN read_at TEXT;
 CREATE TABLE IF NOT EXISTS cron_execution_logs (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   job_name TEXT NOT NULL,
   status TEXT NOT NULL,
   duration_ms INTEGER,
   result_summary TEXT,
   error_message TEXT,
-  executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  executed_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_cron_logs_job ON cron_execution_logs(job_name, executed_at);`
     },
@@ -198,7 +281,7 @@ CREATE INDEX IF NOT EXISTS idx_cron_logs_job ON cron_execution_logs(job_name, ex
       sql: `CREATE TABLE IF NOT EXISTS rate_limits (
   key TEXT PRIMARY KEY,
   count INTEGER NOT NULL DEFAULT 1,
-  window_start TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  window_start TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS security_events (
   id TEXT PRIMARY KEY,
@@ -207,14 +290,14 @@ CREATE TABLE IF NOT EXISTS security_events (
   event_type TEXT NOT NULL,
   ip_address TEXT,
   user_agent TEXT,
-  metadata JSONB DEFAULT '{}',
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  metadata TEXT DEFAULT '{}',
+  created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_security_events_user ON security_events(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_login_logs_ip_time ON login_logs(ip_address, login_time);
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS ip_whitelist JSONB DEFAULT '[]';
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS ip_whitelist_enabled BOOLEAN DEFAULT FALSE;
-ALTER TABLE sessions ADD COLUMN IF NOT EXISTS refresh_family TEXT;
+ALTER TABLE user_configs ADD COLUMN ip_whitelist TEXT DEFAULT '[]';
+ALTER TABLE user_configs ADD COLUMN ip_whitelist_enabled INTEGER DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN refresh_family TEXT;
 CREATE TABLE IF NOT EXISTS webauthn_credentials (
   id TEXT PRIMARY KEY,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -222,14 +305,14 @@ CREATE TABLE IF NOT EXISTS webauthn_credentials (
   public_key TEXT NOT NULL,
   counter INTEGER DEFAULT 0,
   device_name TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT DEFAULT (datetime('now'))
 );`
     },
     {
       version: 18,
       name: 'contacts_broadcast_v18',
       sql: `CREATE TABLE IF NOT EXISTS fixed_contacts (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   nickname TEXT,
@@ -238,16 +321,16 @@ CREATE TABLE IF NOT EXISTS webauthn_credentials (
   telegram_chat_id TEXT,
   qq TEXT,
   wxpusher_uid TEXT,
-  preferred_channels JSONB DEFAULT '[]',
+  preferred_channels TEXT DEFAULT '[]',
   notes TEXT,
   validation_status TEXT DEFAULT 'pending',
-  last_validated_at TIMESTAMP,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  last_validated_at TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_fixed_contacts_user ON fixed_contacts(user_id);
 CREATE TABLE IF NOT EXISTS broadcast_campaigns (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   subject TEXT NOT NULL,
   body_html TEXT NOT NULL,
@@ -256,13 +339,13 @@ CREATE TABLE IF NOT EXISTS broadcast_campaigns (
   failed_count INTEGER DEFAULT 0,
   status TEXT DEFAULT 'pending',
   recipient_source TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  completed_at TIMESTAMP
+  created_at TEXT DEFAULT (datetime('now')),
+  completed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_broadcast_campaigns_user ON broadcast_campaigns(user_id);
-ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS broadcast_id INTEGER REFERENCES broadcast_campaigns(id) ON DELETE SET NULL;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS email_opt_out BOOLEAN DEFAULT FALSE;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT FALSE;`
+ALTER TABLE email_logs ADD COLUMN broadcast_id INTEGER REFERENCES broadcast_campaigns(id) ON DELETE SET NULL;
+ALTER TABLE user_configs ADD COLUMN email_opt_out INTEGER DEFAULT 0;
+ALTER TABLE user_configs ADD COLUMN must_change_password INTEGER DEFAULT 0;`
     },
     {
       version: 19,
@@ -271,85 +354,70 @@ ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN D
   challenge TEXT PRIMARY KEY,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   type TEXT NOT NULL,
-  expires_at TIMESTAMP NOT NULL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  expires_at TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_expires ON webauthn_challenges(expires_at);
-ALTER TABLE webauthn_credentials ADD COLUMN IF NOT EXISTS transports TEXT;
-ALTER TABLE webauthn_credentials ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP;`
+ALTER TABLE webauthn_credentials ADD COLUMN transports TEXT;
+ALTER TABLE webauthn_credentials ADD COLUMN last_used_at TEXT;`
     },
     {
       version: 20,
       name: 'totp_enabled_flag_v20',
-      sql: `ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN DEFAULT FALSE;`,
-      postMigrate: async () => {
-        // Users who completed enable flow (logged in security_events)
-        await query(
-          `UPDATE users u SET totp_enabled = TRUE
-           WHERE u.totp_secret IS NOT NULL
-             AND EXISTS (
-               SELECT 1 FROM security_events se
-               WHERE se.user_id = u.id AND se.event_type = 'totp_enabled'
-             )`,
-        );
-        // Incomplete setup: secret written at /totp/setup but never confirmed at /totp/enable
-        const cleared = await query(
-          `UPDATE users SET totp_secret = NULL, totp_enabled = FALSE
-           WHERE totp_secret IS NOT NULL AND COALESCE(totp_enabled, FALSE) = FALSE
-           RETURNING id, username`,
-        );
-        if (cleared.rows.length > 0) {
-          console.log(
-            `[DB] Cleared incomplete TOTP setup for: ${cleared.rows.map((r: { username: string }) => r.username).join(', ')}`,
-          );
+      sql: `ALTER TABLE users ADD COLUMN totp_enabled INTEGER DEFAULT 0;`,
+      postMigrate: (db: any) => {
+        try {
+          db.exec(`UPDATE users SET totp_enabled = 1 WHERE totp_secret IS NOT NULL AND EXISTS (SELECT 1 FROM security_events se WHERE se.user_id = users.id AND se.event_type = 'totp_enabled')`);
+          // 清理未完成 TOTP 半配置：仅 secret 非空且未启用
+          db.exec(`UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE totp_secret IS NOT NULL AND COALESCE(totp_enabled, 0) = 0 AND NOT EXISTS (SELECT 1 FROM security_events se WHERE se.user_id = users.id AND se.event_type = 'totp_enabled')`);
+          console.log('[DB] v20 totp_enabled migration done');
+        } catch (e) {
+          console.warn('[DB] v20 postMigrate skipped:', e);
         }
       },
     },
     {
       version: 21,
       name: 'notification_defaults_email_logs_v21',
-      sql: `ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS default_test_email TEXT;
-ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE CASCADE;
-ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS subject TEXT;
-ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS error_message TEXT;
-ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS channel_type TEXT DEFAULT 'email';
+      sql: `ALTER TABLE user_configs ADD COLUMN default_test_email TEXT;
+ALTER TABLE email_logs ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE CASCADE;
+ALTER TABLE email_logs ADD COLUMN subject TEXT;
+ALTER TABLE email_logs ADD COLUMN error_message TEXT;
+ALTER TABLE email_logs ADD COLUMN channel_type TEXT DEFAULT 'email';
 CREATE INDEX IF NOT EXISTS idx_email_logs_user_sent ON email_logs(user_id, sent_at);
-ALTER TABLE notification_queue ADD COLUMN IF NOT EXISTS account_id INTEGER;
-CREATE INDEX IF NOT EXISTS idx_notification_queue_retry ON notification_queue(status, next_retry_at);`,
+ALTER TABLE notification_queue ADD COLUMN account_id INTEGER;
+CREATE INDEX IF NOT EXISTS idx_notification_queue_retry ON notification_queue(status, next_retry_at);`
     },
     {
       version: 22,
       name: 'integrations_v22',
-      sql: `ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS webhook_inbound_token TEXT;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS webhook_inbound_secret TEXT;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS calendar_feed_token TEXT;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS external_calendar_urls JSONB DEFAULT '[]';
-ALTER TABLE events ADD COLUMN IF NOT EXISTS timezone TEXT;
+      sql: `ALTER TABLE user_configs ADD COLUMN webhook_inbound_token TEXT;
+ALTER TABLE user_configs ADD COLUMN webhook_inbound_secret TEXT;
+ALTER TABLE user_configs ADD COLUMN calendar_feed_token TEXT;
+ALTER TABLE user_configs ADD COLUMN external_calendar_urls TEXT DEFAULT '[]';
+ALTER TABLE events ADD COLUMN timezone TEXT;
 CREATE TABLE IF NOT EXISTS event_reminder_cache (
   user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  payload JSONB NOT NULL DEFAULT '[]',
-  expires_at TIMESTAMP NOT NULL,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  payload TEXT NOT NULL DEFAULT '[]',
+  expires_at TEXT NOT NULL,
+  updated_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_event_reminder_cache_expires ON event_reminder_cache(expires_at);`,
-      postMigrate: async () => {
-        const { randomBytes } = await import('crypto');
-        const users = await query(
-          `SELECT user_id FROM user_configs
-           WHERE webhook_inbound_token IS NULL OR calendar_feed_token IS NULL`,
-        );
-        for (const row of users.rows as Array<{ user_id: number }>) {
-          const webhookToken = randomBytes(24).toString('hex');
-          const feedToken = randomBytes(24).toString('hex');
-          const webhookSecret = randomBytes(32).toString('hex');
-          await query(
-            `UPDATE user_configs SET
-               webhook_inbound_token = COALESCE(webhook_inbound_token, $1),
-               calendar_feed_token = COALESCE(calendar_feed_token, $2),
-               webhook_inbound_secret = COALESCE(webhook_inbound_secret, $3)
-             WHERE user_id = $4`,
-            [webhookToken, feedToken, webhookSecret, row.user_id],
-          );
+      postMigrate: (db: any) => {
+        try {
+          const stmt = db.prepare('SELECT user_id FROM user_configs WHERE webhook_inbound_token IS NULL OR calendar_feed_token IS NULL');
+          const rows: Array<{ user_id: number }> = [];
+          while (stmt.step()) rows.push(stmt.getAsObject() as any);
+          stmt.free();
+          for (const r of rows) {
+            const webhookToken = randomBytes(24).toString('hex');
+            const feedToken = randomBytes(24).toString('hex');
+            const webhookSecret = randomBytes(32).toString('hex');
+            db.run('UPDATE user_configs SET webhook_inbound_token = COALESCE(webhook_inbound_token, ?), calendar_feed_token = COALESCE(calendar_feed_token, ?), webhook_inbound_secret = COALESCE(webhook_inbound_secret, ?) WHERE user_id = ?', [webhookToken, feedToken, webhookSecret, r.user_id]);
+          }
+          if (rows.length) console.log(`[DB] v22 generated tokens for ${rows.length} user(s)`);
+        } catch (e) {
+          console.warn('[DB] v22 postMigrate skipped:', e);
         }
       },
     },
@@ -357,7 +425,7 @@ CREATE INDEX IF NOT EXISTS idx_event_reminder_cache_expires ON event_reminder_ca
       version: 23,
       name: 'inbox_messages_v23',
       sql: `CREATE TABLE IF NOT EXISTS inbox_messages (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   title TEXT NOT NULL,
   body TEXT NOT NULL,
@@ -365,28 +433,27 @@ CREATE INDEX IF NOT EXISTS idx_event_reminder_cache_expires ON event_reminder_ca
   channel TEXT,
   event_id INTEGER,
   sender_label TEXT,
-  is_read BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  is_read INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_inbox_messages_user_created ON inbox_messages(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_inbox_messages_user_created ON inbox_messages(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_inbox_messages_user_unread ON inbox_messages(user_id, is_read);
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS inbox_receive_token TEXT;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS inbox_receive_secret TEXT;`,
-      postMigrate: async () => {
-        const { randomBytes } = await import('crypto');
-        const users = await query(
-          `SELECT user_id FROM user_configs WHERE inbox_receive_token IS NULL`,
-        );
-        for (const row of users.rows as Array<{ user_id: number }>) {
-          const token = randomBytes(24).toString('hex');
-          const secret = randomBytes(32).toString('hex');
-          await query(
-            `UPDATE user_configs SET
-               inbox_receive_token = COALESCE(inbox_receive_token, $1),
-               inbox_receive_secret = COALESCE(inbox_receive_secret, $2)
-             WHERE user_id = $3`,
-            [token, secret, row.user_id],
-          );
+ALTER TABLE user_configs ADD COLUMN inbox_receive_token TEXT;
+ALTER TABLE user_configs ADD COLUMN inbox_receive_secret TEXT;`,
+      postMigrate: (db: any) => {
+        try {
+          const stmt = db.prepare('SELECT user_id FROM user_configs WHERE inbox_receive_token IS NULL');
+          const rows: Array<{ user_id: number }> = [];
+          while (stmt.step()) rows.push(stmt.getAsObject() as any);
+          stmt.free();
+          for (const r of rows) {
+            const token = randomBytes(24).toString('hex');
+            const secret = randomBytes(32).toString('hex');
+            db.run('UPDATE user_configs SET inbox_receive_token = COALESCE(inbox_receive_token, ?), inbox_receive_secret = COALESCE(inbox_receive_secret, ?) WHERE user_id = ?', [token, secret, r.user_id]);
+          }
+          if (rows.length) console.log(`[DB] v23 generated inbox tokens for ${rows.length} user(s)`);
+        } catch (e) {
+          console.warn('[DB] v23 postMigrate skipped:', e);
         }
       },
     },
@@ -394,71 +461,70 @@ ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS inbox_receive_secret TEXT;`,
       version: 24,
       name: 'optimizations_v24',
       sql: `CREATE TABLE IF NOT EXISTS webhook_idempotency_keys (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   idempotency_key TEXT NOT NULL UNIQUE,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   response_body TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_idempotency_created ON webhook_idempotency_keys(created_at);
 CREATE TABLE IF NOT EXISTS stats_daily (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-  stat_date DATE NOT NULL,
+  stat_date TEXT NOT NULL,
   events_count INTEGER DEFAULT 0,
   triggers_total INTEGER DEFAULT 0,
   triggers_success INTEGER DEFAULT 0,
   triggers_failed INTEGER DEFAULT 0,
   UNIQUE(user_id, stat_date)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_trigger_dedup_success
-  ON event_trigger_logs(event_id, trigger_date) WHERE status = 'success';
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS calendar_feed_tokens JSONB DEFAULT '[]';
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS external_calendar_sync_strategy TEXT DEFAULT 'add_only';
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS api_scopes TEXT DEFAULT 'read,write';
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS lunar_reminders_enabled BOOLEAN DEFAULT FALSE;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS caldav_url TEXT;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS caldav_username TEXT;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS caldav_password_encrypted TEXT;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS outbound_webhook_url TEXT;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS resend_webhook_secret TEXT;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS markdown_email_template TEXT;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS notification_preset TEXT;`,
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trigger_dedup_success ON event_trigger_logs(event_id, trigger_date) WHERE status = 'success';
+ALTER TABLE user_configs ADD COLUMN calendar_feed_tokens TEXT DEFAULT '[]';
+ALTER TABLE user_configs ADD COLUMN external_calendar_sync_strategy TEXT DEFAULT 'add_only';
+ALTER TABLE user_configs ADD COLUMN api_scopes TEXT DEFAULT 'read,write';
+ALTER TABLE user_configs ADD COLUMN lunar_reminders_enabled INTEGER DEFAULT 0;
+ALTER TABLE user_configs ADD COLUMN caldav_url TEXT;
+ALTER TABLE user_configs ADD COLUMN caldav_username TEXT;
+ALTER TABLE user_configs ADD COLUMN caldav_password_encrypted TEXT;
+ALTER TABLE user_configs ADD COLUMN outbound_webhook_url TEXT;
+ALTER TABLE user_configs ADD COLUMN resend_webhook_secret TEXT;
+ALTER TABLE user_configs ADD COLUMN markdown_email_template TEXT;
+ALTER TABLE user_configs ADD COLUMN notification_preset TEXT;`
     },
     {
       version: 25,
       name: 'features_v25',
       sql: `CREATE TABLE IF NOT EXISTS contact_groups (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS contact_group_members (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   group_id INTEGER NOT NULL REFERENCES contact_groups(id) ON DELETE CASCADE,
   email TEXT NOT NULL,
   name TEXT,
   UNIQUE(group_id, email)
 );
 CREATE TABLE IF NOT EXISTS conditional_reminder_rules (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   days_before INTEGER NOT NULL,
-  channels JSONB NOT NULL DEFAULT '[]',
-  is_active BOOLEAN DEFAULT TRUE,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  channels TEXT NOT NULL DEFAULT '[]',
+  is_active INTEGER DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS audit_logs (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   action TEXT NOT NULL,
   entity_type TEXT,
   entity_id TEXT,
-  details JSONB,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  details TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_audit_logs_user_created ON audit_logs(user_id, created_at DESC);`,
+CREATE INDEX IF NOT EXISTS idx_audit_logs_user_created ON audit_logs(user_id, created_at);`
     },
     {
       version: 26,
@@ -466,136 +532,100 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_user_created ON audit_logs(user_id, cr
       sql: `CREATE TABLE IF NOT EXISTS reminder_send_claims (
   event_id INTEGER NOT NULL,
   trigger_date TEXT NOT NULL,
-  claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  claimed_at TEXT DEFAULT (datetime('now')),
   PRIMARY KEY (event_id, trigger_date)
 );
-CREATE INDEX IF NOT EXISTS idx_reminder_claims_claimed ON reminder_send_claims(claimed_at);`,
+CREATE INDEX IF NOT EXISTS idx_reminder_claims_claimed ON reminder_send_claims(claimed_at);`
     },
     {
       version: 27,
       name: 'google_oauth_calendar_v27',
-      sql: `ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS google_oauth_refresh_token_encrypted TEXT;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS google_oauth_email TEXT;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS google_calendar_id TEXT DEFAULT 'primary';
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS google_oauth_connected_at TIMESTAMP;`,
+      sql: `ALTER TABLE user_configs ADD COLUMN google_oauth_refresh_token_encrypted TEXT;
+ALTER TABLE user_configs ADD COLUMN google_oauth_email TEXT;
+ALTER TABLE user_configs ADD COLUMN google_calendar_id TEXT DEFAULT 'primary';
+ALTER TABLE user_configs ADD COLUMN google_oauth_connected_at TEXT;`
     },
     {
       version: 28,
       name: 'alert_settings_v28',
-      sql: `ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS alert_emails JSONB DEFAULT '[]';
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS alert_account_ids JSONB DEFAULT '[]';`,
+      sql: `ALTER TABLE user_configs ADD COLUMN alert_emails TEXT DEFAULT '[]';
+ALTER TABLE user_configs ADD COLUMN alert_account_ids TEXT DEFAULT '[]';`
     },
     {
       version: 29,
       name: 'todo_completions_v29',
       sql: `CREATE TABLE IF NOT EXISTS todo_completions (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-  occurrence_date DATE NOT NULL,
-  completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  occurrence_date TEXT NOT NULL,
+  completed_at TEXT DEFAULT (datetime('now')),
   UNIQUE(user_id, event_id, occurrence_date)
 );
-CREATE INDEX IF NOT EXISTS idx_todo_completions_user ON todo_completions(user_id);`,
+CREATE INDEX IF NOT EXISTS idx_todo_completions_user ON todo_completions(user_id);`
     },
     {
       version: 30,
       name: 'contact_methods_v30',
-      sql: `ALTER TABLE fixed_contacts ADD COLUMN IF NOT EXISTS contact_methods JSONB DEFAULT '{}';
-UPDATE fixed_contacts SET contact_methods = jsonb_build_object(
-  'emails', CASE WHEN email IS NOT NULL AND email <> '' THEN jsonb_build_array(jsonb_build_object('label', '默认', 'value', email)) ELSE '[]'::jsonb END,
-  'phones', CASE WHEN phone IS NOT NULL AND phone <> '' THEN jsonb_build_array(jsonb_build_object('label', '默认', 'value', phone)) ELSE '[]'::jsonb END,
-  'telegrams', CASE WHEN telegram_chat_id IS NOT NULL AND telegram_chat_id <> '' THEN jsonb_build_array(jsonb_build_object('label', '默认', 'value', telegram_chat_id)) ELSE '[]'::jsonb END,
-  'qqs', CASE WHEN qq IS NOT NULL AND qq <> '' THEN jsonb_build_array(jsonb_build_object('label', '默认', 'value', qq)) ELSE '[]'::jsonb END,
-  'wxpusherUids', CASE WHEN wxpusher_uid IS NOT NULL AND wxpusher_uid <> '' THEN jsonb_build_array(jsonb_build_object('label', '默认', 'value', wxpusher_uid)) ELSE '[]'::jsonb END
-) WHERE contact_methods IS NULL OR contact_methods = '{}'::jsonb;`,
+      sql: `ALTER TABLE fixed_contacts ADD COLUMN contact_methods TEXT DEFAULT '{}';
+-- 粗略移植 PG jsonb_build_object -> SQLite json_object/json_array，::jsonb 去除
+UPDATE fixed_contacts SET contact_methods = json_object(
+  'emails', CASE WHEN email IS NOT NULL AND email != '' THEN json_array(json_object('label', '默认', 'value', email)) ELSE json('[]') END,
+  'phones', CASE WHEN phone IS NOT NULL AND phone != '' THEN json_array(json_object('label', '默认', 'value', phone)) ELSE json('[]') END,
+  'telegrams', CASE WHEN telegram_chat_id IS NOT NULL AND telegram_chat_id != '' THEN json_array(json_object('label', '默认', 'value', telegram_chat_id)) ELSE json('[]') END,
+  'qqs', CASE WHEN qq IS NOT NULL AND qq != '' THEN json_array(json_object('label', '默认', 'value', qq)) ELSE json('[]') END,
+  'wxpusherUids', CASE WHEN wxpusher_uid IS NOT NULL AND wxpusher_uid != '' THEN json_array(json_object('label', '默认', 'value', wxpusher_uid)) ELSE json('[]') END
+) WHERE contact_methods IS NULL OR contact_methods = '{}';`
     },
     {
       version: 31,
       name: 'contact_relationship_gender_v31',
-      sql: `ALTER TABLE fixed_contacts ADD COLUMN IF NOT EXISTS relationship TEXT;
-ALTER TABLE fixed_contacts ADD COLUMN IF NOT EXISTS gender TEXT DEFAULT 'unknown';`,
+      sql: `ALTER TABLE fixed_contacts ADD COLUMN relationship TEXT;
+ALTER TABLE fixed_contacts ADD COLUMN gender TEXT DEFAULT 'unknown';`
     },
     {
       version: 32,
       name: 'session_data_text_v32',
-      sql: `ALTER TABLE notification_accounts ADD COLUMN IF NOT EXISTS session_data_text TEXT;`,
-      postMigrate: async () => {
-        const result = await query(
-          `SELECT id, session_data, session_data_text FROM notification_accounts
-           WHERE session_data IS NOT NULL AND session_data_text IS NULL`
-        );
-        for (const row of result.rows as Array<{ id: number; session_data: unknown }>) {
-          const raw = row.session_data;
-          let textValue: string | null = null;
-          if (raw == null) {
-            textValue = null;
-          } else if (typeof raw === 'string') {
-            textValue = raw;
-          } else if (typeof raw === 'object') {
-            // JSONB string primitive or legacy plain object — both become TEXT for AES storage
-            const asAny = raw as { smtpProvider?: string };
-            if (typeof asAny.smtpProvider === 'string' || Object.keys(raw as object).length > 0) {
-              textValue = JSON.stringify(raw);
-            }
+      sql: `ALTER TABLE notification_accounts ADD COLUMN session_data_text TEXT;`,
+      postMigrate: (db: any) => {
+        // 粗略版：先新增 TEXT 列并拷贝数据；DROP COLUMN 在 SQLite 需重建表，此处仅尝试，不成功则留注释由后续完整迁移处理
+        try {
+          const stmt = db.prepare('SELECT id, session_data, session_data_text FROM notification_accounts WHERE session_data IS NOT NULL AND session_data_text IS NULL');
+          const rows: Array<{ id: number; session_data: any }> = [];
+          while (stmt.step()) rows.push(stmt.getAsObject() as any);
+          stmt.free();
+          for (const row of rows) {
+            let textValue: string | null = null;
+            const raw: any = row.session_data;
+            if (raw == null) textValue = null;
+            else if (typeof raw === 'string') textValue = raw;
+            else if (typeof raw === 'object') textValue = JSON.stringify(raw);
+            if (textValue != null) db.run('UPDATE notification_accounts SET session_data_text = ? WHERE id = ?', [textValue, row.id]);
           }
-          if (textValue != null) {
-            await query(
-              'UPDATE notification_accounts SET session_data_text = $1 WHERE id = $2',
-              [textValue, row.id]
-            );
-          }
+          if (rows.length) console.log(`[DB] v32 copied session_data -> session_data_text for ${rows.length} row(s)`);
+          // 尝试 SQLite DROP/COLUMN RENAME（新版 SQLite 支持，旧版会抛错则仅警告）
+          try { db.exec('ALTER TABLE notification_accounts DROP COLUMN session_data;'); } catch { console.warn('[DB] v32 DROP COLUMN session_data skipped (需重建表，粗略版保留)'); }
+          try { db.exec('ALTER TABLE notification_accounts RENAME COLUMN session_data_text TO session_data;'); } catch { console.warn('[DB] v32 RENAME COLUMN skipped'); }
+          // TODO 完整重建表思路: CREATE TABLE notification_accounts_new (... session_data TEXT ...); INSERT INTO ... SELECT ...; DROP TABLE notification_accounts; ALTER TABLE ... RENAME TO ...
+        } catch (e) {
+          console.warn('[DB] v32 postMigrate skipped:', e);
         }
-        await query('ALTER TABLE notification_accounts DROP COLUMN IF EXISTS session_data;');
-        await query(
-          'ALTER TABLE notification_accounts RENAME COLUMN session_data_text TO session_data;'
-        );
       },
     },
     {
-      // v33 (todo 41): bound the growth of logging tables + add the missing indexes.
-      // Additive and idempotent: every statement is IF NOT EXISTS-guarded and
-      // nothing is dropped or rewritten. The DO block only fires for tables that
-      // a later migration may have created (expiry_items); it is a no-op today.
       version: 33,
-      name: 'logging_indexes_retention_v33',
-      sql: `-- pg_trgm powers CJK substring search through GIN trigram indexes, no external calls
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
--- Trigram indexes on the existing searchable text columns
-CREATE INDEX IF NOT EXISTS idx_events_name_trgm ON events USING gin (name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_events_person_name_trgm ON events USING gin (person_name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_events_tags_trgm ON events USING gin ((tags::text) gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_fixed_contacts_name_trgm ON fixed_contacts USING gin (name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_fixed_contacts_nickname_trgm ON fixed_contacts USING gin (nickname gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_fixed_contacts_notes_trgm ON fixed_contacts USING gin (notes gin_trgm_ops);
--- Missing access-path indexes for the logging tables
-CREATE INDEX IF NOT EXISTS idx_trigger_logs_user_created ON event_trigger_logs(user_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_trigger_logs_consecutive ON event_trigger_logs(account_id, channel_type, status, id DESC);
-CREATE INDEX IF NOT EXISTS idx_email_logs_user_sent_desc ON email_logs(user_id, sent_at DESC);
-CREATE INDEX IF NOT EXISTS idx_notification_queue_retry ON notification_queue(status, next_retry_at);
-CREATE INDEX IF NOT EXISTS idx_login_attempts_last_attempt ON login_attempts(last_attempt);
--- Forward-looking trigram indexes for tables created by a later migration
-DO $$
-BEGIN
-  IF to_regclass('expiry_items') IS NOT NULL THEN
-    CREATE INDEX IF NOT EXISTS idx_expiry_items_title_trgm ON expiry_items USING gin (title gin_trgm_ops);
-    CREATE INDEX IF NOT EXISTS idx_expiry_items_vendor_trgm ON expiry_items USING gin (vendor gin_trgm_ops);
-  END IF;
-END $$;`,
+      name: 'session_refresh_token_rotation_v33',
+      sql: `ALTER TABLE sessions ADD COLUMN refresh_token_id TEXT;`,
     },
     {
-      // v34 (todo 44): expiry-item domain - subscriptions, bills, insurance, domains,
-      // warranties, custom - plus its renew audit history (todo 45 writes it).
-      // The plan text said "version 32", but 32 (session_data_text_v32) and 33
-      // (logging_indexes_retention_v33) were already taken when this landed, so the
-      // next free number is 34. Additive and idempotent: every statement is
-      // IF NOT EXISTS-guarded and nothing existing is altered, dropped or rewritten.
+      // v34（vercel todo 44）: 到期项域 —— 订阅/账单/保险/域名/保修/自定义 + 续费审计历史
+      // （expiry_history，todo 45 写入）。纯增量 + 幂等：全部 IF NOT EXISTS，不改不删既有对象。
+      // SQLite 翻译：SERIAL→INTEGER AUTOINCREMENT、JSONB/DATE/TIMESTAMP→TEXT、BOOLEAN→INTEGER、
+      // TEXT[] DEFAULT '{}'→TEXT DEFAULT '[]'、部分索引 TRUE→1；文末 PG trgm DO 块整条删除。
       version: 34,
       name: 'expiry_items_v34',
-      sql: `-- Expiry items are a distinct entity from events: they carry cost/cycle metadata
--- and emit reminders through the shared engine (jobs/tasks.ts sendExpiryReminders).
-CREATE TABLE IF NOT EXISTS expiry_items (
-  id SERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS expiry_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   profile_id INTEGER,
   kind TEXT NOT NULL CHECK (kind IN ('subscription', 'bill', 'insurance', 'domain', 'warranty', 'custom')),
@@ -605,60 +635,39 @@ CREATE TABLE IF NOT EXISTS expiry_items (
   currency TEXT NOT NULL DEFAULT 'CNY',
   cycle TEXT NOT NULL DEFAULT 'once' CHECK (cycle IN ('once', 'monthly', 'quarterly', 'yearly', 'custom')),
   cycle_days INTEGER,
-  start_date DATE,
-  next_due_date DATE NOT NULL,
-  auto_renew BOOLEAN NOT NULL DEFAULT FALSE,
+  start_date TEXT,
+  next_due_date TEXT NOT NULL,
+  auto_renew INTEGER NOT NULL DEFAULT 0,
   notes TEXT,
-  tags TEXT[] DEFAULT '{}',
-  reminder_config JSONB,
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  tags TEXT DEFAULT '[]',
+  reminder_config TEXT,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_expiry_items_user_due ON expiry_items(user_id, next_due_date);
 CREATE INDEX IF NOT EXISTS idx_expiry_items_user_kind ON expiry_items(user_id, kind);
-CREATE INDEX IF NOT EXISTS idx_expiry_items_active_due ON expiry_items(user_id, next_due_date) WHERE is_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_expiry_items_active_due ON expiry_items(user_id, next_due_date) WHERE is_active = 1;
 CREATE TABLE IF NOT EXISTS expiry_history (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   item_id INTEGER NOT NULL REFERENCES expiry_items(id) ON DELETE CASCADE,
   action TEXT NOT NULL,
-  from_date DATE,
-  to_date DATE,
+  from_date TEXT,
+  to_date TEXT,
   amount_cents BIGINT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_expiry_history_item ON expiry_history(item_id, created_at DESC);
--- Fulfils the forward-looking trigram block v33 documented: it ran before this table
--- existed, so on a fresh DB the title/vendor trgm indexes were never created. Guarded
--- so a DB without pg_trgm (v33 failed on CREATE EXTENSION) still gets the tables.
-DO $$
-BEGIN
-  IF to_regclass('expiry_items') IS NOT NULL THEN
-    BEGIN
-      CREATE INDEX IF NOT EXISTS idx_expiry_items_title_trgm ON expiry_items USING gin (title gin_trgm_ops);
-      CREATE INDEX IF NOT EXISTS idx_expiry_items_vendor_trgm ON expiry_items USING gin (vendor gin_trgm_ops);
-    EXCEPTION WHEN undefined_object THEN
-      -- pg_trgm is unavailable; the q filter falls back to ILIKE
-      NULL;
-    END;
-  END IF;
-END $$;`,
+-- pg_trgm 全文索引在 SQLite 上由 LIKE 回退（见 search.service.ts）`,
     },
     {
-      // v35 (todo 49): inventory domain - quantity, expiry date and low-stock threshold.
-      // The plan text said "version: 33", but 33 (logging_indexes_retention_v33) and 34
-      // (expiry_items_v34) were already taken when this landed, so the next free number
-      // is 35 (the expiry lane owns 34). Additive and idempotent: every statement is
-      // IF NOT EXISTS-guarded and nothing existing is altered, dropped or rewritten.
-      // expires_at is NULLABLE on purpose: a non-perishable never enters the expiring
-      // query (which guards `expires_at IS NOT NULL`).
+      // v35（vercel todo 49）: 库存域 —— 数量/低库存阈值/可选过期日。expires_at 有意可空：
+      // 非消耗品不进 expiring 查询（该查询自带 expires_at IS NOT NULL 守卫）。
+      // trgm DO 块删除（同 v34）。
       version: 35,
       name: 'inventory_items_v35',
-      sql: `-- Inventory items are consumables: quantity + low_stock_threshold + optional expiry.
--- Reminders for rows with expires_at reuse the shared engine (jobs/tasks.ts) with
--- an inventory:-prefixed claim key, so no second scheduler exists.
-CREATE TABLE IF NOT EXISTS inventory_items (
-  id SERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS inventory_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   profile_id INTEGER,
   name TEXT NOT NULL,
@@ -666,46 +675,27 @@ CREATE TABLE IF NOT EXISTS inventory_items (
   quantity NUMERIC NOT NULL DEFAULT 1 CHECK (quantity >= 0),
   unit TEXT,
   low_stock_threshold NUMERIC CHECK (low_stock_threshold IS NULL OR low_stock_threshold >= 0),
-  purchased_at DATE,
-  expires_at DATE,
+  purchased_at TEXT,
+  expires_at TEXT,
   location TEXT,
   notes TEXT,
-  reminder_config JSONB,
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  reminder_config TEXT,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_inventory_items_user_expires ON inventory_items(user_id, expires_at);
 CREATE INDEX IF NOT EXISTS idx_inventory_items_user_category ON inventory_items(user_id, category);
-CREATE INDEX IF NOT EXISTS idx_inventory_items_active_expires ON inventory_items(user_id, expires_at) WHERE is_active = TRUE;
--- Forward-looking trigram for the q filter; guarded because pg_trgm may be absent
--- (v33 failed on CREATE EXTENSION in that case). Mirrors the v34 block.
-DO $$
-BEGIN
-  IF to_regclass('inventory_items') IS NOT NULL THEN
-    BEGIN
-      CREATE INDEX IF NOT EXISTS idx_inventory_items_name_trgm ON inventory_items USING gin (name gin_trgm_ops);
-    EXCEPTION WHEN undefined_object THEN
-      -- pg_trgm is unavailable; the q filter falls back to ILIKE
-      NULL;
-    END;
-  END IF;
-END $$;`,
+CREATE INDEX IF NOT EXISTS idx_inventory_items_active_expires ON inventory_items(user_id, expires_at) WHERE is_active = 1;
+-- pg_trgm 全文索引在 SQLite 上由 LIKE 回退（见 search.service.ts）`,
     },
     {
-      // v36 (todo 50): maintenance plans with a date interval (reminders through the
-      // shared engine) and/or a usage interval (inbox nudge at 10% remaining), plus
-      // the maintenance_logs audit table. The plan text said "version: 34", but the
-      // expiry lane owns 34, so this is 36. Additive and idempotent: every statement
-      // is IF NOT EXISTS-guarded and nothing existing is altered, dropped or rewritten.
-      // The table-level CHECK enforces the API-level rule that at least one interval
-      // must be set; it only applies on fresh table creation (idempotent no-op elsewhere).
+      // v36（vercel todo 50）: 保养计划 —— 日期区间（共享提醒引擎）和/或用量区间
+      // （剩余 10% 时收件箱轻推）+ maintenance_logs 审计表。表级 CHECK 强制至少配置一个区间。
       version: 36,
       name: 'maintenance_plans_v36',
-      sql: `-- Date interval -> next_due_at/date reminders; usage interval -> next_due_usage +
--- inbox nudge within 10%. Neither is a hard requirement alone, at least one is.
-CREATE TABLE IF NOT EXISTS maintenance_plans (
-  id SERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS maintenance_plans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   profile_id INTEGER,
   asset_name TEXT NOT NULL,
@@ -714,46 +704,38 @@ CREATE TABLE IF NOT EXISTS maintenance_plans (
   interval_usage INTEGER CHECK (interval_usage IS NULL OR interval_usage > 0),
   usage_unit TEXT CHECK (usage_unit IS NULL OR usage_unit IN ('km', 'hours', 'cycles')),
   current_usage NUMERIC CHECK (current_usage IS NULL OR current_usage >= 0),
-  last_done_at DATE,
-  next_due_at DATE,
+  last_done_at TEXT,
+  next_due_at TEXT,
   next_due_usage NUMERIC CHECK (next_due_usage IS NULL OR next_due_usage >= 0),
   notes TEXT,
-  reminder_config JSONB,
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  reminder_config TEXT,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT maintenance_plans_interval_present CHECK (interval_days IS NOT NULL OR interval_usage IS NOT NULL)
 );
 CREATE INDEX IF NOT EXISTS idx_maintenance_plans_user_due ON maintenance_plans(user_id, next_due_at);
 CREATE INDEX IF NOT EXISTS idx_maintenance_plans_user_kind ON maintenance_plans(user_id, asset_kind);
-CREATE INDEX IF NOT EXISTS idx_maintenance_plans_active_due ON maintenance_plans(user_id, next_due_at) WHERE is_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_maintenance_plans_active_due ON maintenance_plans(user_id, next_due_at) WHERE is_active = 1;
 CREATE TABLE IF NOT EXISTS maintenance_logs (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   plan_id INTEGER NOT NULL REFERENCES maintenance_plans(id) ON DELETE CASCADE,
-  done_at DATE NOT NULL,
+  done_at TEXT NOT NULL,
   usage_at NUMERIC,
   cost_cents BIGINT,
   notes TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_maintenance_logs_plan ON maintenance_logs(plan_id, done_at DESC);`,
     },
     {
-      // v37 (todo 52): attachment metadata for the D2 document vault. The plan text said
-      // "version: 35", but 35 (inventory) and 36 (maintenance) were already taken when this
-      // landed, so the next free number is 37. Bytes live in object storage (Vercel Blob, or
-      // the dev-only .data/ fallback) - NEVER in Postgres (Neon Free is 0.5 GB/project total).
-      // Additive and idempotent: every statement is IF NOT EXISTS-guarded; no columns are
-      // altered and no data is dropped or rewritten.
-      //
-      // Polymorphic owner: (owner_type, owner_id) points at a user-owned row in
-      // documents / expiry_items / inventory_items / maintenance_plans / events.
-      // Both columns are nullable as a PAIR (CHECK below): an attachment can be uploaded
-      // scoped to an owner and later unlinked without deleting the object.
+      // v37（vercel todo 52）: 附件元数据（D2 文档库）。字节存对象存储（docker 部署为本地
+      // 存储实现），绝不入库。多态属主 (owner_type, owner_id)：两列作为整体成对可空
+      // （CHECK 强制），支持"先挂在属主上、后解除关联而不删对象"。
       version: 37,
       name: 'attachments_v37',
       sql: `CREATE TABLE IF NOT EXISTS attachments (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   owner_type TEXT CHECK (owner_type IS NULL OR owner_type IN ('document', 'expiry', 'inventory', 'maintenance', 'event')),
   owner_id INTEGER,
@@ -762,120 +744,91 @@ CREATE INDEX IF NOT EXISTS idx_maintenance_logs_plan ON maintenance_logs(plan_id
   byte_size INTEGER NOT NULL CHECK (byte_size > 0),
   sha256 TEXT NOT NULL,
   storage_key TEXT NOT NULL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT attachments_owner_pair CHECK ((owner_type IS NULL) = (owner_id IS NULL))
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_user_owner ON attachments(user_id, owner_type, owner_id);`,
     },
     {
-      // v38 (todo 54): the document vault (passport / id_card / driver_license / visa /
-      // certificate / policy / contract / other). The plan text said "version: 36", but 36
-      // (maintenance) was already taken when this landed, so the next free number is 38.
-      // `document_number_encrypted` holds an AES-256-GCM ciphertext (same MASTER_KEY
-      // convention as notification credentials) and is NEVER returned by list responses -
-      // only a `numberConfigured` flag is. Document images live in the attachment store;
-      // this table stores no bytes. Additive and idempotent: every statement is
-      // IF NOT EXISTS-guarded; no columns are altered and no data is dropped or rewritten.
+      // v38（vercel todo 54）: 文档库（护照/身份证/驾照/签证/证书/保单/合同/其他）。
+      // document_number_encrypted 存 AES-256-GCM 密文（同 MASTER_KEY 约定），列表接口
+      // 永不返回，只回 numberConfigured 标志。trgm DO 块删除（同 v34）。
       version: 38,
       name: 'documents_v38',
       sql: `CREATE TABLE IF NOT EXISTS documents (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   profile_id INTEGER,
   kind TEXT NOT NULL CHECK (kind IN ('passport', 'id_card', 'driver_license', 'visa', 'certificate', 'policy', 'contract', 'other')),
   title TEXT NOT NULL,
   issuer TEXT,
   document_number_encrypted TEXT,
-  issued_at DATE,
-  expires_at DATE,
+  issued_at TEXT,
+  expires_at TEXT,
   country TEXT,
   notes TEXT,
-  reminder_config JSONB,
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  reminder_config TEXT,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_documents_user_expires ON documents(user_id, expires_at);
 CREATE INDEX IF NOT EXISTS idx_documents_user_kind ON documents(user_id, kind);
-CREATE INDEX IF NOT EXISTS idx_documents_active_expires ON documents(user_id, expires_at) WHERE is_active = TRUE;
--- Forward-looking trigram for the q filter; guarded because pg_trgm may be absent
--- (v33 failed on CREATE EXTENSION in that case). Mirrors the v34/v35 blocks.
-DO $$
-BEGIN
-  IF to_regclass('documents') IS NOT NULL THEN
-    BEGIN
-      CREATE INDEX IF NOT EXISTS idx_documents_title_trgm ON documents USING gin (title gin_trgm_ops);
-      CREATE INDEX IF NOT EXISTS idx_documents_issuer_trgm ON documents USING gin (issuer gin_trgm_ops);
-    EXCEPTION WHEN undefined_object THEN
-      -- pg_trgm is unavailable; the q filter falls back to ILIKE
-      NULL;
-    END;
-  END IF;
-END $$;`,
+CREATE INDEX IF NOT EXISTS idx_documents_active_expires ON documents(user_id, expires_at) WHERE is_active = 1;
+-- pg_trgm 全文索引在 SQLite 上由 LIKE 回退（见 search.service.ts）`,
     },
     {
-      // v39 (todo 60): personal-CRM interaction log + cadence (D4). The plan text said
-      // "version: 37", but 37 (attachments) and 38 (documents) were already taken when
-      // this landed, so the next free number is 39. Additive and idempotent: every
-      // statement is IF NOT EXISTS-guarded; the only UPDATE is the guarded one-time
-      // `last_contact_at` backfill in postMigrate (rows with the column already set are
-      // untouched). `fixed_contacts.contact_methods` (v30 JSONB) stays the single source
-      // of truth for addresses - no contact-method columns are duplicated here.
-      //
-      // `interactions.user_id` is denormalized from `fixed_contacts.user_id` on purpose:
-      // it makes the (user_id, contact_id, occurred_at DESC) timeline index a covering
-      // access path and keeps every read user-scoped even if the join is forgotten.
+      // v39（vercel todo 60）: 个人 CRM 互动流水 + 联系频次（D4）。
+      // interactions.user_id 从 fixed_contacts.user_id 反范式化：时间线索引即覆盖路径，
+      // 且即使漏掉 JOIN 每个读取也保持 user 作用域。contact_methods(v30) 仍是联系方式唯一来源。
+      // 三个 ADD COLUMN 在 SQLite 无 IF NOT EXISTS，走 postMigrate tryExec。
       version: 39,
       name: 'crm_interactions_cadence_v39',
-      sql: `ALTER TABLE fixed_contacts ADD COLUMN IF NOT EXISTS cadence_days INT NULL;
-ALTER TABLE fixed_contacts ADD COLUMN IF NOT EXISTS last_contact_at TIMESTAMPTZ NULL;
-ALTER TABLE fixed_contacts ADD COLUMN IF NOT EXISTS cadence_enabled BOOLEAN DEFAULT FALSE;
--- Interaction log: one row per real touchpoint (call/message/meeting/...).
-CREATE TABLE IF NOT EXISTS interactions (
-  id SERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS interactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   contact_id INTEGER NOT NULL REFERENCES fixed_contacts(id) ON DELETE CASCADE,
   kind TEXT NOT NULL CHECK (kind IN ('call', 'message', 'meeting', 'meal', 'visit', 'gift', 'other')),
-  occurred_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   summary TEXT,
   mood TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_interactions_user_contact_occurred ON interactions(user_id, contact_id, occurred_at DESC);
--- Promises made to (or by) a contact; due_at NULL = "someday".
 CREATE TABLE IF NOT EXISTS contact_promises (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   contact_id INTEGER NOT NULL REFERENCES fixed_contacts(id) ON DELETE CASCADE,
   text TEXT NOT NULL,
-  due_at DATE,
-  done_at TIMESTAMPTZ,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  due_at TEXT,
+  done_at TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_contact_promises_contact ON contact_promises(contact_id, created_at DESC);
--- Gift ledger: what was given to / received from a contact.
 CREATE TABLE IF NOT EXISTS gift_records (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   contact_id INTEGER NOT NULL REFERENCES fixed_contacts(id) ON DELETE CASCADE,
   description TEXT NOT NULL,
   direction TEXT NOT NULL CHECK (direction IN ('given', 'received')),
   occasion TEXT,
   amount_cents BIGINT CHECK (amount_cents IS NULL OR amount_cents >= 0),
-  occurred_at DATE NOT NULL DEFAULT CURRENT_DATE,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  occurred_at TEXT NOT NULL DEFAULT CURRENT_DATE,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_gift_records_contact ON gift_records(contact_id, occurred_at DESC);`,
       postMigrate: async () => {
-        // One-time backfill: when the stored anchor is missing, take the newest
-        // interaction. Contacts that already have a value (or no interactions) are
-        // left untouched, so re-running this is a no-op.
+        // 一次性回填：锚点缺失时取最近一次互动；已有值或无互动的联系人不动，重跑为 no-op。
+        await tryExec('v39 fixed_contacts.cadence_days', 'ALTER TABLE fixed_contacts ADD COLUMN cadence_days INTEGER');
+        await tryExec('v39 fixed_contacts.last_contact_at', 'ALTER TABLE fixed_contacts ADD COLUMN last_contact_at TEXT');
+        await tryExec('v39 fixed_contacts.cadence_enabled', 'ALTER TABLE fixed_contacts ADD COLUMN cadence_enabled INTEGER DEFAULT 0');
+        // SQLite 3.33+ 支持 UPDATE...FROM（sql.js 内核 ≥3.45，探针实测），语义与 PG 版一致。
         const backfilled = await query(
-          `UPDATE fixed_contacts fc
+          `UPDATE fixed_contacts AS fc
            SET last_contact_at = latest.max_occurred
            FROM (
              SELECT contact_id, MAX(occurred_at) AS max_occurred
              FROM interactions
              GROUP BY contact_id
-           ) latest
+           ) AS latest
            WHERE fc.id = latest.contact_id
              AND fc.last_contact_at IS NULL`,
         );
@@ -885,129 +838,89 @@ CREATE INDEX IF NOT EXISTS idx_gift_records_contact ON gift_records(contact_id, 
       },
     },
     {
-      // v40 (todo 64): habit tracking (D6) - habits + habit_logs with per-period targets,
-      // schedule days and reminder times, plus the per-user hour for the nightly
-      // "streak at risk" nudge. The plan text said "version: 38", but 38 (documents) and
-      // 39 (CRM interactions/cadence) were already taken when this landed, so the next
-      // free number is 40. Additive and idempotent: every statement is IF NOT EXISTS-
-      // guarded; the only ALTER is an additive ADD COLUMN IF NOT EXISTS on user_configs.
-      // `UNIQUE (habit_id, logged_on)` makes same-day logging an UPSERT (count += n),
-      // never a second row. This is NOT todo_completions (v29) - habits are their own
-      // concept (day/week periods, targets, schedule/reminder configuration).
+      // v40（vercel todo 64）: 习惯打卡（D6）habits + habit_logs。UNIQUE (habit_id, logged_on)
+      // 使同日打卡成为 UPSERT（count += n），永不出第二行。与 todo_completions(v29) 是两个概念
+      // （日/周周期、目标值、排期/提醒配置）。schedule_days/reminder_times 存 JSON 数组文本。
       version: 40,
       name: 'habits_v40',
       sql: `CREATE TABLE IF NOT EXISTS habits (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   profile_id INTEGER,
   name TEXT NOT NULL,
   icon TEXT,
   target_per_period INTEGER NOT NULL DEFAULT 1 CHECK (target_per_period >= 1),
   period TEXT NOT NULL DEFAULT 'day' CHECK (period IN ('day', 'week')),
-  schedule_days INTEGER[],
-  reminder_times TEXT[],
+  schedule_days TEXT,
+  reminder_times TEXT,
   color TEXT,
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_habits_user ON habits(user_id);
-CREATE INDEX IF NOT EXISTS idx_habits_user_active ON habits(user_id) WHERE is_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_habits_user_active ON habits(user_id) WHERE is_active = 1;
 CREATE TABLE IF NOT EXISTS habit_logs (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   habit_id INTEGER NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  logged_on DATE NOT NULL,
+  logged_on TEXT NOT NULL,
   count INTEGER NOT NULL DEFAULT 1 CHECK (count >= 1),
   note TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (habit_id, logged_on)
 );
 CREATE INDEX IF NOT EXISTS idx_habit_logs_habit_date ON habit_logs(habit_id, logged_on DESC);
-CREATE INDEX IF NOT EXISTS idx_habit_logs_user_date ON habit_logs(user_id, logged_on DESC);
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS habit_streak_nudge_hour TEXT DEFAULT '20:00';`,
+CREATE INDEX IF NOT EXISTS idx_habit_logs_user_date ON habit_logs(user_id, logged_on DESC);`,
+      postMigrate: async () => {
+        await tryExec('v40 user_configs.habit_streak_nudge_hour', `ALTER TABLE user_configs ADD COLUMN habit_streak_nudge_hour TEXT DEFAULT '20:00'`);
+      },
     },
     {
-      // v41 (todo 68): household member profiles (D5). The plan text said "version: 39", but
-      // 39 (CRM) and 40 (habits) were already taken when this landed, so the next free number
-      // is 41. This is a PERSONAL household model (self/family/pet) - no organisations, no
-      // teams, no seats, no multi-tenancy. `profile_id` is nullable everywhere on purpose
-      // (future imports may omit it) and references profiles ON DELETE SET NULL, so deleting
-      // a profile orphans its rows back to "unassigned" instead of deleting data.
-      //
-      // Additive and idempotent: every statement is IF NOT EXISTS / existence-guarded and the
-      // only data writes are in postMigrate - the default `我` profile INSERT (guarded by
-      // NOT EXISTS kind='self') and the NULL-only backfill of profile_id. Re-running creates
-      // no second `我` and rewrites nothing.
-      //
-      // v34-v40 created five of these columns BARE (no FK): ADD COLUMN IF NOT EXISTS is a
-      // no-op when the column already exists, so the DO block below attaches the FK for any
-      // table that has the column without the constraint - first nulling values that point at
-      // no profile (profiles is brand new, so every pre-existing value is dangling; postMigrate
-      // re-points them at the user's default profile).
+      // v41（vercel todo 68）: 家庭成员档案（D5）。个人家庭模型（self/family/pet）——
+      // 无组织、无团队、无席位、无多租户。profile_id 全线可空（未来导入可缺省），
+      // REFERENCES profiles ON DELETE SET NULL：删档案只是把行打回"未分配"，不删数据。
+      // docker 链路差异：
+      // - events/fixed_contacts 的 profile_id 由本迁移 postMigrate 补建（schema.sql 无此列，
+      //   SQLite 无 ADD COLUMN IF NOT EXISTS 故逐条 try/catch）；
+      // - expiry_items/inventory_items/maintenance_plans/documents/habits 在 v34-v40 建表时
+      //   已带裸 profile_id，vercel 的「补 FK」DO 块删除——SQLite 无法事后 ADD CONSTRAINT，
+      //   且新链路在 v41 回填前不存在任何 profile_id 值，无悬挂可能；
+      // - medications 的守卫 DO 块删除：docker 链路 v42 建表时内联自带该列。
       version: 41,
       name: 'profiles_v41',
       sql: `CREATE TABLE IF NOT EXISTS profiles (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   relation TEXT,
   kind TEXT NOT NULL DEFAULT 'family' CHECK (kind IN ('self', 'family', 'pet')),
-  birth_date DATE,
-  lunar_birthday JSONB,
+  birth_date TEXT,
+  lunar_birthday TEXT,
   avatar_emoji TEXT,
   timezone TEXT,
   sort_order INTEGER NOT NULL DEFAULT 0,
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_profiles_user ON profiles(user_id);
--- Exactly one self profile per user (the 我 default); family/pet profiles are unlimited.
+-- 每用户恰好一个 self 档案（「我」默认档案）；family/pet 不限量。
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_profiles_user_self ON profiles(user_id) WHERE kind = 'self';
-ALTER TABLE events ADD COLUMN IF NOT EXISTS profile_id INTEGER REFERENCES profiles(id) ON DELETE SET NULL;
-ALTER TABLE fixed_contacts ADD COLUMN IF NOT EXISTS profile_id INTEGER REFERENCES profiles(id) ON DELETE SET NULL;
-ALTER TABLE expiry_items ADD COLUMN IF NOT EXISTS profile_id INTEGER REFERENCES profiles(id) ON DELETE SET NULL;
-ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS profile_id INTEGER REFERENCES profiles(id) ON DELETE SET NULL;
-ALTER TABLE maintenance_plans ADD COLUMN IF NOT EXISTS profile_id INTEGER REFERENCES profiles(id) ON DELETE SET NULL;
-ALTER TABLE documents ADD COLUMN IF NOT EXISTS profile_id INTEGER REFERENCES profiles(id) ON DELETE SET NULL;
-ALTER TABLE habits ADD COLUMN IF NOT EXISTS profile_id INTEGER REFERENCES profiles(id) ON DELETE SET NULL;
--- medications is created by v42, which lands AFTER this migration: guard so a database where
--- the table already exists still gets the column; v42 adds it for the table it creates.
-DO $$
-BEGIN
-  IF to_regclass('medications') IS NOT NULL THEN
-    ALTER TABLE medications ADD COLUMN IF NOT EXISTS profile_id INTEGER REFERENCES profiles(id) ON DELETE SET NULL;
-  END IF;
-END $$;
--- Attach the FK to columns that already existed bare (v34 expiry, v35 inventory, v36 maintenance,
--- v38 documents, v40 habits). Also covers events/fixed_contacts on a database pre-created from
--- shared/src/schema.pg.sql. The repair only nulls dangling values and only on first run.
-DO $$
-DECLARE t TEXT;
-BEGIN
-  FOREACH t IN ARRAY ARRAY['events', 'fixed_contacts', 'expiry_items', 'inventory_items', 'maintenance_plans', 'documents', 'habits'] LOOP
-    IF NOT EXISTS (
-      SELECT 1 FROM pg_constraint c JOIN pg_class cl ON cl.oid = c.conrelid
-      WHERE cl.relname = t AND c.conname = t || '_profile_id_fkey' AND c.contype = 'f'
-    ) THEN
-      EXECUTE format('UPDATE %I SET profile_id = NULL WHERE profile_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM profiles p WHERE p.id = %I.profile_id)', t, t);
-      EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (profile_id) REFERENCES profiles(id) ON DELETE SET NULL', t, t || '_profile_id_fkey');
-    END IF;
-  END LOOP;
-END $$;
--- (user_id, profile_id) covering index on every table the profile filter can scope (todo 69).
-CREATE INDEX IF NOT EXISTS idx_events_user_profile ON events(user_id, profile_id);
-CREATE INDEX IF NOT EXISTS idx_fixed_contacts_user_profile ON fixed_contacts(user_id, profile_id);
+-- (user_id, profile_id) 覆盖索引：profile 过滤可及的每张表（vercel todo 69）。
+-- events/fixed_contacts 两表依赖 postMigrate 补建的列，其索引也在 postMigrate 创建。
 CREATE INDEX IF NOT EXISTS idx_expiry_items_user_profile ON expiry_items(user_id, profile_id);
 CREATE INDEX IF NOT EXISTS idx_inventory_items_user_profile ON inventory_items(user_id, profile_id);
 CREATE INDEX IF NOT EXISTS idx_maintenance_plans_user_profile ON maintenance_plans(user_id, profile_id);
 CREATE INDEX IF NOT EXISTS idx_documents_user_profile ON documents(user_id, profile_id);
 CREATE INDEX IF NOT EXISTS idx_habits_user_profile ON habits(user_id, profile_id);`,
       postMigrate: async () => {
-        // One default profile per user (`我`, kind='self'). The NOT EXISTS guard makes a
-        // re-run a no-op - never a second 我. (The partial unique index enforces the same
-        // invariant at the schema level.)
+        await tryExec('v41 events.profile_id', 'ALTER TABLE events ADD COLUMN profile_id INTEGER REFERENCES profiles(id) ON DELETE SET NULL');
+        await tryExec('v41 fixed_contacts.profile_id', 'ALTER TABLE fixed_contacts ADD COLUMN profile_id INTEGER REFERENCES profiles(id) ON DELETE SET NULL');
+        await tryExec('v41 idx_events_user_profile', 'CREATE INDEX IF NOT EXISTS idx_events_user_profile ON events(user_id, profile_id)');
+        await tryExec('v41 idx_fixed_contacts_user_profile', 'CREATE INDEX IF NOT EXISTS idx_fixed_contacts_user_profile ON fixed_contacts(user_id, profile_id)');
+        // 每用户一条默认档案（「我」，kind='self'）。NOT EXISTS 守卫使重跑为 no-op，
+        // 部分唯一索引在库层强制同一不变量——绝不出第二个「我」。
         const created = await query(
           `INSERT INTO profiles (user_id, name, kind)
            SELECT u.id, '我', 'self' FROM users u
@@ -1019,13 +932,12 @@ CREATE INDEX IF NOT EXISTS idx_habits_user_profile ON habits(user_id, profile_id
           console.log(`[DB] Created ${created.rowCount} default profile(s) 我`);
         }
 
-        // Backfill every pre-existing row to the owner's default profile. NULL-only, so
-        // re-running this never overwrites an explicit assignment.
+        // 既有行回填到属主的默认档案。仅回填 NULL，重跑绝不覆盖显式指派。
         let backfilled = 0;
         for (const table of PROFILE_AWARE_TABLES) {
           const updated = await query(
-            `UPDATE ${table} t SET profile_id = p.id
-             FROM profiles p
+            `UPDATE ${table} AS t SET profile_id = p.id
+             FROM profiles AS p
              WHERE t.profile_id IS NULL AND p.user_id = t.user_id AND p.kind = 'self'`,
           );
           backfilled += updated.rowCount ?? 0;
@@ -1036,34 +948,24 @@ CREATE INDEX IF NOT EXISTS idx_habits_user_profile ON habits(user_id, profile_id
       },
     },
     {
-      // v42 (todo 71): medication domain (D3) - medications + their dose log. The plan
-      // text said "version: 41", but 41 (profiles) was taken by todo 68 when this landed,
-      // so the next free number is 42. Reminder and log ONLY: no medical advice, no
-      // pharmacy integration, no AI features on this data (all explicitly out of scope).
-      //
-      // Additive and idempotent: every statement is IF NOT EXISTS-guarded; the only ALTER
-      // is ADD COLUMN IF NOT EXISTS (for a pre-existing medications table, parity with
-      // v41's guarded block). `profile_id` is nullable (ON DELETE SET NULL), created
-      // inline here AND guarded so both fresh and pre-created databases converge.
-      //
-      // `schedule_times TEXT[]` is NOT NULL DEFAULT '{}' on purpose: an empty array is a
-      // valid PRN / as-needed regimen and materialises zero scheduled doses, while NULL
-      // would force every reader to special-case it. `UNIQUE (medication_id,
-      // scheduled_for)` is what makes dose materialisation idempotent - inserting the
-      // same scheduled instant twice is rejected, never a second row.
+      // v42（vercel todo 71）: 用药域（D3）medications + 服药记录。仅提醒与记录：
+      // 无医疗建议、无药房集成、无 AI 特性（明确出圈）。schedule_times NOT NULL DEFAULT '[]'：
+      // 空数组是合法的按需（PRN）方案，物化零次排程；NULL 会逼每个读取方特判。
+      // UNIQUE (medication_id, scheduled_for) 使排程物化幂等。v42 建表时内联自带
+      // profile_id（REFERENCES profiles），vercel 末尾的守卫 ALTER 在 docker 链路是纯冗余，删除。
       version: 42,
       name: 'medications_v42',
       sql: `CREATE TABLE IF NOT EXISTS medications (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   profile_id INTEGER REFERENCES profiles(id) ON DELETE SET NULL,
   name TEXT NOT NULL,
   dosage TEXT,
   form TEXT NOT NULL DEFAULT 'tablet' CHECK (form IN ('tablet', 'capsule', 'liquid', 'injection', 'patch', 'drops', 'other')),
-  schedule_times TEXT[] NOT NULL DEFAULT '{}',
-  schedule_days INTEGER[],
-  start_date DATE NOT NULL,
-  end_date DATE CHECK (end_date IS NULL OR end_date >= start_date),
+  schedule_times TEXT NOT NULL DEFAULT '[]',
+  schedule_days TEXT,
+  start_date TEXT NOT NULL,
+  end_date TEXT CHECK (end_date IS NULL OR end_date >= start_date),
   stock_quantity NUMERIC CHECK (stock_quantity IS NULL OR stock_quantity >= 0),
   stock_unit TEXT,
   units_per_dose NUMERIC NOT NULL DEFAULT 1 CHECK (units_per_dose > 0),
@@ -1071,81 +973,50 @@ CREATE INDEX IF NOT EXISTS idx_habits_user_profile ON habits(user_id, profile_id
   prescriber TEXT,
   pharmacy TEXT,
   notes TEXT,
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  is_critical BOOLEAN NOT NULL DEFAULT FALSE,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  is_active INTEGER NOT NULL DEFAULT 1,
+  is_critical INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_medications_user_profile ON medications(user_id, profile_id);
-CREATE INDEX IF NOT EXISTS idx_medications_user_active ON medications(user_id) WHERE is_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_medications_user_active ON medications(user_id) WHERE is_active = 1;
 CREATE TABLE IF NOT EXISTS medication_doses (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   medication_id INTEGER NOT NULL REFERENCES medications(id) ON DELETE CASCADE,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  scheduled_for TIMESTAMPTZ NOT NULL,
-  logged_at TIMESTAMPTZ,
+  scheduled_for TEXT NOT NULL,
+  logged_at TEXT,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('taken', 'skipped', 'missed', 'pending')),
   note TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (medication_id, scheduled_for)
 );
 CREATE INDEX IF NOT EXISTS idx_medication_doses_user_scheduled ON medication_doses(user_id, scheduled_for);
-CREATE INDEX IF NOT EXISTS idx_medication_doses_med_status ON medication_doses(medication_id, status);
-ALTER TABLE medications ADD COLUMN IF NOT EXISTS profile_id INTEGER REFERENCES profiles(id) ON DELETE SET NULL;`,
+CREATE INDEX IF NOT EXISTS idx_medication_doses_med_status ON medication_doses(medication_id, status);`,
     },
     {
-      // v43 (todo 70): per-profile notification routing. The plan text said
-      // "migration 40", but 40 (habits), 41 (profiles) and 42 (medications) were
-      // already taken when this landed, so the next free number is 43.
-      //
-      // `profile_channel_accounts(profile_id, account_id)` is the join table that
-      // decides WHICH channel accounts receive a profile's reminders. Semantics:
-      //   - rows exist for a profile  -> only those accounts are eligible (explicit
-      //     routing wins), an event-level `notification_account_ids` binding stays
-      //     authoritative regardless;
-      //   - no rows for a profile     -> fall back to ALL active accounts (the
-      //     pre-routing behaviour, so nothing changes for existing users).
-      //
-      // Additive and idempotent: CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT
-      // EXISTS only, no data writes, no ALTER of existing tables. Both FKs are
-      // ON DELETE CASCADE: deleting a profile or an account removes its routing
-      // rows, never the other side. The PK makes the pair unique (a profile cannot
-      // route to the same account twice). Same-user ownership is enforced by the
-      // API (profile.service) because profiles and accounts are both user-scoped.
+      // v43（vercel todo 70）: 按档案的通知路由。join 表决定哪些通知账号接收某档案的提醒：
+      // 有行 → 仅这些账号可路由（事件级 notification_account_ids 绑定仍最优先）；
+      // 无行 → 回退全部启用账号（v43 前行为，存量用户无感）。两 FK 均 CASCADE；
+      // 复合主键即去重；同用户属主校验由 API 层承担。
       version: 43,
       name: 'profile_channel_accounts_v43',
       sql: `CREATE TABLE IF NOT EXISTS profile_channel_accounts (
   profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
   account_id INTEGER NOT NULL REFERENCES notification_accounts(id) ON DELETE CASCADE,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (profile_id, account_id)
 );
 CREATE INDEX IF NOT EXISTS idx_profile_channel_accounts_account ON profile_channel_accounts(account_id);`,
     },
     {
-      // v44 (todo 81): personal goals + milestones with progress tracking. The plan
-      // text said "version: 42", but 42 (medications) and 43 (per-profile routing)
-      // were already taken when this landed, so the next free number is 44.
-      //
-      // Additive and idempotent: CREATE TABLE / CREATE INDEX IF NOT EXISTS only,
-      // no ALTER of existing tables and no data writes. This is a personal
-      // checklist - no OKR jargon, no team features.
-      //
-      // - `current_value` stores the RAW value on purpose: a goal may over-achieve
-      //   (150 of 100) and only the derived percentage is clamped to 100 - never
-      //   the stored value.
-      // - `target_value` is NULLable (a pure milestone goal) but never 0 (a zero
-      //   denominator makes the percentage meaningless) - the CHECK guards it.
-      // - `milestones.goal_id` is ON DELETE CASCADE: deleting a goal removes its
-      //   checklist.
-      // - `milestones.event_id` is an OPTIONAL link to the existing events
-      //   reminder engine: a linked milestone rides that event's reminders.
-      //   ON DELETE SET NULL, so deleting the event only unlinks the milestone,
-      //   and deleting the goal never touches the event row.
+      // v44（vercel todo 81）: 个人目标 + 里程碑。current_value 存原始值（可超额 150/100），
+      // 只有派生百分比被钳到 100；target_value 可空（纯里程碑目标）但非 0（分母无意义）。
+      // milestones.goal_id CASCADE（删目标清清单）；event_id 可选挂接既有提醒引擎，SET NULL。
       version: 44,
       name: 'goals_milestones_v44',
       sql: `CREATE TABLE IF NOT EXISTS goals (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   profile_id INTEGER REFERENCES profiles(id) ON DELETE SET NULL,
   title TEXT NOT NULL,
@@ -1154,21 +1025,21 @@ CREATE INDEX IF NOT EXISTS idx_profile_channel_accounts_account ON profile_chann
   target_value NUMERIC CHECK (target_value IS NULL OR target_value > 0),
   current_value NUMERIC NOT NULL DEFAULT 0 CHECK (current_value >= 0),
   unit TEXT,
-  start_date DATE NOT NULL DEFAULT CURRENT_DATE,
-  target_date DATE,
+  start_date TEXT NOT NULL DEFAULT CURRENT_DATE,
+  target_date TEXT,
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused', 'done', 'abandoned')),
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT goals_target_after_start CHECK (target_date IS NULL OR target_date >= start_date)
 );
 CREATE INDEX IF NOT EXISTS idx_goals_user_status ON goals(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_goals_user_profile ON goals(user_id, profile_id);
 CREATE TABLE IF NOT EXISTS milestones (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   goal_id INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
   title TEXT NOT NULL,
-  due_at DATE,
-  done_at TIMESTAMPTZ,
+  due_at TEXT,
+  done_at TEXT,
   sort_order INTEGER NOT NULL DEFAULT 0,
   event_id INTEGER REFERENCES events(id) ON DELETE SET NULL
 );
@@ -1176,55 +1047,41 @@ CREATE INDEX IF NOT EXISTS idx_milestones_goal ON milestones(goal_id, sort_order
 CREATE INDEX IF NOT EXISTS idx_milestones_event ON milestones(event_id) WHERE event_id IS NOT NULL;`,
     },
     {
-      // v45 (checkbox 78): holiday-aware reminders + optional 节气 reminders.
-      // Two additive user_configs columns; both default to the pre-v45 behaviour
-      // (`keep` + empty list), so every existing row is unchanged until the user
-      // opts in from Settings. No data backfill, no constraint on existing rows.
+      // v45（vercel checkbox 78）: 节假日感知提醒 + 可选节气提醒。两个 user_configs 增量列，
+      // 默认值保持 v45 前行为（keep + 空列表），存量行不动，用户从设置里显式开启。
       version: 45,
       name: 'holiday_jieqi_reminders_v45',
-      sql: `ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS holiday_reminder_mode TEXT DEFAULT 'keep';
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS jieqi_reminder_list JSONB DEFAULT '[]'::jsonb;`,
+      sql: `SELECT 1;`,
+      postMigrate: async () => {
+        await tryExec('v45 user_configs.holiday_reminder_mode', `ALTER TABLE user_configs ADD COLUMN holiday_reminder_mode TEXT DEFAULT 'keep'`);
+        await tryExec('v45 user_configs.jieqi_reminder_list', `ALTER TABLE user_configs ADD COLUMN jieqi_reminder_list TEXT DEFAULT '[]'`);
+      },
     },
     {
-      // v46 (checkbox 80): digest preferences - enabled / period / recipient override /
-      // which sections to include / which configured email channel to deliver through.
-      //
-      // Purely additive user_configs columns with defaults that preserve the pre-v46
-      // behaviour: the checkbox-79 cron sent a monthly digest to every account, so
-      // `digest_enabled` defaults to TRUE (a user has to explicitly opt out);
-      // `digest_sections` NULL means "all sections"; `digest_recipients` defaults to
-      // an empty list (= fall back to resolveRecipientEmails).
-      //
-      // Every statement is ADD COLUMN IF NOT EXISTS-guarded: idempotent, purely
-      // additive, no ALTER of existing columns, no data backfill, no constraint on
-      // existing rows. `digest_channel_account_id` is intentionally an unconstrained
-      // integer (ownership / email-capability are validated in the API layer).
+      // v46（vercel checkbox 80）: 日报偏好 —— 开关/周期/收件人覆盖/包含哪些板块/走哪个
+      // 邮件通道投递。默认值保持 v46 前行为：digest_enabled 默认 1（用户需显式退出，
+      // checkbox-79 cron 曾向所有账号发月报）；digest_sections NULL = 全部板块；
+      // digest_recipients 空列表 = 回退 resolveRecipientEmails。digest_channel_account_id
+      // 有意不做 FK 约束（属主/邮件能力校验在 API 层）。
       version: 46,
       name: 'digest_preferences_v46',
-      sql: `ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS digest_enabled BOOLEAN NOT NULL DEFAULT TRUE;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS digest_period TEXT NOT NULL DEFAULT 'monthly';
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS digest_recipients JSONB DEFAULT '[]'::jsonb;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS digest_sections JSONB;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS digest_channel_account_id INTEGER;`,
+      sql: `SELECT 1;`,
+      postMigrate: async () => {
+        await tryExec('v46 user_configs.digest_enabled', 'ALTER TABLE user_configs ADD COLUMN digest_enabled INTEGER NOT NULL DEFAULT 1');
+        await tryExec('v46 user_configs.digest_period', `ALTER TABLE user_configs ADD COLUMN digest_period TEXT NOT NULL DEFAULT 'monthly'`);
+        await tryExec('v46 user_configs.digest_recipients', `ALTER TABLE user_configs ADD COLUMN digest_recipients TEXT DEFAULT '[]'`);
+        await tryExec('v46 user_configs.digest_sections', 'ALTER TABLE user_configs ADD COLUMN digest_sections TEXT');
+        await tryExec('v46 user_configs.digest_channel_account_id', 'ALTER TABLE user_configs ADD COLUMN digest_channel_account_id INTEGER');
+      },
     },
     {
-      // v47 (checkbox 86): opt-in CalDAV write-back. Adds the per-user toggle
-      // (default OFF, so nothing changes until a user explicitly enables it), the
-      // target collection URL (kept separate from `caldav_url`, the read-only import
-      // URL, so the write target is never the calendar we import from), and the
-      // remote-object bookkeeping table that stores the stable UID / last ETag /
-      // content hash needed for create-with-If-None-Match, update-with-If-Match and
-      // delete-with-If-Match on later cron runs.
-      //
-      // Purely additive and idempotent: every statement is IF NOT EXISTS-guarded, no
-      // existing column is altered or dropped, nothing is backfilled, and the new
-      // table starts empty (no writes happen while the toggle is off).
+      // v47（vercel checkbox 86）: 选择性加入的 CalDAV 写回。每用户开关（默认关）、写目标
+      // 集合 URL（与只读导入的 caldav_url 分开存，写目标永不是导入源日历）、以及远端对象
+      // 登记表（稳定 UID / 最近 ETag / 内容哈希，供 If-None-Match 创建、If-Match 更新/删除）。
       version: 47,
       name: 'caldav_writeback_v47',
-      sql: `ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS caldav_writeback_enabled BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS caldav_writeback_url TEXT;
-CREATE TABLE IF NOT EXISTS caldav_writeback_objects (
-  id SERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS caldav_writeback_objects (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   entity_type TEXT NOT NULL CHECK (entity_type IN ('event', 'expiry_item')),
   entity_id INTEGER NOT NULL,
@@ -1232,719 +1089,442 @@ CREATE TABLE IF NOT EXISTS caldav_writeback_objects (
   collection_url TEXT NOT NULL,
   etag TEXT,
   content_hash TEXT,
-  last_pushed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  last_pushed_at TEXT DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (user_id, entity_type, entity_id)
 );
 CREATE INDEX IF NOT EXISTS idx_caldav_writeback_objects_user ON caldav_writeback_objects(user_id);`,
+      postMigrate: async () => {
+        await tryExec('v47 user_configs.caldav_writeback_enabled', 'ALTER TABLE user_configs ADD COLUMN caldav_writeback_enabled INTEGER NOT NULL DEFAULT 0');
+        await tryExec('v47 user_configs.caldav_writeback_url', 'ALTER TABLE user_configs ADD COLUMN caldav_writeback_url TEXT');
+      },
     },
     {
-      // v48 (checkbox 89): opt-in public ICS subscription feeds. Each row is a saved
-      // filter (a category, a profile, or a contact) plus the SHA-256 HASH of the
-      // public token. Only the hash is stored - the raw token is shown exactly once
-      // at creation, so a database read can never reconstruct a subscription URL.
-      // `revoked_at` is a soft delete: the public route only serves rows with
-      // `revoked_at IS NULL`, and the hash is kept forever so a revoked feed can
-      // never be silently resurrected by a token collision.
-      //
-      // Purely additive and idempotent: CREATE TABLE / CREATE INDEX IF NOT EXISTS
-      // only, no ALTER of existing tables, no backfill, and the table starts empty
-      // (nothing is ever served until a user explicitly creates a feed).
+      // v48（vercel checkbox 89）: 选择性加入的公开 ICS 订阅源。每行是一个保存的过滤条件
+      // + 公开 token 的 SHA-256 哈希（原文只展示一次，库泄露无法还原订阅 URL）。
+      // revoked_at 软删：公开路由只服务 revoked_at IS NULL 的行，哈希永久保留，
+      // 撤销的源不可能被 token 碰撞复活。
       version: 48,
       name: 'ics_feeds_v48',
       sql: `CREATE TABLE IF NOT EXISTS ics_feeds (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
-  "filter" JSONB NOT NULL,
+  "filter" TEXT NOT NULL,
   token_hash TEXT NOT NULL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  last_access_at TIMESTAMP,
-  revoked_at TIMESTAMP
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  last_access_at TEXT,
+  revoked_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ics_feeds_token_hash ON ics_feeds(token_hash);
 CREATE INDEX IF NOT EXISTS idx_ics_feeds_user ON ics_feeds(user_id);`,
     },
     {
-      // Checkbox 91 (D7 Telegram bot): `bot_updates` is the Telegram webhook dedup ledger.
-      // Telegram retries an update until it is ACKed, so we claim each `update_id` with an
-      // INSERT ... ON CONFLICT DO NOTHING before processing: a retry then ACKs 200 without
-      // re-executing the command. Purely additive and idempotent (CREATE TABLE / CREATE INDEX
-      // IF NOT EXISTS only, no ALTER of existing tables, no backfill, table starts empty).
+      // v49（vercel checkbox 91, D7 Telegram bot）: bot_updates 是 Telegram webhook 去重台账。
+      // Telegram 会重试未 ACK 的 update，处理前先 INSERT...ON CONFLICT DO NOTHING 认领
+      // update_id：重试时直接 ACK 200 不再执行命令。
       version: 49,
       name: 'bot_updates_v49',
       sql: `CREATE TABLE IF NOT EXISTS bot_updates (
   update_id BIGINT PRIMARY KEY,
-  received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  received_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_bot_updates_received_at ON bot_updates(received_at);`,
     },
     {
-      // Checkbox 94 (D7 Telegram bot): chat <-> user/profile linking and the redacted
-      // command audit trail. Never auto-linked: a chat becomes linked only by consuming a
-      // code that was generated from Settings (`bot_link_codes`), and `/unlink` sets
-      // `revoked_at` (soft delete - an unlinked chat is refused by the dispatcher).
-      //
-      // `bot_link_codes` stores ONLY the SHA-256 hash of a short-lived (10 min), single-use
-      // code, so a database read can never reconstruct a valid code; consumption is an
-      // atomic UPDATE ... WHERE used_at IS NULL AND expires_at > CURRENT_TIMESTAMP, so a
-      // code can be redeemed at most once even under concurrent deliveries.
-      //
-      // `bot_audit_logs` records one row per command: the command name, a WHITELIST-built
-      // `args_redacted` shape (count/kind only - argument values, codes and tokens are
-      // never written) and a short `result` summary. `UNIQUE (platform, chat_id)` on
-      // `bot_links` makes a repeated `/link` from the same chat an UPDATE, never a
-      // duplicate row. Purely additive and idempotent: CREATE TABLE / CREATE INDEX
-      // IF NOT EXISTS only, no ALTER of existing tables, no backfill, tables start empty.
+      // v50（vercel checkbox 94, D7 Telegram bot）: 聊天<->用户/档案绑定 + 脱敏命令审计。
+      // 绝不自动绑定：聊天只能消费设置页生成的 code 完成绑定（bot_link_codes），/unlink 置
+      // revoked_at 软删。bot_link_codes 只存短时一次性 code 的 SHA-256 哈希；核销是
+      // UPDATE...WHERE used_at IS NULL AND expires_at > CURRENT_TIMESTAMP 的原子 UPDATE。
+      // bot_links UNIQUE (platform, chat_id) 使同聊天重复 /link 变 UPDATE 而非重复行。
       version: 50,
       name: 'bot_links_v50',
       sql: `CREATE TABLE IF NOT EXISTS bot_links (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   platform TEXT NOT NULL,
   chat_id TEXT NOT NULL,
   chat_type TEXT,
   active_profile_id INTEGER REFERENCES profiles(id) ON DELETE SET NULL,
-  linked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  revoked_at TIMESTAMP,
+  linked_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  revoked_at TEXT,
   UNIQUE (platform, chat_id)
 );
 CREATE INDEX IF NOT EXISTS idx_bot_links_user ON bot_links(user_id);
 CREATE TABLE IF NOT EXISTS bot_link_codes (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   code_hash TEXT NOT NULL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  expires_at TIMESTAMPTZ NOT NULL,
-  used_at TIMESTAMP
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  expires_at TEXT NOT NULL,
+  used_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_link_codes_code_hash ON bot_link_codes(code_hash);
 CREATE INDEX IF NOT EXISTS idx_bot_link_codes_user ON bot_link_codes(user_id);
 CREATE TABLE IF NOT EXISTS bot_audit_logs (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   platform TEXT NOT NULL,
   chat_id TEXT NOT NULL,
   command TEXT NOT NULL,
   args_redacted TEXT,
   result TEXT NOT NULL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_bot_audit_logs_user ON bot_audit_logs(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_bot_audit_logs_chat ON bot_audit_logs(platform, chat_id, created_at);`,
     },
     {
-      // v51 (checkbox 97, defects D2/D5): `/snooze` persistence.
-      //
-      // `events.next_occurrence` is a DATE column (schema.pg.sql) so a minute-granularity
-      // snooze cannot live there - Postgres truncates the sub-day result back to a date and
-      // the UPDATE silently stored the same day (delta 0 ms). The explicit snooze deadline
-      // therefore gets its OWN timestamptz column; `date` / `next_occurrence` stay canonical
-      // and untouched, which is what keeps a snooze reversible.
-      //
-      // `snoozed_until` semantics (reminder loop in jobs/tasks.ts): the deadline is the
-      // instant the user requested (`NOW() + N minutes` FROM THE REQUEST TIME, not from the
-      // original target time), and the existing ±2-minute reminder window fires the event
-      // once when the deadline enters it (deduped through `reminder_send_claims` with a
-      // `snooze:event#` key). Before the deadline the event is suppressed; after the window
-      // has passed the normal day-based schedule resumes untouched.
-      //
-      // This migration ALSO aligns `event_trigger_logs.trigger_date` with the value the
-      // reminder machinery actually writes there: `buildReminderSendKey()` returns a dedup
-      // TOKEN (`YYYY-MM-DD#d<n>#tHH:mm`), the paired store `reminder_send_claims.trigger_date`
-      // is TEXT, and `tasks.ts` compares that same token against this column before sending.
-      // `shared/src/schema.pg.sql` declared it DATE, so on a real engine the pre-check raised
-      // `invalid input syntax for type date: "...#d0#t..."` and `recordEventTrigger` silently
-      // dropped every event-reminder log - meaning NO event reminder (snoozed or normal) could
-      // be delivered on a fresh database. Proven live (PGlite, schema + migrations):
-      //   SELECT ... WHERE trigger_date = '2026-09-28#d0#t09:00' -> 22007 invalid input syntax
-      //   INSERT INTO event_trigger_logs (..., trigger_date, ...) VALUES (...,?,...) -> 22007
-      // The `USING trigger_date::text` cast is lossless for existing DATE rows
-      // ('2026-09-28' -> '2026-09-28') and re-running is a no-op for a TEXT column.
-      // Consumers of the year (routes/features.ts annual report) read the first 4 chars, so
-      // both legacy dates and new tokens keep working.
-      //
-      // Everything here is idempotent; no backfill. Fresh installs get snoozed_until here
-      // because schema.pg.sql is not modified by this lane (shared/ is frozen for the D1 fix).
+      // v51（vercel checkbox 97, defects D2/D5）: /snooze 持久化。events.next_occurrence 是
+      // 日期语义，分钟级贪睡截止时刻需要独立的 snoozed_until 列；date/next_occurrence 保持
+      // 正典不动（贪睡可逆）。vercel 版还把 event_trigger_logs.trigger_date 从 DATE 改 TEXT
+      //（PG 下 DATE 吞掉去重 token 报 22007）——docker 链路该列本就是 TEXT（schema.sql），
+      // ALTER COLUMN TYPE 无对应物也无需迁移。
       version: 51,
       name: 'event_snoozed_until_v51',
-      sql: `ALTER TABLE events ADD COLUMN IF NOT EXISTS snoozed_until TIMESTAMPTZ;
-ALTER TABLE event_trigger_logs ALTER COLUMN trigger_date TYPE TEXT USING trigger_date::text;`,
+      sql: `SELECT 1;`,
+      postMigrate: async () => {
+        await tryExec('v51 events.snoozed_until', 'ALTER TABLE events ADD COLUMN snoozed_until TEXT');
+      },
     },
     {
-      // v52 (checkbox 105): deterministic behavioral-pattern store. One row per
-      // (user, kind, key) with a JSONB value, a confidence in [0,1] and the number of
-      // consistent observations behind it. Written ONLY by the nightly recompute in
-      // `services/patterns.service.ts` (daily-maintenance) from rows already present in
-      // the database - no LLM, no external call, nothing leaves the box.
-      //
-      // `key` is a plain TEXT bucket label (e.g. `08:00`, `d1`, `email`, weekday `3`,
-      // contact id) so a re-run UPSERTs the same row instead of appending history;
-      // `computed_at` records the last recompute. Rows with confidence < 0.5 are kept
-      // (they become meaningful as evidence accumulates) but the API filters them out.
-      //
-      // Purely additive and idempotent: CREATE TABLE / CREATE INDEX IF NOT EXISTS only,
-      // no ALTER of existing tables, no backfill, no data migration, table starts empty.
+      // v52（vercel checkbox 105）: 确定性行为模式库。每 (user, kind, key) 一行，JSON 值 +
+      // [0,1] 置信度 + 一致观测数。只由 services/patterns.service.ts 的每夜重计算写入
+      // （数据全部来自库内行，无 LLM、无外呼）。key 是纯文本桶标签（如 08:00、d1、email、
+      // 星期 3、联系人 id），重跑 UPSERT 同一行而非追加历史。置信度 <0.5 的行保留作证据，
+      // API 过滤掉。
       version: 52,
       name: 'user_patterns_v52',
       sql: `CREATE TABLE IF NOT EXISTS user_patterns (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   kind TEXT NOT NULL,
   key TEXT NOT NULL,
-  value JSONB NOT NULL,
+  value TEXT NOT NULL,
   confidence NUMERIC(4,3) NOT NULL DEFAULT 0 CHECK (confidence >= 0 AND confidence <= 1),
   evidence_count INTEGER NOT NULL DEFAULT 0 CHECK (evidence_count >= 0),
-  computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  computed_at TEXT DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (user_id, kind, key)
 );
 CREATE INDEX IF NOT EXISTS idx_user_patterns_user ON user_patterns(user_id);`,
     },
     {
-      // v53 (checkbox 106): full-text-ish search over the user's OWN data.
-      //
-      // DEFAULT PATH - trigram, ZERO egress. Neon supports `pg_trgm` but neither
-      // `zhparser` nor `pg_bigm`, and `to_tsvector` cannot tokenise Chinese: the default
-      // parser treats a whole CJK sentence as a single word, so a Chinese query never
-      // matches. Trigram GIN indexes give CJK substring matching plus fuzzy ranking with
-      // `ILIKE '%q%'` / `similarity()` and no external call of any kind - the free-tier
-      // default. The `events.tags` index is an EXPRESSION index on `(tags::text)` because
-      // JSONB itself has no trigram operator class; the query side must use the identical
-      // `tags::text` expression.
-      //
-      // OPT-IN ACCELERATOR - pgvector, guarded. `CREATE EXTENSION vector` is attempted
-      // inside an exception block: on a database that cannot provide it (older self-hosted
-      // Postgres, engines like PGlite that ship pg_trgm but not pgvector) the notice is
-      // logged, the embeddings table is simply not created, and the trigram path above is
-      // unaffected. When the extension IS available (Neon: every plan), `embeddings` stores
-      // one row per (owner_type, owner_id, model). `embedding` is an UNCONSTRAINED `vector`
-      // so 768-dim (nomic-embed-text) and 1536-dim (text-embedding-3-small) models can
-      // coexist; the `<= 2048` CHECK on both `dims` and `vector_dims(embedding)` is the
-      // column-level rejection of oversized model configs. No FK to the owner tables
-      // (owner_id is polymorphic) - the nightly cleaner removes orphans instead, and the
-      // users FK cascades on user deletion. Purely additive + idempotent.
+      // v53（vercel checkbox 106）: vercel 版全量是 pg_trgm GIN 索引 + pgvector embeddings
+      // DO 块。SQLite 翻译：trgm 索引整条删除（CJK 子串搜索由 LIKE 回退，见
+      // search.service.ts）；pgvector 无 SQLite 对应物，embeddings 表不建（语义检索在
+      // docker 部署不可用）。保留版本号占位，维持 v2→v81 链号连续。
       version: 53,
       name: 'search_trgm_embeddings_v53',
-      sql: `-- Default search path: CJK-capable trigram indexes, no external calls.
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-CREATE INDEX IF NOT EXISTS idx_events_name_trgm ON events USING GIN (name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_events_person_name_trgm ON events USING GIN (person_name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_events_tags_trgm ON events USING GIN ((tags::text) gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_fixed_contacts_name_trgm ON fixed_contacts USING GIN (name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_fixed_contacts_nickname_trgm ON fixed_contacts USING GIN (nickname gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_fixed_contacts_notes_trgm ON fixed_contacts USING GIN (notes gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_fixed_contacts_relationship_trgm ON fixed_contacts USING GIN (relationship gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_interactions_summary_trgm ON interactions USING GIN (summary gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_documents_title_trgm ON documents USING GIN (title gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_documents_issuer_trgm ON documents USING GIN (issuer gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_expiry_items_title_trgm ON expiry_items USING GIN (title gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_expiry_items_vendor_trgm ON expiry_items USING GIN (vendor gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_expiry_items_notes_trgm ON expiry_items USING GIN (notes gin_trgm_ops);
--- Opt-in semantic accelerator. Guarded: without pgvector this block degrades to a NOTICE
--- and the trigram search path keeps working.
-DO $migration53$
-BEGIN
-  BEGIN
-    EXECUTE 'CREATE EXTENSION IF NOT EXISTS vector';
-  EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE '[migration v53] pgvector unavailable (%): semantic embeddings stay disabled, trigram search unaffected', SQLERRM;
-  END;
-  IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
-    CREATE TABLE IF NOT EXISTS embeddings (
-      id SERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      owner_type TEXT NOT NULL CHECK (owner_type IN ('event', 'contact', 'interaction', 'document', 'expiry')),
-      owner_id INTEGER NOT NULL,
-      model TEXT NOT NULL,
-      dims INTEGER NOT NULL CHECK (dims > 0 AND dims <= 2048),
-      embedding vector NOT NULL CHECK (vector_dims(embedding) <= 2048),
-      content_hash TEXT NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE (owner_type, owner_id, model)
-    );
-    CREATE INDEX IF NOT EXISTS idx_embeddings_user ON embeddings(user_id);
-    CREATE INDEX IF NOT EXISTS idx_embeddings_content_hash ON embeddings(owner_type, owner_id, content_hash);
-  ELSE
-    RAISE NOTICE '[migration v53] vector extension not installed: embeddings table skipped';
-  END IF;
-END
-$migration53$;`,
+      sql: `SELECT 1;`,
     },
     {
-      // v54 (checkbox 112): durable background-job schema for the always-on AI
-      // (Wave 14). These tables - NOT Vercel Workflow retention - are the source of
-      // truth: the runner is at-least-once, claims with `FOR UPDATE SKIP LOCKED`,
-      // holds a job under a renewable lease (`lease_token` + `lease_expires_at`) and
-      // reclaims it when the lease expires (attempts left -> queued, exhausted ->
-      // dead_letter). `agent_job_events` is the append-only audit trail, `agent_workers`
-      // the worker registry, `agent_routines` the per-user schedules.
-      //
-      // `agent_jobs.kind` is CHECK-constrained to every job kind the plan defines:
-      // `morning_brief` / `evening_review` / `weekly_review` / `hourly_triage` (Wave 15
-      // routines 122-125, the queue's consumers) plus `watchdog` (Wave 14 todo 121's
-      // self-watchdog / todo 130). An unknown kind is rejected by the database with a
-      // message naming `agent_jobs_kind_check`, never silently queued; adding a kind
-      // requires a new append-only migration. `status` is constrained to the seven
-      // lifecycle states the queue service implements (113).
-      //
-      // `user_id` stays nullable like `notification_queue` (v3): user-scoped jobs
-      // dominate but a future system-scope job must not need a schema change. The
-      // partial unique index enforces per-user idempotency exactly when an
-      // `idempotency_key` is present (NULL user_id rows never collide - Postgres
-      // unique-NULL semantics).
-      //
-      // Purely additive + idempotent: only CREATE TABLE / CREATE INDEX IF NOT EXISTS,
-      // no ALTER of existing tables, no backfill, no data migration, re-running is a
-      // no-op. Supersedes `notification_queue` retries for AI work only - notification
-      // retries keep their own table/service.
+      // v54（vercel checkbox 112, Wave 14）: 常驻 AI 的持久后台任务表族（非 Workflow 保留，
+      // 是事实源）：agent_jobs 由 at-least-once runner 认领（lease_token + lease_expires_at
+      // 可续租，租期到期按 attempts 回收），agent_job_events 追加式审计，agent_workers
+      // worker 注册表，agent_routines 每用户排程。kind/status CHECK 收敛生命周期；
+      // idempotency_key 的部分唯一索引只在有 key 时按用户幂等（NULL user_id 行互不碰撞）。
+      // gen_random_uuid() → lower(hex(randomblob(16)))；行锁 FOR UPDATE SKIP LOCKED 在
+      // 单连接内存库无意义，并发正确性由 lease_token 校验保证。
       version: 54,
       name: 'agent_jobs_v54',
       sql: `CREATE TABLE IF NOT EXISTS agent_jobs (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   kind TEXT NOT NULL CONSTRAINT agent_jobs_kind_check CHECK (kind IN ('evening_review', 'hourly_triage', 'morning_brief', 'watchdog', 'weekly_review')),
-  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  payload TEXT NOT NULL DEFAULT '{}',
   status TEXT NOT NULL DEFAULT 'queued' CONSTRAINT agent_jobs_status_check CHECK (status IN ('queued', 'leased', 'running', 'succeeded', 'failed', 'dead_letter', 'cancelled')),
   priority INTEGER NOT NULL DEFAULT 0,
   attempt INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL DEFAULT 3,
   idempotency_key TEXT,
   lease_owner TEXT,
-  lease_token UUID,
-  lease_expires_at TIMESTAMPTZ,
-  last_heartbeat_at TIMESTAMPTZ,
-  run_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  started_at TIMESTAMPTZ,
-  finished_at TIMESTAMPTZ,
+  lease_token TEXT,
+  lease_expires_at TEXT,
+  last_heartbeat_at TEXT,
+  run_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  started_at TEXT,
+  finished_at TEXT,
   error_code TEXT,
   error_message TEXT,
-  result JSONB,
+  result TEXT,
   cost_tokens INTEGER NOT NULL DEFAULT 0,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_jobs_idempotency ON agent_jobs (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_claim ON agent_jobs (status, run_at);
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_kind_status ON agent_jobs (kind, status);
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_user_created ON agent_jobs (user_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS agent_job_events (
-  id BIGSERIAL PRIMARY KEY,
-  job_id UUID NOT NULL REFERENCES agent_jobs(id) ON DELETE CASCADE,
-  at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES agent_jobs(id) ON DELETE CASCADE,
+  at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   status TEXT,
-  detail JSONB
+  detail TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_agent_job_events_job ON agent_job_events (job_id, at);
 CREATE TABLE IF NOT EXISTS agent_workers (
   id TEXT PRIMARY KEY,
   kind TEXT,
-  last_seen_at TIMESTAMPTZ,
-  meta JSONB
+  last_seen_at TEXT,
+  meta TEXT
 );
 CREATE TABLE IF NOT EXISTS agent_routines (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   cron_expr TEXT,
   kind TEXT NOT NULL,
-  enabled BOOLEAN NOT NULL DEFAULT FALSE,
-  next_run_at TIMESTAMPTZ,
-  last_run_at TIMESTAMPTZ,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  next_run_at TEXT,
+  last_run_at TEXT,
   tier TEXT,
   budget_per_day INTEGER,
-  config JSONB NOT NULL DEFAULT '{}'::jsonb,
+  config TEXT NOT NULL DEFAULT '{}',
   UNIQUE (user_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_agent_routines_due ON agent_routines (enabled, next_run_at);`,
     },
     {
-      // Checkbox 101: scoped, revocable agent tokens + their audit log. A token is minted
-      // once (raw value shown once), stored ONLY as a SHA-256 hex hash; the plaintext is
-      // never persisted. `scopes` is a coarse grant array ('read' | 'write' | 'admin') that
-      // the dispatcher maps onto each tool's fine-grained `requiredScope` from
-      // shared/src/agent-tools.ts. `agent_audit_logs` records every authorisation decision
-      // (allowed / denied / confirm_required) with the redacted args, the outcome and timing.
-      //
-      // Purely additive + idempotent: CREATE TABLE / CREATE INDEX IF NOT EXISTS only, no
-      // ALTER of existing tables, no backfill, no data migration, re-running is a no-op.
-      // Revocation is soft (`revoked_at`) so the audit trail keeps referring to the token.
+      // v55（vercel checkbox 101）: 作用域化、可撤销的 agent token + 审计。token 原文只展示
+      // 一次，仅存 SHA-256 哈希；scopes 是粗粒度授权数组（read/write/admin），dispatcher 映射
+      // 到各工具的 requiredScope；agent_audit_logs 记录每次授权决策（脱敏参数/结果/耗时）。
+      // 撤销软删（revoked_at），审计链保留对 token 的引用。ARRAY['read'] → JSON '["read"]'。
       version: 55,
       name: 'agent_tokens_v55',
       sql: `CREATE TABLE IF NOT EXISTS agent_tokens (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   token_hash TEXT NOT NULL UNIQUE,
-  scopes TEXT[] NOT NULL DEFAULT ARRAY['read']::text[],
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  last_used_at TIMESTAMPTZ,
-  revoked_at TIMESTAMPTZ,
-  expires_at TIMESTAMPTZ
+  scopes TEXT NOT NULL DEFAULT '["read"]',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_used_at TEXT,
+  revoked_at TEXT,
+  expires_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_agent_tokens_user ON agent_tokens (user_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS agent_audit_logs (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-  token_id UUID REFERENCES agent_tokens(id) ON DELETE SET NULL,
+  token_id TEXT REFERENCES agent_tokens(id) ON DELETE SET NULL,
   tool TEXT NOT NULL,
-  args_redacted JSONB NOT NULL DEFAULT '{}'::jsonb,
+  args_redacted TEXT NOT NULL DEFAULT '{}',
   decision TEXT NOT NULL CONSTRAINT agent_audit_logs_decision_check CHECK (decision IN ('allowed', 'denied', 'confirm_required')),
   result TEXT CONSTRAINT agent_audit_logs_result_check CHECK (result IN ('ok', 'error')),
   error_code TEXT,
   duration_ms INTEGER,
   request_id TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_agent_audit_logs_user ON agent_audit_logs (user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_audit_logs_token ON agent_audit_logs (token_id, created_at DESC);`,
     },
     {
-      // Checkbox 102: durable two-phase confirmation store for the agent action API.
-      //
-      // A `requiresConfirmation` tool (delete_event, send_digest) is NOT executed by
-      // POST /api/agent/actions/:tool. Phase 1 validates + authorises the call, then records
-      // ONE pending row here and returns its id; phase 2 (POST /api/agent/confirm/:id)
-      // atomically claims the row and only then runs the handler:
-      //
-      //   UPDATE ... SET status='consumed', consumed_at=now()
-      //   WHERE id=$1 AND user_id=$2 AND status='pending' AND expires_at > now()
-      //
-      // The single-use guarantee AND the 2-minute TTL live in that one conditional UPDATE
-      // (the data layer), so a concurrent double-confirm matches at most one row and an
-      // expired confirmation can never be claimed - no JS-side check can race it.
-      //
-      // Persisted, not module state: Hono runs per-invocation on Vercel, so an in-memory
-      // store would silently lose every pending confirmation between the two HTTP calls.
-      // `args` holds the phase-1-validated arguments the handler needs (audit redaction is
-      // a separate concern); `expires_at` is compared in SQL, never by slicing an ISO string.
-      //
-      // Purely additive + idempotent: CREATE TABLE / CREATE INDEX IF NOT EXISTS only, no
-      // ALTER of existing tables, no backfill, re-running is a no-op.
+      // v56（vercel checkbox 102）: agent 动作的两段式确认持久化。requiresConfirmation 工具
+      // 不在第一步执行：先记录一条 pending 行返回 id，第二步原子认领（UPDATE...SET
+      // status='consumed' WHERE status='pending' AND expires_at > CURRENT_TIMESTAMP）——
+      // 单次有效性与 2 分钟 TTL 都在这条条件 UPDATE 里，并发双确认最多命中一行。
+      // 持久化而非内存态：进程重启会丢掉所有待确认项。
       version: 56,
       name: 'agent_confirmations_v56',
       sql: `CREATE TABLE IF NOT EXISTS agent_confirmations (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  token_id UUID REFERENCES agent_tokens(id) ON DELETE SET NULL,
+  token_id TEXT REFERENCES agent_tokens(id) ON DELETE SET NULL,
   tool TEXT NOT NULL,
-  args JSONB NOT NULL DEFAULT '{}'::jsonb,
+  args TEXT NOT NULL DEFAULT '{}',
   status TEXT NOT NULL DEFAULT 'pending' CONSTRAINT agent_confirmations_status_check CHECK (status IN ('pending', 'consumed', 'expired')),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  expires_at TIMESTAMPTZ NOT NULL,
-  consumed_at TIMESTAMPTZ
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_agent_confirmations_user ON agent_confirmations (user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_confirmations_pending ON agent_confirmations (status, expires_at);`,
     },
     {
-      // v57 (checkbox 132): complete the default trigram search path for the five entity
-      // types the earlier trigram landings did NOT cover.
-      //
-      // Existing coverage before this migration (verified by reading migrate.ts + schema.pg.sql
-      // immediately before appending): v33 created pg_trgm + events(name, person_name, tags) +
-      // fixed_contacts(name, nickname, notes) + expiry_items(title, vendor); v34 added
-      // expiry_items(title, vendor) again (the v33 block was forward-looking); v35 added
-      // inventory_items(name); v38/v53 added documents(title, issuer); v53 completed the set
-      // with fixed_contacts(relationship), interactions(summary), expiry_items(notes).
-      // So `inventory_items.name` ALREADY had a trigram index and is deliberately NOT re-issued
-      // here. Genuinely missing until v57: inventory location/notes, maintenance asset_name/notes,
-      // habits name, goals title/description, inbox title/body/sender_label.
-      //
-      // Additive + idempotent + re-runnable: CREATE EXTENSION/INDEX IF NOT EXISTS only, no ALTER
-      // of existing tables, no backfill, no data migration. `CREATE EXTENSION IF NOT EXISTS
-      // pg_trgm` is re-stated so v57 is self-contained even on a database whose v33 failed on the
-      // extension (the runner records a failed version as un-applied and continues walking).
+      // v57（vercel checkbox 132）: vercel 版全量是为 v53 未覆盖实体补建的 pg_trgm GIN 索引
+      // （inventory location/notes、maintenance asset_name/notes、habits name、goals
+      // title/description、inbox title/body/sender_label）。SQLite 上整条删除（同 v53，
+      // LIKE 回退）。保留版本号占位。
       version: 57,
       name: 'search_trgm_remaining_v57',
-      sql: `-- CJK substring search for the remaining entity types; no external calls.
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-CREATE INDEX IF NOT EXISTS idx_inventory_items_location_trgm ON inventory_items USING GIN (location gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_inventory_items_notes_trgm ON inventory_items USING GIN (notes gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_maintenance_plans_asset_name_trgm ON maintenance_plans USING GIN (asset_name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_maintenance_plans_notes_trgm ON maintenance_plans USING GIN (notes gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_habits_name_trgm ON habits USING GIN (name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_goals_title_trgm ON goals USING GIN (title gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_goals_description_trgm ON goals USING GIN (description gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_inbox_messages_title_trgm ON inbox_messages USING GIN (title gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_inbox_messages_body_trgm ON inbox_messages USING GIN (body gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_inbox_messages_sender_label_trgm ON inbox_messages USING GIN (sender_label gin_trgm_ops);`,
+      sql: `SELECT 1;`,
     },
     {
-      // v58 (checkbox 134): cross-entity tag system.
-      //
-      // `tags` is the per-user tag vocabulary; `tag_links` is the many-to-many join against
-      // the eight supported entity kinds (events, contacts, documents, expiry, inventory,
-      // maintenance, habits, goals). Tags are ORTHOGONAL to the pre-existing `events.tags`
-      // JSONB / `events.type` columns - this table is a separate, shared vocabulary.
-      //
-      // `tag_links.user_id` is denormalised on purpose: the list-filter predicate runs a
-      // per-row EXISTS against `(user_id, entity_type, entity_id)`, so the index below keeps
-      // the filter index-usable without joining `tags` first; the link row's owner is also
-      // checked directly, so one user can never observe another user's links.
-      //
-      // `ON DELETE CASCADE` on `tag_links.tag_id` is what makes "delete a tag" remove its
-      // links (but never the linked entities): the entities live in their own tables and are
-      // never touched by this migration or by tag deletion. The `entity_id` INTEGER is a
-      // deliberate plain column (not a polymorphic FK) because it spans eight tables; the
-      // service layer validates that `(entity_type, entity_id)` belongs to the caller BEFORE
-      // every insert, so an orphan link cannot be created through the API.
-      //
-      // Purely additive + idempotent: CREATE TABLE / CREATE INDEX IF NOT EXISTS only, no ALTER
-      // of existing tables, no backfill, no data migration; re-running is a no-op.
+      // v58（vercel checkbox 134）: 跨实体标签系统。tags 是每用户标签词表；tag_links 对八种
+      // 实体（event/contact/document/expiry/inventory/maintenance/habit/goal）做多对多关联，
+      // 与既有 events.tags JSON 列正交。tag_links.user_id 反范式化：列表过滤谓词对
+      // (user_id, entity_type, entity_id) 逐行 EXISTS 时索引可直接命中，且一行用户永远看不到
+      // 另一用户的 link。tag_id CASCADE：删标签清 link 但绝不动被关联实体；entity_id 是普通
+      // 列（跨八表，不做多态 FK），服务层在每次插入前校验属主。
       version: 58,
       name: 'tags_tag_links_v58',
       sql: `CREATE TABLE IF NOT EXISTS tags (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   color TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (user_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_tags_user ON tags (user_id, name);
 CREATE TABLE IF NOT EXISTS tag_links (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   entity_type TEXT NOT NULL CONSTRAINT tag_links_entity_type_check CHECK (entity_type IN ('event', 'contact', 'document', 'expiry', 'inventory', 'maintenance', 'habit', 'goal')),
   entity_id INTEGER NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (tag_id, entity_type, entity_id)
 );
 CREATE INDEX IF NOT EXISTS idx_tag_links_entity ON tag_links (user_id, entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_tag_links_tag ON tag_links (tag_id, entity_type);`,
     },
     {
-      // v59 (checkbox 115-116): scheduler egress ledger for the self-perpetuating chain -
-      // scheduler_runs (one live run per chain via the partial unique index) + scheduler_ticks.
-      // Folded from backend/src/db/pending/59-scheduler-egress.sql; SQL embedded verbatim.
-      // Idempotent: every statement is IF NOT EXISTS-guarded; no existing migration was touched.
+      // v59（vercel checkbox 115-116）: 自续链调度器的出口台账 —— scheduler_runs（经部分
+      // 唯一索引每链至多一个 live run）+ scheduler_ticks（每 tick 一行台账，due/ran/skipped/
+      // error 计数 + 详情）。部分唯一索引是并发引导/交接的仲裁者：INSERT...ON CONFLICT
+      // (chain_id) WHERE status='running' DO NOTHING（SQLite 3.35+ 支持，探针实测）。
       version: 59,
       name: 'scheduler_egress_v59',
-      sql: `-- ============================================================================
--- Pending migration 59 — scheduler_runs / scheduler_ticks (checkbox 115-116)
--- ============================================================================
--- MERGED AS VERSION 59 into backend/src/db/migrate.ts at release. This is the
--- scheduler egress ledger for the self-perpetuating chain: Vercel Workflow DevKit
--- is NOT used, Postgres is the source of truth (see
--- backend/src/services/agent/scheduler.workflow.ts). The orchestrator merges
--- pending files in numeric order; this file follows the landed max (58).
---
--- scheduler_runs  — one row per chain run (status: running -> handed_off when the
---   event threshold is reached, or running -> stalled when the watchdog sees no
---   tick for 3 x tick_interval_ms). The UNIQUE PARTIAL index over
---   (chain_id) WHERE status = 'running' is the concurrency arbiter: both
---   bootstrap and handoff use
---     INSERT ... ON CONFLICT (chain_id) WHERE status = 'running' DO NOTHING
---   + re-select, so concurrent callbacks converge on exactly ONE live run, while
---   history (parents, successors) stays queryable via parent_run_id.
--- scheduler_ticks — one ledger row per executed tick (at most 50 routines per
---   tick), with due/ran/skipped/error counters and a detail jsonb payload.
---
--- Purely additive + idempotent: CREATE TABLE / CREATE INDEX IF NOT EXISTS only,
--- no ALTER of existing tables, no backfill, re-running is a no-op.
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS scheduler_runs (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      sql: `CREATE TABLE IF NOT EXISTS scheduler_runs (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   chain_id TEXT NOT NULL DEFAULT 'default',
-  parent_run_id UUID REFERENCES scheduler_runs(id) ON DELETE SET NULL,
+  parent_run_id TEXT REFERENCES scheduler_runs(id) ON DELETE SET NULL,
   status TEXT NOT NULL DEFAULT 'running'
     CHECK (status IN ('running', 'handed_off', 'stalled', 'stopped')),
   tick_interval_ms INTEGER NOT NULL DEFAULT 600000,
   step_count INTEGER NOT NULL DEFAULT 0,
   event_count INTEGER NOT NULL DEFAULT 0,
-  started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  last_tick_at TIMESTAMPTZ,
-  handed_off_at TIMESTAMPTZ,
-  ended_at TIMESTAMPTZ,
-  meta JSONB NOT NULL DEFAULT '{}'::jsonb
+  started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_tick_at TEXT,
+  handed_off_at TEXT,
+  ended_at TEXT,
+  meta TEXT NOT NULL DEFAULT '{}'
 );
 
--- Exactly one live run per chain: the arbiter for concurrent bootstrap / handoff
--- (\`ON CONFLICT (chain_id) WHERE status = 'running'\` infers this partial index).
+-- 每链恰好一个 live run：并发引导/交接的仲裁者。
 CREATE UNIQUE INDEX IF NOT EXISTS scheduler_runs_one_live_per_chain
   ON scheduler_runs (chain_id) WHERE status = 'running';
 
--- Chain history / status reads.
+-- 链历史 / 状态读取。
 CREATE INDEX IF NOT EXISTS idx_scheduler_runs_chain
   ON scheduler_runs (chain_id, started_at DESC);
 
 CREATE TABLE IF NOT EXISTS scheduler_ticks (
-  id BIGSERIAL PRIMARY KEY,
-  run_id UUID NOT NULL REFERENCES scheduler_runs(id) ON DELETE CASCADE,
-  at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES scheduler_runs(id) ON DELETE CASCADE,
+  at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   due_count INTEGER NOT NULL DEFAULT 0,
   ran_count INTEGER NOT NULL DEFAULT 0,
   skipped_count INTEGER NOT NULL DEFAULT 0,
   error_count INTEGER NOT NULL DEFAULT 0,
-  detail JSONB NOT NULL DEFAULT '{}'::jsonb
+  detail TEXT NOT NULL DEFAULT '{}'
 );
 
--- Last-tick lookup for GET /api/agent/scheduler/status and the heartbeat trail.
+-- GET /api/agent/scheduler/status 与心跳轨迹的最近一次 tick 查询。
 CREATE INDEX IF NOT EXISTS idx_scheduler_ticks_run_at
   ON scheduler_ticks (run_id, at DESC);`,
     },
     {
-      // v60 (checkbox 118 + 121): proactive notification budget / suppression / folded content +
-      // the Neon CU-hour guard alert ledger.
-      // Folded from backend/src/db/pending/60-notification-budget.sql; SQL embedded verbatim.
-      // Idempotent: every statement is IF NOT EXISTS-guarded; no existing migration was touched.
+      // v60（vercel checkbox 118 + 121）: 主动通知预算/抑制/折叠内容台账。
+      // agent_budget_usage：每用户每本地日的主动通知预算与抑制计数（day 是用户本地日历日，
+      // 服务层以 Intl.DateTimeFormat 解析，计数在用户本地午夜归零；仅计主动发送）。
+      // agent_notification_claims：发送认领台账（reminder_send_claims 的 agent 版），认领用
+      // INSERT...ON CONFLICT DO NOTHING，重复认领命中 0 行即跳过；window_bucket =
+      // floor(epochMs/windowMs)。agent_digest_folds：预算耗尽/静音时段时非紧急 routine 内容
+      // 折叠于此，下次收件箱日报消费（consumed_at IS NULL），本表内容永不单独投递。
+      // agent_neon_budget_alerts：vercel Neon CU-hour 告警台账（docker 部署无害保留）。
       version: 60,
       name: 'notification_budget_v60',
-      sql: `-- 60-notification-budget.sql (checkbox 118 + 121 supporting DDL)
---
--- PENDING DDL: this directory is merged into backend/src/db/migrate.ts by the
--- integrator (append-only, next free version = 60 at the time of writing; the
--- integrator re-checks the tail immediately before appending, per repo convention).
--- Do NOT edit migrate.ts from a lane; this file is the lane's DDL handoff.
---
--- Idempotent + additive: CREATE TABLE / CREATE INDEX IF NOT EXISTS only, no ALTER,
--- no backfill, no data migration; re-running is a no-op.
-
--- (118) Per-user per-LOCAL-day proactive notification budget and suppression ledger.
--- \`day\` is the user's local calendar day (YYYY-MM-DD), resolved timezone-aware via
--- Intl.DateTimeFormat in notification-budget.service.ts, so the counters reset at the
--- user's local midnight. \`sent_count\` counts proactive sends only; user-initiated
--- replies and the critical class (e.g. medication critical reminders) are excluded
--- from BOTH counters by the service, never written here as sends.
-CREATE TABLE IF NOT EXISTS agent_budget_usage (
+      sql: `CREATE TABLE IF NOT EXISTS agent_budget_usage (
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  day DATE NOT NULL,
+  day TEXT NOT NULL,
   sent_count INTEGER NOT NULL DEFAULT 0,
   suppressed_count INTEGER NOT NULL DEFAULT 0,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (user_id, day)
 );
 CREATE INDEX IF NOT EXISTS idx_agent_budget_usage_day ON agent_budget_usage (day);
 
--- (118) Send-claim ledger, the agent-queue analogue of \`reminder_send_claims\`:
--- a claim is won with \`INSERT ... ON CONFLICT DO NOTHING RETURNING id\`, so a
--- duplicate claim matches zero rows and the caller skips. \`window_bucket\` is
--- floor(epochMs / windowMs); a new bucket = a fresh window. Two scopes:
---   dedupe            - identical content within AGENT_NOTIFICATION_DEDUPE_WINDOW_MS
---   routine_cooldown  - per-routine cooldown (AGENT_ROUTINE_COOLDOWN_MS)
 CREATE TABLE IF NOT EXISTS agent_notification_claims (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   scope TEXT NOT NULL CONSTRAINT agent_notification_claims_scope_check CHECK (scope IN ('dedupe', 'routine_cooldown')),
   claim_key TEXT NOT NULL,
   window_bucket BIGINT NOT NULL,
-  claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  claimed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (user_id, scope, claim_key, window_bucket)
 );
 CREATE INDEX IF NOT EXISTS idx_agent_notification_claims_user ON agent_notification_claims (user_id, claimed_at DESC);
 
--- (118) Folded proactive content: when the daily budget is exhausted (or the user is
--- inside quiet hours) a non-urgent routine's content is stored here instead of being
--- sent; the next Inbox digest consumes pending rows (consumed_at IS NULL) and marks
--- them consumed. Nothing in this table is ever delivered on its own.
 CREATE TABLE IF NOT EXISTS agent_digest_folds (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   routine_id TEXT,
   notification_class TEXT NOT NULL DEFAULT 'routine',
   title TEXT NOT NULL,
   body TEXT NOT NULL,
   reason TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  consumed_at TIMESTAMPTZ
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  consumed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_agent_digest_folds_pending ON agent_digest_folds (user_id, created_at ASC) WHERE consumed_at IS NULL;
 
--- (121g) Neon Free CU-hour guard alert ledger: one row per (month, threshold) so the
--- 70% and 90% alerts fire once per month across cold-started serverless instances.
 CREATE TABLE IF NOT EXISTS agent_neon_budget_alerts (
   month TEXT NOT NULL,
   threshold_percent INTEGER NOT NULL,
   cu_hours DOUBLE PRECISION,
-  alerted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  alerted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (month, threshold_percent)
 );`,
     },
     {
-      // v61 (tasks 122-123): routine delivery idempotency + audit store (agent_routine_artifacts).
-      // Folded from backend/src/db/pending/61-routine-artifacts.sql; SQL embedded verbatim.
-      // Idempotent: every statement is IF NOT EXISTS-guarded; no existing migration was touched.
+      // v61（vercel tasks 122-123）: routine 投递幂等 + 审计（agent_routine_artifacts）。
+      // 每用户每天每 routine 一条：idempotency_key = '<routine>:<YYYY-MM-DD>'，
+      // UNIQUE (user_id, idempotency_key) 是每日一次投递守卫。payload 存正文背后的结构化
+      // 事实 + 叙述标志，回喂后续日报。partial index 服务"已认领未投递"的过期回收清扫。
       version: 61,
       name: 'routine_artifacts_v61',
-      sql: `-- 61-routine-artifacts.sql (tasks 122-123)
--- Idempotency + audit store for agent routine deliveries (morning_brief,
--- evening_review, and the later weekly_review / hourly_triage lanes).
---
--- NOT yet registered in backend/src/db/migrate.ts (coordinator-owned this wave).
--- Register as: { version: 61, name: 'routine_artifacts_v61', sql: <this file> }
--- (the migrate.ts chain ended at v58 when this file was written; 59/60 belong
--- to sibling lanes). Additive and idempotent: every statement is
--- IF NOT EXISTS-guarded; nothing existing is altered, dropped or rewritten.
-
-CREATE TABLE IF NOT EXISTS agent_routine_artifacts (
-  id SERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS agent_routine_artifacts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  -- Routine kind ('morning_brief', 'evening_review', ...); no FK - kinds are code.
+  -- routine 种类（morning_brief / evening_review / ...），无 FK —— 种类即代码。
   routine TEXT NOT NULL,
-  -- The user-local calendar day the artifact covers (YYYY-MM-DD).
-  local_date DATE NOT NULL,
-  -- '<routine>:<YYYY-MM-DD>' - unique per user, the once-per-day delivery guard.
+  -- 该 artifact 覆盖的用户本地日历日（YYYY-MM-DD）。
+  local_date TEXT NOT NULL,
+  -- '<routine>:<YYYY-MM-DD>'，每用户唯一，即每日一次投递守卫。
   idempotency_key TEXT NOT NULL,
   title TEXT NOT NULL,
   body TEXT NOT NULL,
-  -- Structured facts behind the body + narration flag (fed back into later digests).
-  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-  delivered BOOLEAN NOT NULL DEFAULT FALSE,
-  delivered_at TIMESTAMPTZ,
+  -- 正文背后的结构化事实 + 叙述标志。
+  payload TEXT NOT NULL DEFAULT '{}',
+  delivered INTEGER NOT NULL DEFAULT 0,
+  delivered_at TEXT,
   channel TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (user_id, idempotency_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_routine_artifacts_user_date
   ON agent_routine_artifacts (user_id, local_date DESC);
 
--- Partial index for the stale-reclaim sweep (claimed but never delivered).
+-- 过期回收清扫（已认领但从未投递）的部分索引。
 CREATE INDEX IF NOT EXISTS idx_agent_routine_artifacts_pending
-  ON agent_routine_artifacts (created_at) WHERE delivered = FALSE;`,
+  ON agent_routine_artifacts (created_at) WHERE delivered = 0;`,
     },
     {
-      // v62 (routines 122-125): hourly-triage / weekly-review dedupe memory (agent_triage_state).
-      // Folded from backend/src/db/pending/62-triage-state.sql; SQL embedded verbatim.
-      // Idempotent: every statement is IF NOT EXISTS-guarded; no existing migration was touched.
+      // v62（vercel routines 122-125）: hourly-triage / weekly-review 的去重记忆
+      // （agent_triage_state）。hourly triage 观察、weekly review 摘要，二者必须对"已经给
+      // 用户看过什么"达成一致。每 (user, item fingerprint) 一行持久记忆：fingerprint 稳定键
+      // （如 event:42），last_seen_at 保新鲜度，last_surfaced_at 是抑制锚点（去重窗口内跳过，
+      // 除非重要度升级），surfaced_count 实际展示次数，digest_week 是最近一次进周报的 ISO 周
+      // （NULL = 从未摘要，同周重跑产出同一份摘要）。
       version: 62,
       name: 'triage_state_v62',
-      sql: `-- ============================================================================
--- Pending migration 62 — agent_triage_state (Wave 15 routines 122-125)
--- ============================================================================
--- NOT yet merged into backend/src/db/migrate.ts: that file is a shared file the
--- routine lane must not edit. The orchestrator merges pending files in numeric
--- order at release (62 follows the currently landed max, 58 at the time of
--- writing). Until then the routines in
---   backend/src/services/agent/routines/hourly-triage.ts
---   backend/src/services/agent/routines/weekly-review.ts
--- will fail their reads/writes with "relation agent_triage_state does not exist".
---
--- Why one table and not per-routine state: the hourly triage OBSERVES and the
--- weekly review DIGESTS, and both must agree on what has already been shown to
--- the user. One durable row per (user, item fingerprint) is the dedupe memory
--- that survives serverless cold starts:
---
---   fingerprint          stable key, e.g. 'event:42'  (UNIQUE per user)
---   last_seen_at         freshness: when the item last appeared in a scan
---   last_surfaced_at     suppression anchor: hourly triage skips a fingerprint
---                        surfaced within its dedupe window unless importance
---                        escalated (see TRIAGE_DEDUPE_WINDOW_HOURS / _DELTA)
---   surfaced_count       how many times it was actually shown
---   last_surface_kind    'hourly_triage' | 'weekly_review'
---   digest_week          ISO week ('2026-W40') the item was last included in a
---                        weekly digest; NULL = never digested. Same-week re-runs
---                        reproduce the same digest; earlier-week items repeat only
---                        while importance stays at/above the urgent bar.
---
--- Purely additive + idempotent: CREATE TABLE / CREATE INDEX IF NOT EXISTS only,
--- no ALTER of existing tables, no backfill, re-running is a no-op.
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS agent_triage_state (
-  id BIGSERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS agent_triage_state (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   fingerprint TEXT NOT NULL,
   source_kind TEXT NOT NULL,
@@ -1952,16 +1532,16 @@ CREATE TABLE IF NOT EXISTS agent_triage_state (
   title TEXT NOT NULL DEFAULT '',
   importance INTEGER NOT NULL DEFAULT 0,
   band TEXT NOT NULL DEFAULT 'fyi',
-  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  last_surfaced_at TIMESTAMPTZ,
+  first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_surfaced_at TEXT,
   surfaced_count INTEGER NOT NULL DEFAULT 0,
   last_surface_kind TEXT,
   digest_week TEXT,
   UNIQUE (user_id, fingerprint)
 );
 
--- Scan/lookup support for the two routines (bounded, index-friendly reads).
+-- 两个 routine 的扫描/查找支持（有界、索引友好读取）。
 CREATE INDEX IF NOT EXISTS idx_agent_triage_state_recent
   ON agent_triage_state (user_id, last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_triage_state_surfaced
@@ -1970,194 +1550,108 @@ CREATE INDEX IF NOT EXISTS idx_agent_triage_state_week
   ON agent_triage_state (user_id, digest_week);`,
     },
     {
-      // v63 (tasks 126/127): agent decision cards + durable feedback policy memory.
-      // Folded from backend/src/db/pending/63-agent-feedback.sql; SQL embedded verbatim.
-      // Idempotent: every statement is IF NOT EXISTS-guarded; no existing migration was touched.
+      // v63（vercel tasks 126/127）: agent 决策卡 + 持久反馈策略记忆。agent_decision_cards
+      // 是 human-in-the-loop 提案（任务 126）：批准前绝不改用户数据，exactly-once 由单条原子
+      // 认领保证（UPDATE...SET status='approved' WHERE status='pending'，输者更新 0 行，
+      // API 回 409 already_decided）。agent_feedback 是持久记忆（任务 127）：每次批准/编辑/
+      // 拒绝（含可选"为什么"）与每条纠错落库，并在 user_patterns（kind='decision_feedback'）
+      // 派生一行提升挖掘器置信度。同一 subject 最近一行即生效策略；极性翻转记为 conflict。
+      // 反馈记忆永不覆盖硬设置（静音时段、通知预算）——见 feedback.service.ts HARD_SETTING_SUBJECTS。
       version: 63,
       name: 'agent_feedback_v63',
-      sql: `-- ============================================================================
--- Pending migration 63 — agent decision cards + durable feedback memory
--- (Wave 16 tasks 126 + 127)
--- ============================================================================
--- NOT yet merged into backend/src/db/migrate.ts: that file is owned by the
--- integrator lane. The orchestrator merges pending files in numeric order at
--- release (63 follows the currently landed max, 62 at the time of writing).
--- Until then:
---   backend/src/services/agent/decision-card.service.ts
---   backend/src/services/agent/feedback.service.ts
---   backend/src/routes/decisions.ts
--- will fail their reads/writes with "relation agent_decision_cards/agent_feedback
--- does not exist".
---
--- WHY TWO TABLES:
---
---   agent_decision_cards  The human-in-the-loop proposal (task 126). NOTHING
---                         mutates user data until the card is approved. The
---                         exactly-once guarantee is a single atomic claim:
---                         \`UPDATE ... SET status='approved' WHERE status='pending'\`
---                         - the loser of a race updates zero rows and the API
---                         returns 409 already_decided. The card stores the full
---                         typed payload so the resolver registry (subject kind ->
---                         apply function) can re-validate it at approval time.
---                         \`is_question\` marks question cards, whose daily cap is
---                         enforced separately from the notification budget.
---
---   agent_feedback        The durable memory (task 127): every approve/edit/
---                         reject (with its optional free-text "Why?") and every
---                         correction lands here, plus a derived row in
---                         user_patterns (kind='decision_feedback') so the miner's
---                         confidence rises from REAL feedback. The most recent
---                         row for a subject is the effective policy; a polarity
---                         flip (approve then reject) is logged as a conflict
---                         rather than oscillating.
---
--- The feedback memory NEVER overrides a hard setting (quiet hours, notification
--- budget): those live in configuration and the feedback service refuses to turn
--- feedback rows into config overrides (see HARD_SETTING_SUBJECTS in
--- feedback.service.ts). Hard settings are excluded from the policy digest too.
---
--- Purely additive + idempotent: CREATE TABLE / CREATE INDEX IF NOT EXISTS only,
--- no ALTER of existing tables, no backfill, re-running is a no-op.
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS agent_decision_cards (
-  id BIGSERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS agent_decision_cards (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  -- Typed subject kind; only kinds present in DECISION_SUBJECT_KINDS have a
-  -- resolver, so an unknown kind can never be applied (injection guard).
+  -- 类型化 subject kind；只有出现在 DECISION_SUBJECT_KINDS 里的 kind 才有 resolver，
+  -- 未知 kind 永远无法被执行（注入守卫）。
   subject_kind TEXT NOT NULL,
-  -- Stable human/machine subject, e.g. 'contact:12+34'. It is the key the
-  -- feedback memory and the policy digest use for suppression checks.
+  -- 稳定的人机可读 subject，如 'contact:12+34'，是反馈记忆与策略摘要的抑制键。
   subject_ref TEXT,
-  -- 'propose' at creation time; kept as a column so future action kinds
-  -- (e.g. 'question') do not need an ALTER.
+  -- 创建时为 'propose'；保留成列以便未来动作种类（如 'question'）无需改表。
   action TEXT NOT NULL DEFAULT 'propose',
   summary TEXT NOT NULL DEFAULT '',
-  -- Full proposed change; validated against the resolver's allowlist at
-  -- approval time - never executed blindly.
-  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-  -- Caller-provided idempotency key: re-proposing the same change returns the
-  -- EXISTING card instead of creating (and re-notifying) a second one.
+  -- 完整提案变更；批准时对照 resolver 白名单校验——绝不盲执行。
+  payload TEXT NOT NULL DEFAULT '{}',
+  -- 调用方提供的幂等键：重复提案同一变更返回既有卡片而不是再建（再通知）一张。
   idempotency_key TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending', 'approved', 'rejected', 'target_missing', 'expired')),
-  -- Question cards (the agent asking the user something) have their own daily
-  -- cap, enforced separately from the notification budget.
-  is_question BOOLEAN NOT NULL DEFAULT FALSE,
-  -- The optional free-text "Why?" note captured at decide time.
+  -- 提问卡（agent 向用户提问）有独立每日上限，与通知预算分开。
+  is_question INTEGER NOT NULL DEFAULT 0,
+  -- 决定时记录的可选"为什么"备注。
   rationale TEXT,
-  -- For an edit decision: the user-adjusted payload merged over \`payload\`.
-  edit_payload JSONB,
-  -- Outcome of the resolver run: { status, detail, applied_at }.
-  resolution JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  decided_at TIMESTAMPTZ,
+  -- 编辑决策：用户调整后的 payload 合并到 payload 之上。
+  edit_payload TEXT,
+  -- resolver 运行结果：{ status, detail, applied_at }。
+  resolution TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  decided_at TEXT,
   UNIQUE (user_id, idempotency_key)
 );
 
--- Pending-card lists (API + bot) and the question-card day counter.
+-- 待决卡片列表（API + bot）与提问卡日计数。
 CREATE INDEX IF NOT EXISTS idx_agent_decision_cards_user_status
   ON agent_decision_cards (user_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_decision_cards_user_question
   ON agent_decision_cards (user_id, is_question, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS agent_feedback (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  -- 'decision' (approve/edit/reject of a card) | 'correction' (free correction).
+  -- 'decision'（卡片的批准/编辑/拒绝）| 'correction'（自由纠错）。
   kind TEXT NOT NULL,
-  -- Feedback subject; matches agent_decision_cards.subject_ref (or the subject
-  -- kind when no ref was supplied). This is the suppression key.
+  -- 反馈 subject；对应 agent_decision_cards.subject_ref（未给 ref 时为 subject kind）。抑制键。
   subject TEXT NOT NULL,
-  -- 'approve' | 'edit' | 'reject' | 'correct'.
+  -- 'approve' | 'edit' | 'reject' | 'correct'。
   action TEXT NOT NULL,
-  -- Optional free-text "Why?" note, persisted verbatim (bounded upstream).
+  -- 可选"为什么"备注，原样持久化（上游限长）。
   rationale TEXT,
-  -- Card that produced this feedback, when applicable; audit only.
+  -- 产生该反馈的卡片（如适用）；仅审计用途。
   decision_card_id BIGINT REFERENCES agent_decision_cards(id) ON DELETE SET NULL,
-  -- Machine details (edited payload, target_missing flag, conflict_with, ...).
-  detail JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  -- 机器细节（编辑后 payload、target_missing 标志、conflict_with、...）。
+  detail TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- Latest-per-subject lookup (policy check, digest, conflict resolution).
+-- 每 subject 最近一行查找（策略检查、摘要、冲突消解）。
 CREATE INDEX IF NOT EXISTS idx_agent_feedback_user_subject
   ON agent_feedback (user_id, subject, created_at DESC);
--- Recency window scan for the bounded policy digest.
+-- 有界策略摘要的近期窗口扫描。
 CREATE INDEX IF NOT EXISTS idx_agent_feedback_user_created
   ON agent_feedback (user_id, created_at DESC);`,
     },
     {
-      // v64 (tasks 135/142): dedupe candidates + destructive-change audit trail with the
-      // TTL'd exactly-once undo (audit_events / audit_undo_snapshots).
-      // Folded from backend/src/db/pending/64-dedupe-audit.sql; SQL embedded verbatim.
-      // Idempotent: every statement is IF NOT EXISTS-guarded; no existing migration was touched.
+      // v64（vercel tasks 135/142）: 去重候选 + 破坏性变更审计（带 TTL 的 exactly-once 撤销）。
+      // audit_events：每次破坏性变更（delete/merge/bulk_edit/archive）一行，actor、脱敏的
+      // 前后快照、撤销截止时刻；只经 audit.service.recordAudit() 写入（token/秘钥永不入库）。
+      // audit_undo_snapshots：exactly-once 撤销。snapshot 存可恢复行组；undo_token 是暴露给
+      // 用户/bot 的 TTL 令牌；consumed_at 即原子认领（UPDATE...WHERE consumed_at IS NULL AND
+      // expires_at > CURRENT_TIMESTAMP），第二次撤销更新 0 行，API 回 409。撤销只写白名单表
+      // （events、fixed_contacts、todo_completions、interactions）。任务 135 的去重扫描器只
+      // "提案"合并（决策卡），本表族不触发任何删除。
       version: 64,
       name: 'dedupe_audit_v64',
-      sql: `-- ============================================================================
--- Pending migration 64 — dedupe candidates + audit trail with TTL'd undo
--- (Wave 17 tasks 135 + 142)
--- ============================================================================
--- NOT yet merged into backend/src/db/migrate.ts: that file is owned by the
--- integrator lane. The orchestrator merges pending files in numeric order at
--- release (64 follows the currently landed max, 63 at the time of writing).
--- Until then:
---   backend/src/services/agent/audit.service.ts
---   backend/src/services/agent/dedupe.service.ts
---   backend/src/routes/audit.ts
---   backend/src/routes/dedupe.ts
--- will fail their reads/writes with "relation audit_events/audit_undo_snapshots
--- does not exist".
---
--- WHY TWO TABLES:
---
---   audit_events         One row per destructive change (delete / merge /
---                        bulk_edit / archive) with the actor, the REDACTED
---                        before/after payloads and the undo deadline. Written
---                        only through audit.service.recordAudit(); payloads are
---                        redacted by job-hardening's redactForAudit before they
---                        reach this table (tokens/secrets never persist here).
---
---   audit_undo_snapshots The exactly-once undo. \`snapshot\` holds the restorable
---                        row groups ({version, truncated, groups:[{table, mode,
---                        rows}]}); \`undo_token\` is the TTL'd token exposed to
---                        the user/bot; \`consumed_at\` is the atomic claim
---                        (\`UPDATE ... SET consumed_at=now() WHERE consumed_at
---                        IS NULL AND expires_at > now()\`) so a second undo
---                        updates zero rows and the API returns 409. The undo
---                        deadline is \`expires_at\` (AUDIT_UNDO_TTL_HOURS,
---                        default 72h); once it passes the undo is refused.
---
--- Safety model: the task-135 dedupe scanner only PROPOSES merges (decision
--- card, task 126); nothing in these tables triggers a delete. Undo only writes
--- to an allowlisted set of tables (events, fixed_contacts, todo_completions,
--- interactions), filtered against information_schema columns at restore time.
---
--- Purely additive + idempotent: CREATE TABLE / CREATE INDEX IF NOT EXISTS only,
--- no ALTER of existing tables, no backfill, re-running is a no-op.
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS audit_events (
-  id BIGSERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  -- 'delete' | 'merge' | 'bulk_edit' | 'archive' (AUDIT_ACTIONS).
+  -- 'delete' | 'merge' | 'bulk_edit' | 'archive'（AUDIT_ACTIONS）。
   action TEXT NOT NULL,
-  -- Domain of the affected rows, e.g. 'event' | 'contact' | 'todo'.
+  -- 受影响行的域，如 'event' | 'contact' | 'todo'。
   entity_kind TEXT NOT NULL,
-  -- Stable ids of the affected entities (array of numbers/strings).
-  entity_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+  -- 受影响实体的稳定 id（数字/字符串数组）。
+  entity_ids TEXT NOT NULL DEFAULT '[]',
   summary TEXT NOT NULL DEFAULT '',
-  -- Human user the change is attributed to (agent/bot runs act on their behalf).
+  -- 变更归属的人类用户（agent/bot 代其行事）。
   actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
   -- 'api' | 'bot' | 'agent' | 'decision_card' | ...
   actor_via TEXT NOT NULL DEFAULT 'api',
-  -- REDACTED payload snapshots; never raw secrets (see redactForAudit).
-  before_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
-  after_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
-  -- Deadline copied from the snapshot row so the list view is a single scan.
-  undo_expires_at TIMESTAMPTZ,
-  undone_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  -- 脱敏 payload 快照；绝无原始秘钥（见 redactForAudit）。
+  before_snapshot TEXT NOT NULL DEFAULT '{}',
+  after_snapshot TEXT NOT NULL DEFAULT '{}',
+  -- 从快照行复制的截止时刻，列表视图单次扫描即可得。
+  undo_expires_at TEXT,
+  undone_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_events_user_created
@@ -2168,19 +1662,19 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_user_expiry
   ON audit_events (user_id, undo_expires_at);
 
 CREATE TABLE IF NOT EXISTS audit_undo_snapshots (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   audit_event_id BIGINT NOT NULL REFERENCES audit_events(id) ON DELETE CASCADE,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   -- {version, truncated, groups:[{table, mode:'reinsert'|'revert', rows:[...]}]}
-  snapshot JSONB NOT NULL DEFAULT '{"version":1,"truncated":false,"groups":[]}'::jsonb,
-  -- Opaque TTL'd token (32 random bytes, base64url). Unique per snapshot.
+  snapshot TEXT NOT NULL DEFAULT '{"version":1,"truncated":false,"groups":[]}',
+  -- 不透明 TTL 令牌（32 随机字节 base64url），每快照唯一。
   undo_token TEXT NOT NULL,
-  expires_at TIMESTAMPTZ NOT NULL,
-  -- Atomic exactly-once claim; NULL = undo still available.
-  consumed_at TIMESTAMPTZ,
-  -- Outcome detail of a successful restore: {restored, groups:[...]}.
-  restored JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TEXT NOT NULL,
+  -- 原子 exactly-once 认领；NULL = 撤销仍可用。
+  consumed_at TEXT,
+  -- 成功恢复的结果明细：{restored, groups:[...]}。
+  restored TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (audit_event_id),
   UNIQUE (undo_token)
 );
@@ -2189,62 +1683,40 @@ CREATE INDEX IF NOT EXISTS idx_audit_undo_snapshots_user_expiry
   ON audit_undo_snapshots (user_id, expires_at);`,
     },
     {
-      // v65 (task 137): data-health one-click repair ledger (data_health_repairs).
-      // Folded from backend/src/db/pending/65-data-health.sql; SQL embedded verbatim.
-      // Idempotent: every statement is IF NOT EXISTS-guarded; no existing migration was touched.
+      // v65（vercel task 137）: 数据健康一键修复台账（data_health_repairs）。每次成功修复
+      // 额外写一行（尽力而为），repaired_count 是修复触及的行数；confirmed 记录破坏性修复
+      // 是否被调用方显式确认。修复幂等，对已干净数据集重跑会追加 repaired_count = 0 的行。
       version: 65,
       name: 'data_health_v65',
-      sql: `-- Task 137: audit ledger for data-health one-click repairs.
---
--- Every successful repair writes one row here (best-effort) in addition to the shipped
--- \`audit_logs\` entry written via services/audit.service.ts. \`repaired_count\` is the number
--- of rows the repair touched; \`confirmed\` records whether a destructive repair was
--- explicitly confirmed by the caller. Repairs are idempotent, so re-running one over an
--- already-clean dataset appends a row with repaired_count = 0.
-CREATE TABLE IF NOT EXISTS data_health_repairs (
-  id SERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS data_health_repairs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   kind TEXT NOT NULL,
   repaired_count INTEGER NOT NULL DEFAULT 0,
-  confirmed BOOLEAN NOT NULL DEFAULT FALSE,
-  details JSONB,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  confirmed INTEGER NOT NULL DEFAULT 0,
+  details TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_data_health_repairs_user ON data_health_repairs (user_id, created_at DESC);`,
     },
     {
-      // v67 (tasks 140-141): recurring routine templates + steps + instantiation claims.
-      // Folded from backend/src/db/pending/67-templates.sql; SQL embedded verbatim.
-      // Idempotent: every statement is IF NOT EXISTS-guarded; no existing migration was touched.
+      // v67（vercel tasks 140-141）: 周期性 routine 模板 + 步骤 + 实例化认领。
+      // routine_templates 是命名的 routine（每用户）；routine_template_steps 是有序步骤
+      //（payload 存各 kind 选项）；routine_template_instances 兼做幂等与审计：
+      // UNIQUE (user_id, template_id, slot_key) 使双击成为 no-op —— instantiate 先以
+      // ON CONFLICT DO NOTHING 插入认发行，认领成功才创建条目，整个单元一个事务。
       version: 67,
       name: 'routine_templates_v67',
-      sql: `-- 67-templates.sql (tasks 140-141)
--- Recurring routine templates: a named set of steps (event + reminders + checklist
--- todos + optional habit / maintenance linkage) that can be instantiated as a whole.
---
--- Storage:
---   routine_templates        - the named routine (per user)
---   routine_template_steps   - ordered steps; \`payload\` holds the per-kind options
---   routine_template_instances - idempotency + audit: one row per (user, template, slot).
---     UNIQUE (user_id, template_id, slot_key) is what makes a double-click a no-op:
---     instantiate inserts this row first with ON CONFLICT DO NOTHING and only creates
---     the items when the claim succeeds. The whole unit runs in one transaction.
---
--- NOT yet registered in backend/src/db/migrate.ts (integrator-owned this wave).
--- Register as: { version: 67, name: 'routine_templates_v67', sql: <this file> }
--- (sibling pending files 59-63 belong to other lanes). Additive and idempotent: every
--- statement is IF NOT EXISTS-guarded; nothing existing is altered, dropped or rewritten.
-
-CREATE TABLE IF NOT EXISTS routine_templates (
-  id SERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS routine_templates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   description TEXT,
-  -- Built-in presets (每周大扫除 / 旅行准备 / 月度报表) are seeded with TRUE.
-  is_builtin BOOLEAN NOT NULL DEFAULT FALSE,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- 内置预设（每周大扫除 / 旅行准备 / 月度报表）以 1 播种。
+  is_builtin INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (user_id, name)
 );
 
@@ -2252,33 +1724,33 @@ CREATE INDEX IF NOT EXISTS idx_routine_templates_user
   ON routine_templates (user_id, name);
 
 CREATE TABLE IF NOT EXISTS routine_template_steps (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   template_id INTEGER NOT NULL REFERENCES routine_templates(id) ON DELETE CASCADE,
   position INTEGER NOT NULL DEFAULT 0,
-  -- event | todo | habit | maintenance (todo steps are events under the hood:
-  -- this app's completable todo IS an event in its reminder window).
+  -- event | todo | habit | maintenance（todo 步骤底层就是 event：本应用可完成的 todo
+  -- 就是其提醒窗口内的 event）。
   kind TEXT NOT NULL CONSTRAINT routine_template_steps_kind_check
     CHECK (kind IN ('event', 'todo', 'habit', 'maintenance')),
   title TEXT NOT NULL,
-  -- Per-kind options: dateOffsetDays, eventType, reminder, recurring, habitId/habit,
-  -- maintenancePlanId/maintenance, profileId.
-  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  -- 各 kind 选项：dateOffsetDays、eventType、reminder、recurring、habitId/habit、
+  -- maintenancePlanId/maintenance、profileId。
+  payload TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_routine_template_steps_template
   ON routine_template_steps (template_id, position, id);
 
 CREATE TABLE IF NOT EXISTS routine_template_instances (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   template_id INTEGER NOT NULL REFERENCES routine_templates(id) ON DELETE CASCADE,
-  -- Slot identity: caller-supplied slot, else the anchor date (user-local today).
+  -- 槽位身份：调用方给的槽位，否则锚定日期（用户本地今天）。
   slot_key TEXT NOT NULL,
-  anchor_date DATE NOT NULL,
-  -- Per-item creation report (stepId -> created/linked entity), JSONB array.
-  report JSONB NOT NULL DEFAULT '[]'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  anchor_date TEXT NOT NULL,
+  -- 每条目创建报告（stepId -> 创建/关联实体），JSON 数组。
+  report TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (user_id, template_id, slot_key)
 );
 
@@ -2286,201 +1758,118 @@ CREATE INDEX IF NOT EXISTS idx_routine_template_instances_user_template
   ON routine_template_instances (user_id, template_id, created_at DESC);`,
     },
     {
-      // v69 (tasks 144/147): inbound feed ingest sources / proposals / seen. The export lane needs no table.
-      // Folded from backend/src/db/pending/69-feeds-export.sql; SQL embedded verbatim.
-      // Idempotent: every statement is IF NOT EXISTS-guarded; no existing migration was touched.
+      // v69（vercel tasks 144/147）: 入站订阅源摄取（导出线不需要表）。
+      // feed_sources 是入站源登记表（kind='ics' 为轮询外部日历 URL；kind='mail' 为入站
+      // 邮箱）。注意与 ics_feeds(v48) 方向相反：那是出站公开订阅。trusted 是每源开关：
+      // trusted 源可直接应用；untrusted（默认）只产提案。
+      // feed_ingest_proposals 是 human-in-the-loop 队列：行翻到 accepted 前不创建任何
+      // event/contact；accept 是单条原子认领（UPDATE...WHERE status='pending'，输者 0 行 → 409）。
+      // (user_id, source_kind, dedupe_key) 唯一 = 重同步幂等。
+      // feed_ingest_seen 是跨重启的去重记忆：ICS 以 UID + DTSTART 为契约 —— 全新
+      // (uid, dtstart_key) 提案 event_new；已知 uid 配不同 dtstart_key 提案 event_changed；
+      // 其余组合为重复跳过。mail 以 Message-ID + 候选序号为键。(source_id, dedupe_key) 唯一
+      // = 重摄取幂等。
       version: 69,
       name: 'feeds_export_v69',
-      sql: `-- ============================================================================
--- Pending migration 69 — inbound feed ingest + print/export support
--- (Tasks 144 + 147)
--- ============================================================================
--- NOT yet merged into backend/src/db/migrate.ts (integrator-owned). The
--- orchestrator merges pending files in numeric order at release; the next free
--- version at the time of writing is 64, but this lane was assigned the reserved
--- slot 69. Register as:
---   { version: 69, name: 'feeds_export_v69', sql: <this file> }
---
--- Until then:
---   backend/src/services/agent/feed-ingest.service.ts
---   backend/src/routes/feeds.ts
--- will fail their reads/writes with "relation feed_sources ... does not exist".
--- The export lane (147) needs NO table — it renders from existing events /
--- fixed_contacts / event_trigger_logs.
---
--- WHY THREE TABLES (and why NOT the existing \`ics_feeds\`):
---
---   feed_sources        Task 144 inbound SOURCE registry. NOTE: the shipped
---                       \`ics_feeds\` table (migration v48, ics-feed.service.ts) is
---                       the OPPOSITE direction — it stores OUTBOUND public
---                       subscription feeds keyed by token_hash + "filter".
---                       Reusing it would require ALTERing a NOT-NULL token/filter
---                       shape that has no meaning for an inbound url+poll source,
---                       so a separate additive table is used instead. One row is
---                       either kind='ics' (url + poll_interval_minutes) or
---                       kind='mail' (mail_address). \`trusted\` is the per-source
---                       switch: trusted sources may be applied immediately;
---                       untrusted sources only ever produce proposals.
---
---   feed_ingest_proposals  Human-in-the-loop queue. Nothing creates an event or
---                       contact until the row flips to 'accepted'; the accept
---                       path is a single atomic claim
---                       (\`UPDATE ... WHERE status='pending'\`, loser updates 0
---                       rows -> 409). kind ('event_new' | 'event_changed' |
---                       'contact_new') tells the resolver what to do. The unique
---                       (user_id, source_kind, dedupe_key) is the idempotency
---                       guard: re-syncing the same feed is a no-op.
---
---   feed_ingest_seen    The dedupe memory that survives serverless cold starts.
---                       For ICS the contract is UID + DTSTART: a brand-new
---                       (uid, dtstart_key) proposes 'event_new'; a known uid with
---                       a DIFFERENT dtstart_key proposes 'event_changed'; every
---                       other combination is a duplicate and is skipped. For
---                       mail the key is Message-ID + candidate index. The unique
---                       (source_id, dedupe_key) makes re-ingest idempotent.
---
--- Purely additive + idempotent: CREATE TABLE / CREATE INDEX IF NOT EXISTS only,
--- no ALTER of existing tables, no backfill, re-running is a no-op.
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS feed_sources (
-  id BIGSERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS feed_sources (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  -- 'ics' = polled external calendar URL; 'mail' = inbound RFC822 mailbox.
+  -- 'ics' = 轮询的外部日历 URL；'mail' = 入站 RFC822 邮箱。
   kind TEXT NOT NULL CHECK (kind IN ('ics', 'mail')),
   name TEXT NOT NULL DEFAULT '',
-  -- ICS only: the external feed URL (operator must add the host to
-  -- EGRESS_ALLOWED_HOSTS so services/agent/egress-guard.service.ts lets the fetch out).
+  -- 仅 ICS：外部源 URL（运营方须把主机加入 EGRESS_ALLOWED_HOSTS 才放行 fetch）。
   url TEXT,
-  -- ICS only: how often the scheduler should re-poll (minutes).
+  -- 仅 ICS：调度器重轮询间隔（分钟）。
   poll_interval_minutes INTEGER NOT NULL DEFAULT 360,
-  -- Mail only: the address this mailbox expects mail for (informational).
+  -- 仅 mail：该邮箱期望收件的地址（参考信息）。
   mail_address TEXT,
-  enabled BOOLEAN NOT NULL DEFAULT TRUE,
-  -- trusted = apply directly (still recorded as an accepted proposal);
-  -- untrusted (default) = propose only, never silently write user data.
-  trusted BOOLEAN NOT NULL DEFAULT FALSE,
-  last_synced_at TIMESTAMPTZ,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  -- trusted = 直接应用（仍记为已接受提案）；untrusted（默认）= 仅提案，绝不静默写用户数据。
+  trusted INTEGER NOT NULL DEFAULT 0,
+  last_synced_at TEXT,
   last_status TEXT,
   last_error TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_feed_sources_user
   ON feed_sources (user_id, enabled, kind);
 
 CREATE TABLE IF NOT EXISTS feed_ingest_proposals (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  source_id BIGINT REFERENCES feed_sources(id) ON DELETE CASCADE,
+  source_id INTEGER REFERENCES feed_sources(id) ON DELETE CASCADE,
   source_kind TEXT NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN ('event_new', 'event_changed', 'contact_new')),
-  -- UID|<DTSTART> for ICS, Message-ID#<index> for mail.
+  -- ICS: UID|<DTSTART>；mail: Message-ID#<index>。
   dedupe_key TEXT NOT NULL,
   title TEXT NOT NULL DEFAULT '',
-  -- Typed payload re-validated at accept time (never executed blindly).
-  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  -- 接受时重新校验的类型化 payload（绝不盲执行）。
+  payload TEXT NOT NULL DEFAULT '{}',
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'rejected')),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  reviewed_at TIMESTAMPTZ,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  reviewed_at TEXT,
   UNIQUE (user_id, source_kind, dedupe_key)
 );
 
--- Pending queue listing (newest first) + status filters.
+-- 待处理队列列表（新在前）+ 状态过滤。
 CREATE INDEX IF NOT EXISTS idx_feed_ingest_proposals_user_status
   ON feed_ingest_proposals (user_id, status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS feed_ingest_seen (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  source_id BIGINT REFERENCES feed_sources(id) ON DELETE CASCADE,
+  source_id INTEGER REFERENCES feed_sources(id) ON DELETE CASCADE,
   source_kind TEXT NOT NULL,
   dedupe_key TEXT NOT NULL,
-  -- ICS: the VEVENT UID (stable identity across re-syncs).
+  -- ICS: VEVENT UID（跨重同步的稳定身份）。
   uid TEXT,
-  -- ICS: the DTSTART token (all-day 'YYYYMMDD' or 'YYYYMMDDTHHMMSSZ').
+  -- ICS: DTSTART token（全天 'YYYYMMDD' 或 'YYYYMMDDTHHMMSSZ'）。
   dtstart_key TEXT,
   title TEXT NOT NULL DEFAULT '',
-  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (source_id, dedupe_key)
 );
 
--- Change detection: find every DTSTART already known for a UID.
+-- 变更检测：找出某 UID 已知的所有 DTSTART。
 CREATE INDEX IF NOT EXISTS idx_feed_ingest_seen_source_uid
   ON feed_ingest_seen (source_id, uid);`,
     },
     {
-      // v70 (tasks 146/148/149): OCR results + family share tokens + remote backup config / records.
-      // Folded from backend/src/db/pending/70-ocr-share-backup.sql; SQL embedded verbatim.
-      // Idempotent: every statement is IF NOT EXISTS-guarded; no existing migration was touched.
+      // v70（vercel tasks 146/148/149）: OCR 结果 + 家庭分享令牌 + 远端备份配置/记录。
+      // ocr_results：可选 OCR，每次抽取尝试一行，挂到属主文档和/或源附件；原文有界存储
+      // （excerpt）+ 结构化字段 JSON。OCR 默认关闭。
+      // share_tokens：只读家庭分享，原文 token 只展示一次，仅存 SHA-256 哈希；scope 是
+      // profile | tag | household_list 之一，可选口令同样存哈希；expires_at/revoked_at 管门禁。
+      //   SQLite 差异：vercel 在 v73 才把 scope_type 的 CHECK 从 ('profile','tag') 扩容到含
+      //   'household_list'（PG 可 DROP CONSTRAINT 再重加；SQLite 无法 DROP CONSTRAINT），
+      //   docker 链路建表时即按终态写 CHECK（见 v73 注释），终态与 vercel 完全一致。
+      // remote_backup_configs：WebDAV/S3 目标，每用户一行；凭据以共享 crypto 工具（MASTER_KEY）
+      // 加密落库，明文不存不记日志。remote_backup_records：每次 backup/restore/list/prune
+      // 的追加式尝试日志。
       version: 70,
       name: 'ocr_share_remote_backup_v70',
-      sql: `-- ============================================================================
--- Pending migration 70 - OCR results + family share tokens + remote backups
--- (Wave tasks 146 + 148 + 149)
--- ============================================================================
--- NOT yet merged into backend/src/db/migrate.ts (integrator-owned). The
--- orchestrator merges pending files in numeric order at release (70 follows the
--- currently-landed max, 63 at the time of writing). Register as:
---   { version: 70, name: 'ocr_share_remote_backup_v70', sql: <this file> }
--- Until then the new services/routes fail their reads/writes with
--- "relation ocr_results / share_tokens / remote_backup_configs /
--- remote_backup_records does not exist".
---
--- WHY EACH TABLE:
---
---   ocr_results            Optional OCR (task 146). One row per extraction
---                          attempt, linked to the owning document and/or the
---                          source attachment. The raw text is stored bounded
---                          (excerpt) plus a structured-fields JSON object
---                          (issuer/date/total/currency). OCR is OFF by default:
---                          rows only appear once an engine is configured.
---
---   share_tokens           Read-only family sharing (task 148). The raw token
---                          is shown once and NEVER stored - only its SHA-256
---                          hash (\`token_hash\`) is persisted. Scope is exactly
---                          one of profile | tag; an optional passcode is stored
---                          as its SHA-256 hash. \`expires_at\` / \`revoked_at\`
---                          gate access; \`access_count\` / \`last_accessed_at\`
---                          are usage counters (no IP, no user agent).
---
---   remote_backup_configs  WebDAV / S3-compatible target (task 149). One row
---                          per user. Credentials are encrypted at rest with the
---                          shared crypto util (MASTER_KEY); the plaintext is
---                          never stored and never logged.
---
---   remote_backup_records  Append-only attempt log for every backup / restore /
---                          list / prune action (task 149), so the UI can show
---                          history without touching the remote target.
---
--- Purely additive + idempotent: CREATE TABLE / CREATE INDEX IF NOT EXISTS only,
--- no ALTER of existing tables, no backfill; re-running is a no-op.
--- ============================================================================
-
--- ---------------------------------------------------------------------------
--- 146: optional OCR results
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS ocr_results (
-  id BIGSERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS ocr_results (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  -- Owning document (preferred) - null for a standalone extraction.
+  -- 属主文档（优先）—— 独立抽取时为 NULL。
   document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
-  -- Source attachment when the bytes came from the vault.
+  -- 字节来自文档库时的源附件。
   attachment_id INTEGER REFERENCES attachments(id) ON DELETE SET NULL,
-  -- Engine that produced the row (e.g. 'tesseract'); 'none' when disabled.
+  -- 产出该行的引擎（如 'tesseract'）；禁用时为 'none'。
   engine TEXT NOT NULL,
   -- 'extracted' | 'disabled' | 'failed'
   status TEXT NOT NULL,
   content_type TEXT,
   byte_size INTEGER,
-  -- Bounded text excerpt; never the full document body.
+  -- 有界文本节选；绝非完整文档正文。
   text_excerpt TEXT,
-  -- Structured fields: { issuer, date, total, currency } (any may be null).
-  fields JSONB NOT NULL DEFAULT '{}'::jsonb,
+  -- 结构化字段：{ issuer, date, total, currency }（均可空）。
+  fields TEXT NOT NULL DEFAULT '{}',
   error_code TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_ocr_results_user_document
@@ -2488,62 +1877,54 @@ CREATE INDEX IF NOT EXISTS idx_ocr_results_user_document
 CREATE INDEX IF NOT EXISTS idx_ocr_results_user_created
   ON ocr_results (user_id, created_at DESC);
 
--- ---------------------------------------------------------------------------
--- 148: read-only family share tokens (profile / tag scoped)
--- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS share_tokens (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  -- SHA-256 hex of the high-entropy raw token - the ONLY persisted form.
+  -- 高熵原文 token 的 SHA-256 十六进制 —— 唯一持久化形态。
   token_hash TEXT NOT NULL UNIQUE,
-  -- 'profile' | 'tag'
-  scope_type TEXT NOT NULL CHECK (scope_type IN ('profile', 'tag')),
-  -- Present when scope_type = 'profile' (ownership checked in the service).
+  -- 'profile' | 'tag' | 'household_list'（household_list 为 v73 扩容，docker 建表即按终态）。
+  scope_type TEXT NOT NULL CHECK (scope_type IN ('profile', 'tag', 'household_list')),
+  -- scope_type = 'profile' 时出现（属主校验在服务层）。
   scope_profile_id INTEGER REFERENCES profiles(id) ON DELETE CASCADE,
-  -- Present when scope_type = 'tag' (a value in events.tags / contacts tags).
+  -- scope_type = 'tag' 时出现（events.tags / 联系人标签中的值）。
   scope_tag TEXT,
   label TEXT,
-  -- SHA-256 hex of the optional passcode; null = no passcode required.
+  -- 可选口令的 SHA-256 十六进制；NULL = 无需口令。
   passcode_hash TEXT,
-  expires_at TIMESTAMPTZ,
-  revoked_at TIMESTAMPTZ,
-  last_accessed_at TIMESTAMPTZ,
+  expires_at TEXT,
+  revoked_at TEXT,
+  last_accessed_at TEXT,
   access_count INTEGER NOT NULL DEFAULT 0,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_share_tokens_user_created
   ON share_tokens (user_id, created_at DESC);
 
--- ---------------------------------------------------------------------------
--- 149: remote backup target config + attempt log
--- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS remote_backup_configs (
-  id SERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
   -- 'webdav' | 's3'
   target_type TEXT NOT NULL CHECK (target_type IN ('webdav', 's3')),
-  -- WebDAV base URL / S3-compatible endpoint. Its host MUST be on the egress
-  -- allowlist before any call is attempted (see remote-backup.service.ts).
+  -- WebDAV 基础 URL / S3 兼容端点。任何调用前其主机必须在出口允许清单上。
   endpoint TEXT NOT NULL,
   path_prefix TEXT NOT NULL DEFAULT '',
-  -- S3 only.
+  -- 仅 S3。
   bucket TEXT,
   region TEXT,
   access_key_id TEXT,
-  -- WebDAV only.
+  -- 仅 WebDAV。
   username TEXT,
-  -- Encrypted (shared crypto util) WebDAV password / S3 secret access key.
-  -- Never serialized into a response, never logged.
+  -- 加密的 WebDAV 密码 / S3 secret access key。绝不序列化进响应，绝不记日志。
   secret_encrypted TEXT,
   retention_count INTEGER NOT NULL DEFAULT 5,
-  enabled BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS remote_backup_records (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   -- 'backup' | 'restore' | 'list' | 'prune'
   kind TEXT NOT NULL,
@@ -2553,61 +1934,42 @@ CREATE TABLE IF NOT EXISTS remote_backup_records (
   object_key TEXT,
   byte_size BIGINT,
   retention_deleted INTEGER NOT NULL DEFAULT 0,
-  dry_run BOOLEAN NOT NULL DEFAULT FALSE,
+  dry_run INTEGER NOT NULL DEFAULT 0,
   error_code TEXT,
-  detail JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  detail TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_remote_backup_records_user_created
   ON remote_backup_records (user_id, created_at DESC);`,
     },
     {
-      // v71 (tasks 151/152): weather settings / cross-instance cache + tracked parcels.
-      // Folded from backend/src/db/pending/71-weather-parcels.sql; SQL embedded verbatim.
-      // Idempotent: every statement is IF NOT EXISTS-guarded; no existing migration was touched.
+      // v71（vercel tasks 151/152）: 天气设置/跨实例缓存 + 包裹追踪。
+      // user_weather_settings：用户存的天气位置（选择性加入），每用户一行；缺行 = 未配置，
+      // 服务降级为"天气不可用"。weather_cache：Open-Meteo 的跨实例上游缓存；fetched_at 是
+      // 载荷新鲜度时钟，attempted_at 是 5 分钟外呼下限（无论成败，前次尝试未过期就不再打上游，
+      // 失败时以 stale 供旧载荷）。parcels：手动状态更新覆盖 status + last_event；追踪号是
+      // 用户秘密，只经 maskTrackingNumber() 记日志。
       version: 71,
       name: 'weather_parcels_v71',
-      sql: `-- 71-weather-parcels.sql (tasks 151 + 152 supporting DDL)
---
--- PENDING DDL: this directory is merged into backend/src/db/migrate.ts by the
--- integrator (append-only, next free version = 71 at the time of writing; the
--- integrator re-checks the tail immediately before appending, per repo convention).
--- Do NOT edit migrate.ts from a lane; this file is the lane's DDL handoff.
---
--- Idempotent + additive: CREATE TABLE / CREATE INDEX IF NOT EXISTS only, no ALTER,
--- no backfill, no data migration; re-running is a no-op.
-
--- (151) The user's stored weather location (opt-in). One row per user; an absent row
--- means "unconfigured" and the service degrades to 天气不可用. \`latitude\`/\`longitude\`
--- are WGS-84 decimal degrees keyed by the Open-Meteo forecast endpoints.
-CREATE TABLE IF NOT EXISTS user_weather_settings (
+      sql: `CREATE TABLE IF NOT EXISTS user_weather_settings (
   user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   latitude DOUBLE PRECISION NOT NULL,
   longitude DOUBLE PRECISION NOT NULL,
   location_label TEXT NOT NULL DEFAULT '',
-  enabled BOOLEAN NOT NULL DEFAULT TRUE,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  enabled INTEGER NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- (151) Shared, cross-instance upstream cache for Open-Meteo (free, no API key).
--- \`fetched_at\` is the payload freshness clock; \`attempted_at\` is the 5-minute
--- Postgres/egress floor: an instance never re-calls upstream while a previous
--- attempt (success OR failure) is younger than WEATHER_MIN_REFRESH_MS, and a
--- failed attempt serves the previous payload as \`stale\` instead of failing.
 CREATE TABLE IF NOT EXISTS weather_cache (
   cache_key TEXT PRIMARY KEY,
-  payload JSONB NOT NULL,
-  fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  attempted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  payload TEXT NOT NULL,
+  fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  attempted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- (152) Tracked parcels (carrier, tracking number, label, status, last event, ETA).
--- Manual status updates overwrite \`status\` + \`last_event\`; adapter polling (the
--- injected CarrierAdapter seam) writes the same fields. The tracking number is a
--- user secret: it is only ever logged through maskTrackingNumber().
 CREATE TABLE IF NOT EXISTS parcels (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   carrier TEXT NOT NULL,
   tracking_number TEXT NOT NULL,
@@ -2615,47 +1977,33 @@ CREATE TABLE IF NOT EXISTS parcels (
   status TEXT NOT NULL DEFAULT 'registered'
     CONSTRAINT parcels_status_check CHECK (status IN ('registered', 'in_transit', 'out_for_delivery', 'delivered', 'exception')),
   last_event TEXT,
-  last_event_at TIMESTAMPTZ,
-  eta DATE,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_event_at TEXT,
+  eta TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (user_id, carrier, tracking_number)
 );
 CREATE INDEX IF NOT EXISTS idx_parcels_user_status ON parcels (user_id, status);`,
     },
     {
-      // v72 (tasks 153/154/155): attendance/timesheet + child/elder care + pet care.
-      // Folded from backend/src/db/pending/72-timesheet-care-pets.sql; SQL embedded verbatim.
-      // Idempotent: every statement is IF NOT EXISTS-guarded; no existing migration was touched.
+      // v72（vercel tasks 153/154/155）: 考勤/工时 + 儿童老人照护 + 宠物照护。
+      // timesheet_sessions：一个工作时段一行，clock_out IS NULL 标记唯一进行中时段；
+      // 部分唯一索引是重复打卡的硬保证（第二次打卡 409）。
+      // timesheet_leaves：缺勤/请假记录。care_profiles + care_logs：照护对象与事件
+      //（喂养/服药/体征/情绪/意外），刻意命名 care_logs 避免与用药域撞名。
+      // pets + pet_logs：体重/喂养/就诊史。pet_schedules：疫苗/驱虫排程，一次性排程置
+      // completed_at 退役；周期排程（interval_days 非空）完成时前滚 due_date。
       version: 72,
       name: 'timesheet_care_pets_v72',
-      sql: `-- 72-timesheet-care-pets.sql (tasks 153 + 154 + 155 supporting DDL)
---
--- PENDING DDL: this directory is merged into backend/src/db/migrate.ts by the
--- integrator (append-only, next free version after 71 at the time of writing; the
--- integrator re-checks the tail immediately before appending, per repo convention).
--- Do NOT edit migrate.ts from a lane; this file is the lane's DDL handoff.
---
--- Idempotent + additive: CREATE TABLE / CREATE INDEX IF NOT EXISTS only, no ALTER,
--- no backfill, no data migration; re-running is a no-op.
-
--- ---------------------------------------------------------------------------
--- (153) Attendance / timesheet
--- ---------------------------------------------------------------------------
-
--- One row per work session. \`clock_out IS NULL\` marks the single open session.
--- The partial unique index below is the hard guarantee against duplicate open
--- sessions (a second clock-in hits 23505 and the route answers 409); the service
--- also checks for a friendly error before inserting.
-CREATE TABLE IF NOT EXISTS timesheet_sessions (
-  id BIGSERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS timesheet_sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  clock_in TIMESTAMPTZ NOT NULL DEFAULT now(),
-  clock_out TIMESTAMPTZ,
+  clock_in TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  clock_out TEXT,
   note TEXT NOT NULL DEFAULT '',
   location TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT timesheet_sessions_range_check CHECK (clock_out IS NULL OR clock_out > clock_in)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_timesheet_open_session
@@ -2663,116 +2011,96 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_timesheet_open_session
 CREATE INDEX IF NOT EXISTS idx_timesheet_sessions_user_clock_in
   ON timesheet_sessions (user_id, clock_in);
 
--- Absence / leave records. \`kind\` is a coarse bucket; the note carries detail.
 CREATE TABLE IF NOT EXISTS timesheet_leaves (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   kind TEXT NOT NULL DEFAULT 'leave'
     CONSTRAINT timesheet_leaves_kind_check CHECK (kind IN ('absence', 'leave', 'sick', 'holiday', 'other')),
-  start_date DATE NOT NULL,
-  end_date DATE NOT NULL,
+  start_date TEXT NOT NULL,
+  end_date TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT timesheet_leaves_range_check CHECK (end_date >= start_date)
 );
 CREATE INDEX IF NOT EXISTS idx_timesheet_leaves_user_start
   ON timesheet_leaves (user_id, start_date);
 
--- ---------------------------------------------------------------------------
--- (154) Child / elder care
--- ---------------------------------------------------------------------------
-
--- A care recipient (child, elder, ...). One user may keep several profiles.
 CREATE TABLE IF NOT EXISTS care_profiles (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   relationship TEXT NOT NULL DEFAULT '',
-  date_of_birth DATE,
+  date_of_birth TEXT,
   allergies TEXT NOT NULL DEFAULT '',
   notes TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_care_profiles_user ON care_profiles (user_id);
 
--- Care events: feeding / dose / vitals / mood / incident. Deliberately named
--- \`care_logs\` so it cannot collide with the existing medications/doses domain.
--- \`value\` + \`unit\` carry measurement history (e.g. temperature 36.8 C, weight
--- 12.5 kg); \`label\` names the item (formula, drug, metric).
 CREATE TABLE IF NOT EXISTS care_logs (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  profile_id BIGINT NOT NULL REFERENCES care_profiles(id) ON DELETE CASCADE,
+  profile_id INTEGER NOT NULL REFERENCES care_profiles(id) ON DELETE CASCADE,
   kind TEXT NOT NULL
     CONSTRAINT care_logs_kind_check CHECK (kind IN ('feeding', 'dose', 'vitals', 'mood', 'incident')),
-  logged_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  logged_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   label TEXT NOT NULL DEFAULT '',
   value NUMERIC,
   unit TEXT NOT NULL DEFAULT '',
   detail TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_care_logs_profile_logged_at
   ON care_logs (profile_id, logged_at DESC);
 CREATE INDEX IF NOT EXISTS idx_care_logs_user_kind_logged_at
   ON care_logs (user_id, kind, logged_at DESC);
 
--- ---------------------------------------------------------------------------
--- (155) Pet care
--- ---------------------------------------------------------------------------
-
 CREATE TABLE IF NOT EXISTS pets (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   species TEXT NOT NULL DEFAULT '',
   breed TEXT NOT NULL DEFAULT '',
-  birth_date DATE,
+  birth_date TEXT,
   weight_kg NUMERIC(6, 2),
   notes TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_pets_user ON pets (user_id);
 
--- Pet history: weight / feeding / vet. \`weight_kg\` is used by kind='weight'
--- (and optionally by vet visits); \`detail\` carries feeding / vet notes.
 CREATE TABLE IF NOT EXISTS pet_logs (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  pet_id BIGINT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+  pet_id INTEGER NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
   kind TEXT NOT NULL
     CONSTRAINT pet_logs_kind_check CHECK (kind IN ('weight', 'feeding', 'vet')),
-  logged_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  logged_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   weight_kg NUMERIC(6, 2),
   detail TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_pet_logs_pet_kind_logged_at
   ON pet_logs (pet_id, kind, logged_at DESC);
 
--- Vaccination / deworming schedule with per-row lead time. A one-shot schedule
--- is retired by setting \`completed_at\`; a recurring schedule (interval_days IS
--- NOT NULL) rolls \`due_date\` forward on completion so the reminder scan keeps
--- working off a single due date (see pet.service.ts completePetSchedule).
 CREATE TABLE IF NOT EXISTS pet_schedules (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  pet_id BIGINT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+  pet_id INTEGER NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
   kind TEXT NOT NULL
     CONSTRAINT pet_schedules_kind_check CHECK (kind IN ('vaccination', 'deworming')),
   name TEXT NOT NULL,
-  due_date DATE NOT NULL,
+  due_date TEXT NOT NULL,
   interval_days INTEGER,
   reminder_days_before INTEGER NOT NULL DEFAULT 14,
-  completed_at TIMESTAMPTZ,
-  last_completed_at TIMESTAMPTZ,
+  completed_at TEXT,
+  last_completed_at TEXT,
   completion_count INTEGER NOT NULL DEFAULT 0,
   notes TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT pet_schedules_interval_check CHECK (interval_days IS NULL OR interval_days > 0),
   CONSTRAINT pet_schedules_reminder_check CHECK (reminder_days_before >= 0)
 );
@@ -2782,255 +2110,168 @@ CREATE INDEX IF NOT EXISTS idx_pet_schedules_pet_due
   ON pet_schedules (pet_id, due_date);`,
     },
     {
-      // v73 (tasks 156/157/158): vehicle fuel/maintenance ledger + watch/read list + household collaborative lists.
-      // Folded from backend/src/db/pending/73-vehicle-watchlist-household.sql; SQL embedded verbatim.
-      // Idempotent: every statement is IF NOT EXISTS-guarded; no existing migration was touched.
+      // v73（vercel tasks 156/157/158）: 车辆油/保养台账 + 影音书游戏清单 + 家庭协作清单。
+      // watchlist_items：release_date 在未来且状态 wanted/in_progress 的行喂给共享分钟级
+      // cron 提醒迭代器，不加第二个调度器。household_lists 刻意独立于 inventory_items
+      // 库存域（不同表名、不同生命周期）。
+      // share_tokens 扩容：scope_list_id 列走 postMigrate tryExec；scope_type CHECK 的
+      // 'household_list' 扩容已在 v70 建表时按终态写入（SQLite 无法 DROP CONSTRAINT，
+      // vercel 的 DROP+ADD 约束循环无对应物，终态一致）。
       version: 73,
       name: 'vehicle_watchlist_household_v73',
-      sql: `-- Task 156/157/158: vehicle fuel & maintenance ledger, watch/read list, household lists.
---
--- Idempotent + additive. Folds into backend/src/db/migrate.ts by the integrator in
--- numeric order after the landed max. No data migration: brand-new tables plus two
--- additive share_tokens changes (new 'household_list' scope value + scope_list_id)
--- guarded so re-runs are no-ops.
-
--- ---------------------------------------------------------------------------
--- 156: vehicles + fuel / maintenance ledger
--- ---------------------------------------------------------------------------
-
-CREATE TABLE IF NOT EXISTS vehicles (
-  id BIGSERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS vehicles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   make TEXT NOT NULL DEFAULT '',
   model TEXT NOT NULL DEFAULT '',
   year INTEGER CHECK (year IS NULL OR (year >= 1886 AND year <= 2100)),
   plate TEXT NOT NULL DEFAULT '',
   odometer INTEGER NOT NULL DEFAULT 0 CHECK (odometer >= 0),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_vehicles_user ON vehicles (user_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS vehicle_fuel_records (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  vehicle_id BIGINT NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
-  recorded_on DATE NOT NULL,
+  vehicle_id INTEGER NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+  recorded_on TEXT NOT NULL,
   energy_type TEXT NOT NULL DEFAULT 'fuel' CHECK (energy_type IN ('fuel', 'electric')),
   quantity NUMERIC(10, 2) NOT NULL CHECK (quantity > 0),
   unit_price NUMERIC(10, 3) NOT NULL DEFAULT 0 CHECK (unit_price >= 0),
   total_cost NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (total_cost >= 0),
   odometer INTEGER NOT NULL CHECK (odometer >= 0),
   note TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_vehicle_fuel_vehicle ON vehicle_fuel_records (vehicle_id, odometer DESC);
 
 CREATE TABLE IF NOT EXISTS vehicle_maintenance_records (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  vehicle_id BIGINT NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+  vehicle_id INTEGER NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
   item TEXT NOT NULL,
-  serviced_on DATE NOT NULL,
+  serviced_on TEXT NOT NULL,
   odometer INTEGER CHECK (odometer IS NULL OR odometer >= 0),
   cost NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (cost >= 0),
-  next_due_date DATE,
+  next_due_date TEXT,
   next_due_odometer INTEGER CHECK (next_due_odometer IS NULL OR next_due_odometer >= 0),
   note TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_vehicle_maintenance_vehicle
   ON vehicle_maintenance_records (vehicle_id, serviced_on DESC);
 
--- ---------------------------------------------------------------------------
--- 157: watch / read list. Rows with a future release_date + status
--- wanted/in_progress feed the shared minute-cron reminder iterator
--- (jobs/tasks.ts WATCHLIST_SOURCE); no second scheduler.
--- ---------------------------------------------------------------------------
-
 CREATE TABLE IF NOT EXISTS watchlist_items (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   profile_id INTEGER REFERENCES profiles(id) ON DELETE SET NULL,
   kind TEXT NOT NULL DEFAULT 'other' CHECK (kind IN ('film', 'series', 'book', 'game', 'other')),
   title TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'wanted' CHECK (status IN ('wanted', 'in_progress', 'done', 'dropped')),
-  release_date DATE,
+  release_date TEXT,
   source TEXT,
   link TEXT,
   rating INTEGER CHECK (rating IS NULL OR (rating >= 0 AND rating <= 10)),
   note TEXT NOT NULL DEFAULT '',
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  reminder_config JSONB,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  is_active INTEGER NOT NULL DEFAULT 1,
+  reminder_config TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_watchlist_user_status ON watchlist_items (user_id, status);
 CREATE INDEX IF NOT EXISTS idx_watchlist_user_release ON watchlist_items (user_id, release_date);
 
--- ---------------------------------------------------------------------------
--- 158: household collaborative list. Deliberately separate from the existing
--- inventory_items stock domain (different table names, different lifecycle).
--- ---------------------------------------------------------------------------
-
 CREATE TABLE IF NOT EXISTS household_lists (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_household_lists_user ON household_lists (user_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS household_list_items (
-  id BIGSERIAL PRIMARY KEY,
-  list_id BIGINT NOT NULL REFERENCES household_lists(id) ON DELETE CASCADE,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  list_id INTEGER NOT NULL REFERENCES household_lists(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   quantity TEXT NOT NULL DEFAULT '',
   note TEXT NOT NULL DEFAULT '',
   assignee TEXT NOT NULL DEFAULT '',
-  checked BOOLEAN NOT NULL DEFAULT FALSE,
-  checked_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  checked INTEGER NOT NULL DEFAULT 0,
+  checked_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_household_list_items_list
-  ON household_list_items (list_id, checked, created_at);
-
--- Per-list share links reuse share_tokens: widen the scope CHECK to accept
--- 'household_list' and add the list reference column. Dropping the old CHECK is
--- required (an ADD would otherwise be rejected); the loop handles any constraint
--- name, and re-runs drop + re-add the same widened constraint.
-ALTER TABLE share_tokens ADD COLUMN IF NOT EXISTS scope_list_id BIGINT;
-
-DO $$
-DECLARE
-  constraint_row record;
-BEGIN
-  FOR constraint_row IN
-    SELECT conname
-    FROM pg_constraint
-    WHERE conrelid = 'share_tokens'::regclass
-      AND contype = 'c'
-      AND pg_get_constraintdef(oid) ILIKE '%scope_type%'
-  LOOP
-    EXECUTE format('ALTER TABLE share_tokens DROP CONSTRAINT %I', constraint_row.conname);
-  END LOOP;
-  ALTER TABLE share_tokens
-    ADD CONSTRAINT share_tokens_scope_type_check
-    CHECK (scope_type IN ('profile', 'tag', 'household_list'));
-END $$;`,
+  ON household_list_items (list_id, checked, created_at);`,
+      postMigrate: async () => {
+        // 每清单分享链接复用 share_tokens，新增清单引用列（CHECK 扩容见 v70/v73 注释）。
+        await tryExec('v73 share_tokens.scope_list_id', 'ALTER TABLE share_tokens ADD COLUMN scope_list_id BIGINT');
+      },
     },
     {
-      // v74 (tasks 159/160): two-way calendar sync accounts + single-owner collaboration invites.
-      // Folded from backend/src/db/pending/74-calendar-sync-collab.sql; SQL embedded verbatim.
-      // Idempotent: every statement is IF NOT EXISTS-guarded; no existing migration was touched.
+      // v74（vercel tasks 159/160）: 双向日历同步账号 + 单属主协作邀请。
+      // calendar_sync_accounts：每用户外部日历目标（caldav / exchange 适配缝）；凭据以共享
+      // crypto（MASTER_KEY）加密落库，密文不回显不记日志；direction 管 pull/push/both，
+      // enabled 可暂停账号而不删除。
+      // calendar_sync_events：幂等 + 冲突台账。UNIQUE (account_id, calendar_id, external_uid)
+      // 使重拉为 no-op；external_version（ETag/changeKey）与 local_version（内容哈希）是上次
+      // 同步两侧的版本；losing_version 记录被冲突策略丢弃的版本（默认 last-write-wins）。
+      // collaboration_invites：单属主、仅限邀请的访客——只有一个 owner_user_id，访客是持有
+      // token 的 email/link 而非账号；原文 token 只展示一次，仅存哈希；role 三级，
+      // scope_* 圈定可见面。collaboration_activity：协作者变更的追加式动态，凭据与原文
+      // token 永不入库。
       version: 74,
       name: 'calendar_sync_collaboration_v74',
-      sql: `-- ============================================================================
--- Pending migration 74 - two-way calendar sync accounts + single-owner
--- family collaboration invites (Wave tasks 159 + 160)
--- ============================================================================
--- NOT yet merged into backend/src/db/migrate.ts (integrator-owned). The
--- orchestrator merges pending files in numeric order at release (74 follows the
--- currently-landed max, 73 at the time of writing). Register as:
---   { version: 74, name: 'calendar_sync_collaboration_v74', sql: <this file> }
--- Until then the new services/routes fail their reads/writes with
--- "relation calendar_sync_accounts / calendar_sync_events /
---  collaboration_invites / collaboration_activity does not exist".
---
--- WHY EACH TABLE:
---
---   calendar_sync_accounts  A per-user external calendar target (task 159).
---                           \`kind\` is 'caldav' | 'exchange'; the Exchange path
---                           is an adapter seam that may report \`unsupported\`
---                           instead of faking success. Credentials are encrypted
---                           at rest with the shared crypto util (MASTER_KEY);
---                           the ciphertext is never returned and never logged.
---                           \`direction\` gates pull / push / both and \`enabled\`
---                           lets the owner pause an account without deleting it.
---
---   calendar_sync_events    The idempotency + conflict ledger. UNIQUE
---                           (account_id, calendar_id, external_uid) makes a
---                           re-pull a no-op (dedupe on external UID + calendar
---                           id). \`external_version\` (ETag / changeKey) and
---                           \`local_version\` (content hash) are the per-side
---                           versions recorded at the last sync; \`losing_version\`
---                           records the version discarded by the conflict policy
---                           (last-write-wins by default).
---
---   collaboration_invites   SINGLE-OWNER, invite-only guests (task 160). There
---                           is exactly one owner (owner_user_id) and NO tenant
---                           table, org table or membership table: a guest is an
---                           email/link holding a token, not an account. The raw
---                           token is shown once and never stored - only its
---                           SHA-256 hash (\`token_hash\`) is persisted. \`role\` is
---                           viewer | commenter | editor and \`scope_*\` bounds the
---                           surface (profile and/or tag and/or entity types).
---
---   collaboration_activity  Append-only feed of collaborator changes (task 160)
---                           so the owner sees what a guest did, scoped to the
---                           invite. Never stores credentials or raw tokens.
---
--- Purely additive + idempotent: CREATE TABLE / CREATE INDEX IF NOT EXISTS only,
--- no ALTER of existing tables, no backfill; re-running is a no-op.
--- ============================================================================
-
--- ---------------------------------------------------------------------------
--- 159: external calendar sync accounts (CalDAV / Exchange seam)
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS calendar_sync_accounts (
-  id BIGSERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS calendar_sync_accounts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   -- 'caldav' | 'exchange'
   kind TEXT NOT NULL CHECK (kind IN ('caldav', 'exchange')),
-  -- External calendar collection / endpoint root. Its host MUST clear the
-  -- shipped egress guard before any outbound call (see calendar-sync.service.ts).
+  -- 外部日历集合/端点根。任何出站调用前其主机必须先过出口守卫。
   base_url TEXT NOT NULL,
-  -- Login name for HTTP basic / CalDAV. Not secret, but never echoed with creds.
+  -- HTTP basic / CalDAV 登录名。非机密，但绝不与凭据一起回显。
   username TEXT,
-  -- Encrypted (shared crypto util / MASTER_KEY) password, app-password or
-  -- bearer token. NULL when the target needs no credential.
+  -- 加密的密码/应用密码/bearer token。目标无需凭据时为 NULL。
   credentials_encrypted TEXT,
-  -- Remote calendar / collection id (CalDAV collection path or Exchange folder).
+  -- 远端日历/集合 id（CalDAV 集合路径或 Exchange 文件夹）。
   calendar_id TEXT NOT NULL DEFAULT 'default',
   -- 'pull' | 'push' | 'both'
   direction TEXT NOT NULL DEFAULT 'both' CHECK (direction IN ('pull', 'push', 'both')),
-  -- 'last_write_wins' (default) | 'local_wins' | 'remote_wins'
+  -- 'last_write_wins'（默认）| 'local_wins' | 'remote_wins'
   conflict_policy TEXT NOT NULL DEFAULT 'last_write_wins'
     CHECK (conflict_policy IN ('last_write_wins', 'local_wins', 'remote_wins')),
-  enabled BOOLEAN NOT NULL DEFAULT TRUE,
-  last_synced_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_synced_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_calendar_sync_accounts_user
   ON calendar_sync_accounts (user_id, created_at DESC);
 
--- ---------------------------------------------------------------------------
--- 159: per-event idempotency + conflict ledger
--- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS calendar_sync_events (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  account_id BIGINT NOT NULL REFERENCES calendar_sync_accounts(id) ON DELETE CASCADE,
-  -- Stable external identity. Re-pull dedupes on (account_id, calendar_id, external_uid).
+  account_id INTEGER NOT NULL REFERENCES calendar_sync_accounts(id) ON DELETE CASCADE,
+  -- 稳定外部身份。重拉按 (account_id, calendar_id, external_uid) 去重。
   external_uid TEXT NOT NULL,
   calendar_id TEXT NOT NULL DEFAULT 'default',
-  -- Local event this external object maps to (NULL until imported).
+  -- 该外部对象映射的本地 event（导入前为 NULL）。
   local_event_id INTEGER REFERENCES events(id) ON DELETE SET NULL,
-  -- Remote version at last sync: ETag / Exchange changeKey.
+  -- 上次同步的远端版本：ETag / Exchange changeKey。
   external_version TEXT,
-  -- Local content hash at last sync (name + date + type).
+  -- 上次同步的本地内容哈希（name + date + type）。
   local_version TEXT,
-  -- The version the conflict policy discarded (audit trail); NULL when no conflict.
+  -- 被冲突策略丢弃的版本（审计轨迹）；无冲突时为 NULL。
   losing_version TEXT,
   last_direction TEXT,
-  last_synced_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_synced_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (account_id, calendar_id, external_uid)
 );
 
@@ -3039,110 +2280,107 @@ CREATE INDEX IF NOT EXISTS idx_calendar_sync_events_account
 CREATE INDEX IF NOT EXISTS idx_calendar_sync_events_local
   ON calendar_sync_events (user_id, local_event_id);
 
--- ---------------------------------------------------------------------------
--- 160: single-owner collaboration invites (invite-only guests, roles + scope)
--- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS collaboration_invites (
-  id BIGSERIAL PRIMARY KEY,
-  -- The ONE owner of all data. Guests are never rows in \`users\`.
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  -- 全部数据的唯一属主。访客绝不是 users 表的行。
   owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   guest_email TEXT,
   -- 'viewer' | 'commenter' | 'editor'
   role TEXT NOT NULL CHECK (role IN ('viewer', 'commenter', 'editor')),
-  -- Scope: any combination of profile, tag and entity types. An empty
-  -- \`scope_entity_types\` means "all supported entity types" for the chosen
-  -- profile/tag; with no profile AND no tag it is bounded by entity types only.
+  -- 范围：profile、tag、实体类型的任意组合。空 scope_entity_types = 所选 profile/tag 的
+  -- "全部受支持实体类型"；无 profile 且无 tag 时仅按实体类型圈界。
   scope_profile_id INTEGER REFERENCES profiles(id) ON DELETE CASCADE,
   scope_tag TEXT,
-  scope_entity_types JSONB NOT NULL DEFAULT '[]'::jsonb,
-  -- SHA-256 hex of the high-entropy raw invite token - the ONLY persisted form.
+  scope_entity_types TEXT NOT NULL DEFAULT '[]',
+  -- 高熵原文邀请 token 的 SHA-256 十六进制 —— 唯一持久化形态。
   token_hash TEXT NOT NULL UNIQUE,
   label TEXT,
-  expires_at TIMESTAMPTZ,
-  revoked_at TIMESTAMPTZ,
-  accepted_at TIMESTAMPTZ,
-  last_accessed_at TIMESTAMPTZ,
+  expires_at TEXT,
+  revoked_at TEXT,
+  accepted_at TEXT,
+  last_accessed_at TEXT,
   access_count INTEGER NOT NULL DEFAULT 0,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_collaboration_invites_owner
   ON collaboration_invites (owner_user_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS collaboration_activity (
-  id BIGSERIAL PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   -- 'owner' | 'guest'
   actor_kind TEXT NOT NULL CHECK (actor_kind IN ('owner', 'guest')),
   actor_label TEXT,
-  invite_id BIGINT REFERENCES collaboration_invites(id) ON DELETE SET NULL,
+  invite_id INTEGER REFERENCES collaboration_invites(id) ON DELETE SET NULL,
   -- 'invite_created' | 'invite_revoked' | 'guest_viewed' | 'guest_commented'
   -- | 'guest_event_created' | 'guest_write_denied'
   action TEXT NOT NULL,
   entity_type TEXT,
   entity_id TEXT,
-  detail JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  detail TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_collaboration_activity_owner
   ON collaboration_activity (owner_user_id, created_at DESC, id DESC);`,
     },
     {
-      // v75 (task 168): birthday greeting link - events.contact_id + fixed_contacts.greeting_opt_out.
-      // Re-runnable: both ALTERs use ADD COLUMN IF NOT EXISTS (no existing migration was touched).
+      // v75（vercel task 168）: 生日祝福链接 —— events.contact_id + fixed_contacts.greeting_opt_out。
+      // SQLite 无 ADD COLUMN IF NOT EXISTS，走 postMigrate tryExec（列不在 schema.sql，新库必成）。
       version: 75,
       name: 'birthday_link_v75',
-      sql: `ALTER TABLE events ADD COLUMN IF NOT EXISTS contact_id INTEGER REFERENCES fixed_contacts(id) ON DELETE SET NULL;
-ALTER TABLE fixed_contacts ADD COLUMN IF NOT EXISTS greeting_opt_out BOOLEAN NOT NULL DEFAULT FALSE;`,
+      sql: `SELECT 1;`,
+      postMigrate: async () => {
+        await tryExec('v75 events.contact_id', 'ALTER TABLE events ADD COLUMN contact_id INTEGER REFERENCES fixed_contacts(id) ON DELETE SET NULL');
+        await tryExec('v75 fixed_contacts.greeting_opt_out', 'ALTER TABLE fixed_contacts ADD COLUMN greeting_opt_out INTEGER NOT NULL DEFAULT 0');
+      },
     },
     {
-      // v76: TOTP recovery codes. With 2FA on, login hard-requires a TOTP code and this is a
-      // single-user app - a lost authenticator would mean a permanently lost account.
-      // Codes are stored as SHA-256 hashes in this JSONB array. Re-runnable: ADD COLUMN IF NOT EXISTS.
+      // v76: TOTP 恢复码。2FA 开启后登录硬性要求 TOTP 码且是单用户应用——
+      // 丢失认证器意味着账号永久丢失。恢复码以 SHA-256 哈希存 JSON 数组。
       version: 76,
       name: 'totp_recovery_codes_v76',
-      sql: `ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_recovery_codes JSONB NOT NULL DEFAULT '[]';`,
+      sql: `SELECT 1;`,
+      postMigrate: async () => {
+        await tryExec('v76 users.totp_recovery_codes', `ALTER TABLE users ADD COLUMN totp_recovery_codes TEXT NOT NULL DEFAULT '[]'`);
+      },
     },
     {
-      // v77: fold the legacy 'email' channel into 'resend'. Delivery has always treated the two
-      // identically (same send branch, same account fields), but 'email' has no UI template, so
-      // accounts and event selections typed 'email' stayed active-yet-invisible. Retyping them
-      // makes them visible and manageable under the 'resend' template with zero behaviour change.
-      // Historical trigger logs are left as-is (they are an audit record, and their
-      // channel_results keys are keyed by the original channel id). The 'email' alias stays in
-      // the dispatch chain as a safety net for rows written between the code deploy and this
-      // migration. Idempotent: every UPDATE is guarded by a containment check.
+      // v77: 把遗留 'email' 渠道并入 'resend'。投递侧一直把两者同等对待，但 'email' 没有
+      // UI 模板，导致 type='email' 的账号与事件选择"活跃却不可见"。改型后以零行为变化纳入
+      // 'resend' 模板管理。历史触发日志不动（审计记录）。'email' 别名保留在派发链兜底
+      // （覆盖代码先部署、迁移后执行的窗口行）。
+      // 翻译：::text/::jsonb 去除；@> '["email"]' 包含判定 → json_each EXISTS，
+      // 另加 json_valid 守卫防个别脏行使整条迁移失败。
       version: 77,
       name: 'fold_email_channel_v77',
       sql: `UPDATE notification_accounts SET type = 'resend' WHERE type = 'email';
-UPDATE events SET notification_channels = REPLACE(notification_channels::text, '"email"', '"resend"')::jsonb
-  WHERE notification_channels @> '["email"]'::jsonb;`,
+UPDATE events SET notification_channels = REPLACE(notification_channels, '"email"', '"resend"')
+  WHERE notification_channels IS NOT NULL AND json_valid(notification_channels)
+    AND EXISTS (SELECT 1 FROM json_each(notification_channels) WHERE value = 'email');`,
     },
     {
-      // v78: notification reachability. Accounts no longer get hard-disabled after 3
-      // consecutive failures (that silently removed them from every resolver); instead they
-      // are suspended for 24h and auto-recover. Also: per-user reminder catch-up window
-      // (minutes; NULL = env/10) and the email template style selector.
+      // v78: 通知可达性。连续 3 次失败不再硬禁用账号（那会把它从所有 resolver 静默摘掉），
+      // 改为停机 24h 自动恢复；另有每用户提醒追赶窗口（分钟；NULL = env/10）与邮件模板风格。
       version: 78,
       name: 'notification_reachability_v78',
-      sql: `ALTER TABLE notification_accounts ADD COLUMN IF NOT EXISTS suspended_until TIMESTAMPTZ;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS reminder_catchup_minutes INTEGER;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS email_template_style TEXT NOT NULL DEFAULT 'classic';
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS fallback_enabled BOOLEAN NOT NULL DEFAULT TRUE;`,
+      sql: `SELECT 1;`,
+      postMigrate: async () => {
+        await tryExec('v78 notification_accounts.suspended_until', 'ALTER TABLE notification_accounts ADD COLUMN suspended_until TEXT');
+        await tryExec('v78 user_configs.reminder_catchup_minutes', 'ALTER TABLE user_configs ADD COLUMN reminder_catchup_minutes INTEGER');
+        await tryExec('v78 user_configs.email_template_style', `ALTER TABLE user_configs ADD COLUMN email_template_style TEXT NOT NULL DEFAULT 'classic'`);
+        await tryExec('v78 user_configs.fallback_enabled', 'ALTER TABLE user_configs ADD COLUMN fallback_enabled INTEGER NOT NULL DEFAULT 1');
+      },
     },
     {
-      // v79: AI birthday greetings. Per-user greeting mode (auto = send on the day,
-      // draft = stage for one-click send) and AI toggle; contacts gain a birth_date so
-      // greetings work without a linked birthday event; greeting_history stores the
-      // final composed text per contact/year/channel (rotation basis + audit).
+      // v79: AI 生日祝福。每用户祝福模式（auto=当天发送，draft=暂存一键发送）与 AI 开关；
+      // 联系人补 birth_date 使无关联生日事件的联系人也能祝福；greeting_history 按
+      // 联系人/年份/渠道存最终成文（轮换依据 + 审计）。
       version: 79,
       name: 'ai_birthday_greetings_v79',
-      sql: `ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS greeting_mode TEXT NOT NULL DEFAULT 'auto';
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS greeting_ai_enabled BOOLEAN NOT NULL DEFAULT TRUE;
-ALTER TABLE fixed_contacts ADD COLUMN IF NOT EXISTS birth_date DATE;
-CREATE TABLE IF NOT EXISTS greeting_history (
-  id BIGSERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS greeting_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
   contact_id INTEGER,
   event_id INTEGER,
@@ -3152,74 +2390,77 @@ CREATE TABLE IF NOT EXISTS greeting_history (
   subject TEXT,
   body_html TEXT,
   recipients TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_greeting_history_user_year ON greeting_history(user_id, year DESC);`,
+      postMigrate: async () => {
+        await tryExec('v79 user_configs.greeting_mode', `ALTER TABLE user_configs ADD COLUMN greeting_mode TEXT NOT NULL DEFAULT 'auto'`);
+        await tryExec('v79 user_configs.greeting_ai_enabled', 'ALTER TABLE user_configs ADD COLUMN greeting_ai_enabled INTEGER NOT NULL DEFAULT 1');
+        await tryExec('v79 fixed_contacts.birth_date', 'ALTER TABLE fixed_contacts ADD COLUMN birth_date TEXT');
+      },
     },
     {
-      // v80: log retention & bounded cron status.
-      // - greeting_history gains source (ai|composer) and tone for the greeting AI budget
-      //   gate and per-draft regeneration;
-      // - digest_archive stores the AI monthly digest narrative so raw trigger logs can
-      //   expire at 90 days without losing history ("AI keeps what matters");
-      // - cron_job_status is a one-row-per-job upsert (last outcome) replacing the
-      //   every-minute success rows; failed details stay in cron_execution_logs (30d);
-      // - indexes for the two hot paths: /api/health's cron status lookup and the
-      //   trigger-logs list ordering.
+      // v80: 日志保留与有界 cron 状态。
+      // - greeting_history 增 source（ai|composer）与 tone，供祝福 AI 预算闸与按草稿重生成；
+      // - digest_archive 存 AI 月报叙述，使原始触发日志可 90 天过期而不丢历史（"AI 留下重要的"）；
+      // - cron_job_status 每任务一行 UPSERT（最近结果），取代每分钟成功行；失败细节仍在
+      //   cron_execution_logs（30 天）；
+      // - 两条热路径索引：/api/health 的 cron 状态查询与触发日志列表排序。
       version: 80,
       name: 'log_retention_and_ai_greetings_v80',
-      sql: `ALTER TABLE greeting_history ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'composer';
-ALTER TABLE greeting_history ADD COLUMN IF NOT EXISTS tone TEXT;
-CREATE TABLE IF NOT EXISTS digest_archive (
-  id BIGSERIAL PRIMARY KEY,
+      sql: `CREATE TABLE IF NOT EXISTS digest_archive (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
   period TEXT NOT NULL,
-  period_start DATE,
-  period_end DATE,
+  period_start TEXT,
+  period_end TEXT,
   narrative_md TEXT,
-  stats_json JSONB,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  stats_json TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_digest_archive_user_period ON digest_archive(user_id, period_start DESC);
 CREATE TABLE IF NOT EXISTS cron_job_status (
   job_name TEXT PRIMARY KEY,
   last_status TEXT NOT NULL,
-  last_ok_at TIMESTAMPTZ,
+  last_ok_at TEXT,
   last_error TEXT,
   last_summary TEXT,
   last_duration_ms INTEGER,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_cron_executed_at ON cron_execution_logs(executed_at);
 CREATE INDEX IF NOT EXISTS idx_trigger_user_created ON event_trigger_logs(user_id, created_at);`,
+      postMigrate: async () => {
+        await tryExec('v80 greeting_history.source', `ALTER TABLE greeting_history ADD COLUMN source TEXT NOT NULL DEFAULT 'composer'`);
+        await tryExec('v80 greeting_history.tone', 'ALTER TABLE greeting_history ADD COLUMN tone TEXT');
+      },
     },
     {
-      // v81 (v2.30 方向 A): AI 日报/周报自动化。每用户独立的日报/周报开关与投递时刻
-      // （用户本地时区，由 /api/cron/digest?period=daily|weekly 端点内逐用户判断是否到点）；
+      // v81（v2.30 方向 A）: AI 日报/周报自动化。每用户独立的日报/周报开关与投递时刻
+      //（用户本地时区，由 /api/cron/digest?period=daily|weekly 端点内逐用户判断是否到点）；
       // 投递渠道复用既有 digest_channel_account_id，不新增列。防重走 digest_archive 查重。
-      // 全部 ADD COLUMN IF NOT EXISTS，可重跑。
       version: 81,
       name: 'digest_daily_weekly_schedule_v81',
-      sql: `ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS digest_daily_enabled BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS digest_daily_time TEXT NOT NULL DEFAULT '21:00';
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS digest_weekly_enabled BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS digest_weekly_day INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS digest_weekly_time TEXT NOT NULL DEFAULT '09:00';`,
+      sql: `SELECT 1;`,
+      postMigrate: async () => {
+        await tryExec('v81 user_configs.digest_daily_enabled', 'ALTER TABLE user_configs ADD COLUMN digest_daily_enabled INTEGER NOT NULL DEFAULT 0');
+        await tryExec('v81 user_configs.digest_daily_time', `ALTER TABLE user_configs ADD COLUMN digest_daily_time TEXT NOT NULL DEFAULT '21:00'`);
+        await tryExec('v81 user_configs.digest_weekly_enabled', 'ALTER TABLE user_configs ADD COLUMN digest_weekly_enabled INTEGER NOT NULL DEFAULT 0');
+        await tryExec('v81 user_configs.digest_weekly_day', 'ALTER TABLE user_configs ADD COLUMN digest_weekly_day INTEGER NOT NULL DEFAULT 1');
+        await tryExec('v81 user_configs.digest_weekly_time', `ALTER TABLE user_configs ADD COLUMN digest_weekly_time TEXT NOT NULL DEFAULT '09:00'`);
+      },
     },
   ];
 
   for (const migration of migrations) {
-    if (currentVersion < migration.version) {
+    if (fromVersion < migration.version) {
       try {
         console.log(`[DB] Applying migration v${migration.version}: ${migration.name}`);
-        await query(migration.sql);
+        db.exec(migration.sql);
         if (migration.postMigrate) {
-          await migration.postMigrate();
+          await migration.postMigrate(db);
         }
-        await query(
-          'INSERT INTO schema_version (version, applied_at) VALUES ($1, CURRENT_TIMESTAMP) ON CONFLICT (version) DO UPDATE SET applied_at = CURRENT_TIMESTAMP',
-          [migration.version]
-        );
+        db.run('INSERT OR REPLACE INTO schema_version (version) VALUES (?)', [migration.version]);
         console.log(`[DB] Migration v${migration.version} applied successfully`);
       } catch (error) {
         console.error(`[DB] Migration v${migration.version} failed:`, error);
@@ -3247,23 +2488,28 @@ export async function migrateEncryptionKey(): Promise<void> {
     return;
   }
 
+  const db = getDb();
+
   // Migrate notification_accounts
   const encryptedFields = ['webhook', 'token', 'secret', 'chat_id', 'session_data'];
-  const accountsResult = await query(
-    'SELECT id, webhook, token, secret, chat_id, session_data FROM notification_accounts'
-  );
-  const rows = accountsResult.rows as Array<{ id: number; [key: string]: any }>;
+  const stmt = db.prepare('SELECT id, webhook, token, secret, chat_id, session_data FROM notification_accounts');
+  const rows: Array<{ id: number; [key: string]: any }> = [];
+  while (stmt.step()) {
+    rows.push(stmt.getAsObject() as any);
+  }
+  stmt.free();
 
   let migratedCount = 0;
   for (const row of rows) {
     const updates: string[] = [];
     const values: any[] = [];
-    let paramIdx = 0;
 
     for (const field of encryptedFields) {
       let value = row[field];
       if (!value) continue;
 
+      // v2.30 合入上游新增守卫：session_data 若被驱动解析成对象先归一化为字符串，
+      // 非字符串一律跳过（SQLite 下该列恒为 TEXT，守卫不触发，仅保持与上游一致）。
       if (field === 'session_data' && typeof value === 'object' && value !== null) {
         value = JSON.stringify(value);
       }
@@ -3281,8 +2527,7 @@ export async function migrateEncryptionKey(): Promise<void> {
       try {
         const plaintext = decrypt(value, LEGACY_MASTER_KEY);
         const reEncrypted = encrypt(plaintext, currentKey);
-        paramIdx++;
-        updates.push(`${field} = $${paramIdx}`);
+        updates.push(`${field} = ?`);
         values.push(reEncrypted);
       } catch {
         // Both keys failed - might be plaintext or corrupted, skip
@@ -3291,12 +2536,8 @@ export async function migrateEncryptionKey(): Promise<void> {
     }
 
     if (updates.length > 0) {
-      paramIdx++;
       values.push(row.id);
-      await query(
-        `UPDATE notification_accounts SET ${updates.join(', ')} WHERE id = $${paramIdx}`,
-        values
-      );
+      db.run(`UPDATE notification_accounts SET ${updates.join(', ')} WHERE id = ?`, values);
       migratedCount++;
     }
   }
@@ -3314,16 +2555,17 @@ export async function migrateEncryptionKey(): Promise<void> {
     'encrypted_qmsg_qq', 'encrypted_channel_webhooks'
   ];
 
-  const configResult = await query(
-    `SELECT user_id, ${configFields.join(', ')} FROM user_configs`
-  );
-  const configRows = configResult.rows as Array<{ user_id: number; [key: string]: any }>;
+  const configStmt = db.prepare(`SELECT user_id, ${configFields.join(', ')} FROM user_configs`);
+  const configRows: Array<{ user_id: number; [key: string]: any }> = [];
+  while (configStmt.step()) {
+    configRows.push(configStmt.getAsObject() as any);
+  }
+  configStmt.free();
 
   let configMigratedCount = 0;
   for (const row of configRows) {
     const updates: string[] = [];
     const values: any[] = [];
-    let paramIdx = 0;
 
     for (const field of configFields) {
       const value = row[field];
@@ -3341,8 +2583,7 @@ export async function migrateEncryptionKey(): Promise<void> {
       try {
         const plaintext = decrypt(value, LEGACY_MASTER_KEY);
         const reEncrypted = encrypt(plaintext, currentKey);
-        paramIdx++;
-        updates.push(`${field} = $${paramIdx}`);
+        updates.push(`${field} = ?`);
         values.push(reEncrypted);
       } catch {
         // Both keys failed, skip
@@ -3351,12 +2592,8 @@ export async function migrateEncryptionKey(): Promise<void> {
     }
 
     if (updates.length > 0) {
-      paramIdx++;
       values.push(row.user_id);
-      await query(
-        `UPDATE user_configs SET ${updates.join(', ')} WHERE user_id = $${paramIdx}`,
-        values
-      );
+      db.run(`UPDATE user_configs SET ${updates.join(', ')} WHERE user_id = ?`, values);
       configMigratedCount++;
     }
   }
