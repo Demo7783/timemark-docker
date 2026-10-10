@@ -16,6 +16,12 @@ data/
 data-test/
 backend/data/
 
+# LocalAI 模型权重（~260MB 二进制不入库：仓库/镜像体积不友好，API 推送通道也有
+# 单请求上限）。用 scripts/fetch-localai-models.mjs 一条命令拉取；小体积配置
+# （*.json）仍跟踪，保证模型清单可审。
+frontend/public/models/**/*.bin
+frontend/public/models/**/*.onnx
+
 # ...except the vendored chinese-days dataset, which IS checked-in source
 !shared/src/data/
 !shared/src/data/**
