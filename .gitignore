@@ -3,6 +3,7 @@ dist
 build
 .env
 .env.*
+!.env.example
 *.log
 .DS_Store
 .docker-cache
@@ -15,9 +16,27 @@ data/
 data-test/
 backend/data/
 
+# ...except the vendored chinese-days dataset, which IS checked-in source
+!shared/src/data/
+!shared/src/data/**
+
+# PWA service worker assets（全局 *.js 忽略会吞掉它们——v2.22 教训）
+!frontend/public/sw.js
+!frontend/public/install-prompt.js
+
+# Generated build-time static search index (scripts/build-search-index.mjs)
+frontend/public/search-index.json
+
 # Test files with credentials
 test-login.json
 test-api*.ps1
 
+# Playwright artifacts
+frontend/test-results/
+
 # Sisyphus state
 .sisyphus/
+
+# Mimosa security scanner state
+.mimosa/
+*.tsbuildinfo

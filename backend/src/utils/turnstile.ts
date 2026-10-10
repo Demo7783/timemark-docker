@@ -26,20 +26,27 @@ export function isTurnstileEnabled(): boolean {
   return !!getTurnstileSecretKey();
 }
 
+/** GET /auth/turnstile-config 的载荷。misconfigured = 服务端要求验证但前端拿不到 siteKey，
+ *  此时登录页验证组件消失且登录必被拒——必须显式暴露给前端，不能静默。 */
+export function turnstileConfigPayload(): {
+  siteKey: string | null;
+  enabled: boolean;
+  misconfigured: boolean;
+} {
+  const siteKey = getTurnstileSiteKey() || null;
+  const enabled = isTurnstileEnabled();
+  return { siteKey, enabled, misconfigured: enabled && !siteKey };
+}
+
 type SiteVerifyResponse = {
   success?: boolean;
   'error-codes'?: string[];
 };
 
-type TurnstileVerifyOptions = {
-  token: string | undefined;
-  /** Only pass to Cloudflare when sourced from a trusted platform header */
-  trustedRemoteIp?: string;
-};
-
 export async function verifyTurnstileToken(
   token: string | undefined,
-  trustedRemoteIp?: string,
+  /** 兼容旧签名：siteverify 统一不带 remoteip（见上），该参数仅保留不再使用 */
+  _trustedRemoteIp?: string,
 ): Promise<{ ok: boolean; skipped: boolean; error?: string; code?: string }> {
   const secret = getTurnstileSecretKey();
   if (!secret) return { ok: true, skipped: true };
@@ -48,11 +55,8 @@ export async function verifyTurnstileToken(
     return { ok: false, skipped: false, error: '请完成人机验证', code: 'turnstile_required' };
   }
 
-  const verify = async (includeRemoteIp: boolean): Promise<SiteVerifyResponse> => {
+  const verify = async (): Promise<SiteVerifyResponse> => {
     const body = new URLSearchParams({ secret, response: token });
-    if (includeRemoteIp && trustedRemoteIp) {
-      body.set('remoteip', trustedRemoteIp);
-    }
 
     const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method: 'POST',
@@ -63,15 +67,10 @@ export async function verifyTurnstileToken(
   };
 
   try {
-    // Trusted IP (cf-connecting-ip / x-vercel-forwarded-for): verify with remoteip first.
-    // Fallback without remoteip for proxy edge cases — still validates the token+secret pair.
-    let data = trustedRemoteIp
-      ? await verify(true)
-      : await verify(false);
-
-    if (!data.success && trustedRemoteIp) {
-      data = await verify(false);
-    }
+    // Cloudflare 规定每个 token 只能提交 siteverify 一次：第一次提交（无论成败）即消费。
+    // 因此绝不带 remoteip 失败后重试——第二次必然 timeout-or-duplicate，用户永远过不了验证。
+    // remoteip 只是可选加固，token+secret 校验本身已足够安全，统一不带。
+    const data = await verify();
 
     if (!data.success) {
       const codes = data['error-codes'] ?? [];

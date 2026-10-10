@@ -1,6 +1,7 @@
 import { query } from '../db/index.js';
 import { sendNotifications } from './notifications/index.js';
 import { createLogger } from '../utils/logger.js';
+import { purgeLogTable } from './retention.service.js';
 
 const log = createLogger('notification-retry');
 
@@ -32,21 +33,16 @@ export async function enqueueNotificationRetry(params: {
 }
 
 export async function processNotificationRetries(): Promise<{ processed: number; succeeded: number }> {
-  // 注意：不能用 SELECT nq.*, e.* —— 同名列（id 等）在 sql.js 的对象行里会互相覆盖，
-  // 导致 row.id 拿到事件 id、后续 UPDATE 静默失效。这里显式列出队列列 + 事件列。
-  const nowIso = new Date().toISOString();
   const due = await query(
-    `SELECT nq.id AS queue_id, nq.event_id, nq.retry_count, nq.max_retries,
-            nq.channel, nq.user_id, nq.account_id, e.*
+    `SELECT nq.*, e.*
      FROM notification_queue nq
      JOIN events e ON e.id = nq.event_id
      WHERE nq.status = 'pending'
        AND nq.next_retry_at IS NOT NULL
-       AND nq.next_retry_at <= $1
+       AND nq.next_retry_at <= NOW()
        AND nq.retry_count < nq.max_retries
      ORDER BY nq.next_retry_at ASC
      LIMIT 20`,
-    [nowIso],
   );
 
   let processed = 0;
@@ -54,7 +50,7 @@ export async function processNotificationRetries(): Promise<{ processed: number;
 
   for (const row of due.rows as Array<Record<string, unknown>>) {
     processed++;
-    const queueId = row.queue_id as number;
+    const queueId = row.id as number;
     const retryCount = (row.retry_count as number) ?? 0;
     const channel = row.channel as string;
     const userId = row.user_id as number;
@@ -120,10 +116,5 @@ async function scheduleNextRetry(queueId: number, currentRetry: number, errorMes
 }
 
 export async function purgeOldQueueEntries(): Promise<number> {
-  const result = await query(
-    `DELETE FROM notification_queue
-     WHERE status IN ('completed', 'dead')
-       AND updated_at < datetime('now','-30 days')`,
-  );
-  return result.rowCount ?? 0;
+  return purgeLogTable('notification_queue');
 }

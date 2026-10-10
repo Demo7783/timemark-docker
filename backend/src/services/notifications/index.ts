@@ -20,39 +20,153 @@ import { sendMatrixNotification } from './matrix.service.js';
 import { sendMattermostNotification } from './mattermost.service.js';
 import { sendMicrosoftTeamsNotification } from './msteams.service.js';
 import { sendNextcloudTalkNotification } from './nextcloudtalk.service.js';
-import { sendNostrNotification } from './nostr.service.js';
 import { sendNtfyNotification } from './ntfy.service.js';
 import { sendPushoverNotification } from './pushover.service.js';
 import { sendAppriseNotification } from './apprise.service.js';
-// New token-based channels (batch 2)
-import { sendClawBotNotification } from './clawbot.service.js';
 import { sendServerChanNotification } from './serverchan.service.js';
 import { sendPushPlusNotification } from './pushplus.service.js';
 import { sendBarkNotification } from './bark.service.js';
 import { sendGotifyNotification } from './gotify.service.js';
 import { sendMeowNotification } from './meow.service.js';
 import { sendPushMeNotification } from './pushme.service.js';
+import { sendPushDeerNotification } from './pushdeer.service.js';
+import { sendTwilioSmsNotification } from './twilio.service.js';
 import { sendWeComAppNotification } from './wecomapp.service.js';
-
-// Plugin channel services
-import { sendNotification as sendWechatNotification } from './wechaty.service.js';
-import { sendNotification as sendWhatsappNotification } from './whatsapp.service.js';
-import { sendNotification as sendQQNotification } from './qqbot.service.js';
-import { sendNotification as sendSignalNotification } from './signal.service.js';
-import { sendNotification as sendZaloNotification } from './zalo.service.js';
-import { sendNotification as sendBlueBubblesNotification } from './bluebubbles.service.js';
+import { sendServerChan3Notification } from './serverchan3.service.js';
+import { sendXizhiNotification } from './xizhi.service.js';
+import { sendAnPushNotification } from './anpush.service.js';
+import { sendChanifyNotification } from './chanify.service.js';
+import { sendPushbackNotification } from './pushback.service.js';
+import { sendSimplePushNotification } from './simplepush.service.js';
+import { sendZulipNotification } from './zulip.service.js';
+import { sendRocketChatNotification } from './rocketchat.service.js';
+import { sendFcmNotification } from './fcm.service.js';
+import { sendTwilioWhatsAppNotification } from './twilio-whatsapp.service.js';
+// v78 batch 3: WhatsApp Cloud API / Kook / Fanbook / Home Assistant
+import {
+  sendWhatsAppCloudNotification,
+  sendKookNotification,
+  sendFanbookNotification,
+  sendHomeAssistantNotification,
+} from './extended-channels.service.js';
+// Browser Web Push (checkbox 84): VAPID channel backed by push_subscriptions rows.
+import {
+  buildWebPushPayload,
+  deliverWebPush,
+  getVapidConfig,
+  type StoredPushSubscription,
+} from './webpush.service.js';
+import { filterSupportedChannels } from './supported-channels.js';
+import { resolveProfileRoutedAccountIds } from '../reminder-channel-resolver.service.js';
 
 import { getUserConfig, getRelationshipMappings, getNotificationAccounts, getEventTemplate } from '../config.service.js';
 import { applyRelationshipMapping } from '@timemark/shared/relationship';
-import { getBlessing } from '../../../../shared/src/blessings.js';
-import { generateNotificationContent } from '../../../../shared/src/templates.js';
+import { getBlessing } from '@timemark/shared/blessings';
+import { generateNotificationContent, formatLunarDateLabel, formatLunarMonthDay } from '@timemark/shared/templates';
 import { query } from '../../db/index.js';
+import { logEmail } from '../email-log.service.js';
+import { enqueueNotificationRetry } from '../notification-retry.service.js';
+import { getConflictHint } from '../conflict-hint.service.js';
+import { mapWithConcurrency } from '../../utils/concurrency.js';
+import { classifyErrorForRetry } from '../../utils/retry-classifier.js';
+import { createLogger } from '../../utils/logger.js';
+import { writeAfterResponse } from '../../utils/write-after-response.js';
+
+const log = createLogger('notifications');
+
+function formatEventDateValue(date: unknown): string {
+  if (!date) return '';
+  if (date instanceof Date) {
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  }
+  if (typeof date === 'string') return date.split('T')[0];
+  return String(date);
+}
+
+function parseReminderConfigField(raw: unknown): Record<string, unknown> {
+  if (!raw) return {};
+  if (typeof raw === 'object') return raw as Record<string, unknown>;
+  if (typeof raw === 'string') {
+    try { return JSON.parse(raw) as Record<string, unknown>; } catch { return {}; }
+  }
+  return {};
+}
+
+/** Normalize raw DB event rows for notification handlers (test-send, cron). */
+export function normalizeEventForNotification(row: Record<string, unknown>): Record<string, unknown> {
+  const reminderConfig = parseReminderConfigField(row.reminder_config ?? row.reminderConfig);
+  const personName = row.person_name ?? row.personName;
+  const reminderRecipientName = row.reminder_recipient_name ?? row.reminderRecipientName;
+  return {
+    ...row,
+    name: String(row.name ?? ''),
+    type: String(row.type ?? 'other'),
+    date: formatEventDateValue(row.date),
+    reminderConfig,
+    reminder_config: reminderConfig,
+    personName,
+    person_name: personName,
+    reminderRecipientName,
+    reminder_recipient_name: reminderRecipientName,
+  };
+}
+
+export function resolveRecipientEmails(event: Record<string, unknown>, chConfig: { emails?: string[] }, userConfig: Record<string, unknown> | null): string[] {
+  const normalizeList = (list: string[]): string[] => [
+    ...new Set(
+      list
+        .map((e) => String(e || '').trim().toLowerCase())
+        .filter((e) => e.includes('@')),
+    ),
+  ];
+
+  let parsedReminderConfig: { emailRecipients?: string[] } = {};
+  try {
+    const raw = event.reminder_config || event.reminderConfig;
+    if (raw) {
+      parsedReminderConfig = typeof raw === 'string' ? JSON.parse(raw) : (raw as { emailRecipients?: string[] });
+    }
+  } catch {
+    // ignore
+  }
+
+  // 1. 事件里明确填写的提醒人邮箱
+  if (parsedReminderConfig.emailRecipients?.length) {
+    const emails = normalizeList(parsedReminderConfig.emailRecipients);
+    if (emails.length) return emails;
+  }
+
+  // 2. 设置 → 默认测试/收件邮箱（未填事件邮箱时发给自己）
+  if (userConfig?.default_test_email) {
+    const email = String(userConfig.default_test_email).trim().toLowerCase();
+    if (email.includes('@')) return [email];
+  }
+
+  // 3. 设置 → 默认提醒收件人列表
+  if (Array.isArray(userConfig?.reminder_emails) && userConfig.reminder_emails.length) {
+    const emails = normalizeList(userConfig.reminder_emails as string[]);
+    if (emails.length) return emails;
+  }
+
+  // 4. 通知渠道账号上可选填的收件地址（最低优先级）
+  if (chConfig.emails?.length) {
+    const emails = normalizeList(chConfig.emails);
+    if (emails.length) return emails;
+  }
+
+  return [];
+}
 
 /**
  * Check if current time is within quiet hours for the user's timezone.
  * Handles overnight ranges (e.g., "22:00" to "07:00").
+ *
+ * Exported for the medication reminder job (checkbox 73), which must respect
+ * quiet hours for every non-critical medication and may bypass them only for a
+ * medication explicitly marked `is_critical`. The semantics for every other
+ * notification are unchanged.
  */
-function isInQuietHours(quietStart: string | null, quietEnd: string | null, timezone: string): boolean {
+export function isInQuietHours(quietStart: string | null, quietEnd: string | null, timezone: string): boolean {
   if (!quietStart || !quietEnd) return false;
 
   const [startH, startM] = quietStart.split(':').map(Number);
@@ -95,6 +209,7 @@ async function retryWithBackoff<T>(
       return await fn();
     } catch (error) {
       lastError = error as Error;
+      if (!classifyErrorForRetry(error)) throw lastError;
       if (attempt < maxRetries - 1) {
         const delay = baseDelayMs * Math.pow(2, attempt);
         await new Promise(resolve => setTimeout(resolve, delay));
@@ -106,29 +221,23 @@ async function retryWithBackoff<T>(
 
 // 通用 Webhook 渠道（通过配置文件中的 channel_webhooks 字段配置）
 const genericWebhookChannels = new Set([
-  'whatsapp',
-  'signal',
-  'imessage',
-  'bluebubbles',
-  'zalo',
-  'zalo_personal',
-  'network_chat',
-  'irc',
   'synologychat',
   'twitch',
-  'googlechat',
 ]);
 
 // 渠道类型到通知账户类型的映射
-const channelToAccountType: Record<string, string> = {
+export const channelToAccountType: Record<string, string> = {
   'feishu': 'feishu',
   'wecom': 'wecom',
   'dingtalk': 'dingtalk',
   'telegram': 'telegram',
   'discord': 'discord',
   'slack': 'slack',
+  'generic_webhook': 'generic_webhook',
   'wechat': 'wxpusher',
+  'wxpusher': 'wxpusher',
   'qq': 'qmsg',
+  'qmsg': 'qmsg',
   'email': 'email',
   'resend': 'resend',
   'smtp': 'smtp',
@@ -139,30 +248,214 @@ const channelToAccountType: Record<string, string> = {
   'mattermost': 'mattermost',
   'msteams': 'msteams',
   'nextcloud_talk': 'nextcloud_talk',
-  'nostr': 'nostr',
+  'nextcloudtalk': 'nextcloud_talk',
   'irc': 'irc',
   'synologychat': 'synologychat',
   'twitch': 'twitch',
-  'whatsapp': 'whatsapp',
-  'signal': 'signal',
-  'zalo': 'zalo',
   // New channels (batch 2)
   'ntfy': 'ntfy',
   'pushover': 'pushover',
   'apprise': 'apprise',
-  'clawbot': 'clawbot',
   'serverchan': 'serverchan',
   'pushplus': 'pushplus',
   'bark': 'bark',
   'gotify': 'gotify',
   'meow': 'meow',
   'pushme': 'pushme',
+  'pushdeer': 'pushdeer',
+  'twilio': 'twilio',
   'wecomapp': 'wecomapp',
-  // Plugin channels
-  'wechat_personal': 'wechat_personal',
-  'qq_bot': 'qq_bot',
-  'imessage': 'imessage',
+  // Wave 2 channels (checkboxes 15-22)
+  'serverchan3': 'serverchan3',
+  'xizhi': 'xizhi',
+  'anpush': 'anpush',
+  'chanify': 'chanify',
+  'pushback': 'pushback',
+  'simplepush': 'simplepush',
+  'zulip': 'zulip',
+  'rocketchat': 'rocketchat',
+  'fcm': 'fcm',
+  'twilio_whatsapp': 'twilio_whatsapp',
+  // v78 batch 3
+  'whatsapp_cloud': 'whatsapp_cloud',
+  'kook': 'kook',
+  'fanbook': 'fanbook',
+  'homeassistant': 'homeassistant',
+  'pushbullet': 'pushbullet',
+  'join': 'join',
+  'pushsafer': 'pushsafer',
+  'webex': 'webex',
+  'notifiarr': 'notifiarr',
+  // v2.29 batch (wave4)
+  'guilded': 'guilded',
+  'ifttt': 'ifttt',
+  'revolt': 'revolt',
+  'onesignal': 'onesignal',
+  'sendgrid': 'sendgrid',
+  'mailgun': 'mailgun',
+  'vonage_sms': 'vonage_sms',
+  'messagebird': 'messagebird',
+  'alertzy': 'alertzy',
+  'awtrix': 'awtrix',
 };
+
+/**
+ * 主分发链（sendNotifications 中的 if/else）可处理的渠道 ID。
+ * 与 `__tests__/channel-integrity.test.ts` 共享：渠道目录中的每个渠道都必须在此集合中，
+ * 否则说明它被列入了支持的渠道目录却没有真正的发送分支。
+ */
+export const DISPATCHABLE_CHANNELS = new Set<string>([
+  // Webhook
+  'feishu',
+  'wecom',
+  'dingtalk',
+  'discord',
+  'slack',
+  'googlechat',
+  'irc',
+  'synologychat',
+  'twitch',
+  'generic_webhook',
+  'rocketchat',
+  // Token
+  'resend',
+  'smtp',
+  'telegram',
+  'line',
+  'matrix',
+  'mattermost',
+  'msteams',
+  'nextcloud_talk',
+  'wxpusher',
+  'qmsg',
+  'serverchan',
+  'pushplus',
+  'bark',
+  'gotify',
+  'meow',
+  'pushme',
+  'pushdeer',
+  'twilio',
+  'wecomapp',
+  'ntfy',
+  'pushover',
+  'apprise',
+  'serverchan3',
+  'xizhi',
+  'anpush',
+  'chanify',
+  'pushback',
+  'simplepush',
+  'zulip',
+  'fcm',
+  'twilio_whatsapp',
+  // v78 batch 3
+  'whatsapp_cloud',
+  'kook',
+  'fanbook',
+  'homeassistant',
+  'pushbullet',
+  'join',
+  'pushsafer',
+  'webex',
+  'notifiarr',
+  // v2.29 batch (wave4)
+  'guilded',
+  'ifttt',
+  'revolt',
+  'onesignal',
+  'sendgrid',
+  'mailgun',
+  'vonage_sms',
+  'messagebird',
+  'alertzy',
+  'awtrix',
+  // Browser Web Push (checkbox 84) — VAPID, per-user subscriptions
+  'web_push',
+  // Legacy aliases（旧事件里可能仍存有这些渠道 ID）
+  'wechat',
+  'qq',
+  'email',
+]);
+
+/**
+ * 回退分发链（sendSingleChannel）可处理的渠道 ID。必须与上面的集合保持一致——
+ * 两个集合由 `channel-integrity.test.ts` 同时校验。
+ */
+export const FALLBACK_DISPATCHABLE_CHANNELS = new Set<string>([
+  // Webhook
+  'feishu',
+  'wecom',
+  'dingtalk',
+  'discord',
+  'slack',
+  'googlechat',
+  'irc',
+  'synologychat',
+  'twitch',
+  'generic_webhook',
+  'rocketchat',
+  // Token
+  'resend',
+  'smtp',
+  'telegram',
+  'line',
+  'matrix',
+  'mattermost',
+  'msteams',
+  'nextcloud_talk',
+  'wxpusher',
+  'qmsg',
+  'serverchan',
+  'pushplus',
+  'bark',
+  'gotify',
+  'meow',
+  'pushme',
+  'pushdeer',
+  'twilio',
+  'wecomapp',
+  'ntfy',
+  'pushover',
+  'apprise',
+  'serverchan3',
+  'xizhi',
+  'anpush',
+  'chanify',
+  'pushback',
+  'simplepush',
+  'zulip',
+  'fcm',
+  'twilio_whatsapp',
+  // v78 batch 3
+  'whatsapp_cloud',
+  'kook',
+  'fanbook',
+  'homeassistant',
+  // v2.28 batch
+  'pushbullet',
+  'join',
+  'pushsafer',
+  'webex',
+  'notifiarr',
+  // v2.29 batch (wave4)
+  'guilded',
+  'ifttt',
+  'revolt',
+  'onesignal',
+  'sendgrid',
+  'mailgun',
+  'vonage_sms',
+  'messagebird',
+  'alertzy',
+  'awtrix',
+  // Browser Web Push (checkbox 84) — VAPID, per-user subscriptions
+  'web_push',
+  // Legacy aliases（旧事件里可能仍存有这些渠道 ID）
+  'wechat',
+  'qq',
+  'email',
+]);
 
 /**
  * 根据账户类型获取通知配置
@@ -170,18 +463,21 @@ const channelToAccountType: Record<string, string> = {
 function getChannelConfigFromAccount(
   account: any,
   channel: string
-): { webhook?: string; token?: string; secret?: string; chat_id?: string; server_url?: string; sessionData?: any; toUser?: string; email?: string; apiKey?: string; emails?: string[]; fromEmail?: string } | null {
+): { webhook?: string; token?: string; secret?: string; chat_id?: string; priority?: number; server_url?: string; sessionData?: any; toUser?: string; email?: string; apiKey?: string; emails?: string[]; fromEmail?: string } | null {
   // 直接使用账户的字段
   switch (channel) {
     // Email channels
     case 'email':
-    case 'resend':
-      return { 
-        apiKey: account.token,  // Resend API Key
-        emails: [account.chat_id || account.name],  // Recipient emails as array
-        // 使用已验证域名的邮箱地址，或Resend测试地址（仅能发送到自己的邮箱）
-        fromEmail: account.webhook || 'onboarding@resend.dev'
+    case 'resend': {
+      const recipient = account.chat_id?.trim();
+      const normalized = recipient && recipient.includes('@') ? recipient.toLowerCase() : null;
+      const emails = normalized ? [normalized] : [];
+      return {
+        apiKey: account.token,
+        emails,
+        fromEmail: account.webhook || 'onboarding@resend.dev',
       };
+    }
     
     case 'smtp':
       return (account.webhook && account.token && account.chat_id)
@@ -198,6 +494,11 @@ function getChannelConfigFromAccount(
     case 'synologychat':
     case 'twitch':
       return account.webhook ? { webhook: account.webhook } : null;
+    
+    case 'generic_webhook':
+      return account.webhook
+        ? { webhook: account.webhook, secret: account.secret }
+        : null;
     
     case 'dingtalk':
       return (account.webhook && account.secret)
@@ -263,15 +564,20 @@ function getChannelConfigFromAccount(
       return account.token
         ? { token: account.token }
         : null;
+
+    case 'pushdeer':
+      return account.token
+        ? { token: account.token, webhook: account.webhook }
+        : null;
+
+    case 'twilio':
+      return (account.token && account.secret && account.webhook && account.chat_id)
+        ? { token: account.token, secret: account.secret, webhook: account.webhook, chat_id: account.chat_id }
+        : null;
     
     case 'wecomapp':
       return (account.token && account.secret && account.chat_id && account.webhook)
         ? { token: account.token, secret: account.secret, chat_id: account.chat_id, webhook: account.webhook }
-        : null;
-    
-    case 'nostr':
-      return (account.token && account.chat_id)
-        ? { token: account.token, chat_id: account.chat_id, webhook: account.webhook }
         : null;
     
     case 'ntfy':
@@ -279,44 +585,147 @@ function getChannelConfigFromAccount(
         ? { webhook: account.webhook, token: account.token }
         : null;
     
-    case 'pushover':
-      return (account.token && account.secret)
-        ? { token: account.token, secret: account.secret }
-        : null;
+    case 'pushover': {
+      if (!account.token || !account.secret) return null;
+      const rawPriority = account.chat_id != null ? parseInt(String(account.chat_id), 10) : 0;
+      const priority = Number.isFinite(rawPriority) && rawPriority >= -2 && rawPriority <= 2 ? rawPriority : 0;
+      return { token: account.token, secret: account.secret, priority };
+    }
     
     case 'apprise':
       return account.webhook
         ? { webhook: account.webhook, token: account.token }
         : null;
-    
-    // Plugin-based channels
-    case 'wechat_personal':
-    case 'whatsapp':
-    case 'qq_bot':
-    case 'signal':
-    case 'clawbot':
-    case 'zalo':
-      return (account.session_data || account.token)
-        ? { 
-            sessionData: account.session_data || account.token,
-            toUser: account.chat_id 
-          }
+
+    // Wave 2 channels (checkboxes 15-22)
+    case 'serverchan3':
+      return account.token
+        ? { token: account.token, webhook: account.webhook }
         : null;
-    
-    // iMessage via BlueBubbles
-    case 'imessage':
+
+    case 'xizhi':
+      return account.token ? { token: account.token } : null;
+
+    case 'anpush':
+      return account.token
+        ? { token: account.token, chat_id: account.chat_id }
+        : null;
+
+    case 'chanify':
+      // 服务器地址可留空（默认官方 API），设备 Token 必填
+      return account.token
+        ? { webhook: account.webhook, token: account.token }
+        : null;
+
+    case 'pushback':
+      return (account.token && account.chat_id)
+        ? { token: account.token, chat_id: account.chat_id }
+        : null;
+
+    case 'simplepush':
+      return account.token ? { token: account.token } : null;
+
+    case 'zulip':
+      return (account.webhook && account.token && account.chat_id && account.secret)
+        ? { webhook: account.webhook, token: account.token, chat_id: account.chat_id, secret: account.secret }
+        : null;
+
+    case 'rocketchat':
+      return account.webhook ? { webhook: account.webhook } : null;
+
+    case 'fcm':
+      return (account.token && account.chat_id)
+        ? { token: account.token, chat_id: account.chat_id }
+        : null;
+
+    case 'twilio_whatsapp':
+      return (account.token && account.secret && account.webhook && account.chat_id)
+        ? { token: account.token, secret: account.secret, webhook: account.webhook, chat_id: account.chat_id }
+        : null;
+
+    // v78 batch 3
+    case 'whatsapp_cloud':
+      // token = 永久访问令牌, secret = Phone Number ID, chat_id = 收件人手机号
+      return (account.token && account.secret && account.chat_id)
+        ? { token: account.token, secret: account.secret, chat_id: account.chat_id }
+        : null;
+
+    case 'kook':
+    case 'fanbook':
+      return account.webhook ? { webhook: account.webhook } : null;
+
+    case 'homeassistant':
+      // webhook = HA 地址, token = 长期访问令牌, chat_id = notify 服务名
       return (account.webhook && account.token && account.chat_id)
-        ? {
-            webhook: account.webhook,
-            token: account.token,
-            chat_id: account.chat_id
-          }
+        ? { webhook: account.webhook, token: account.token, chat_id: account.chat_id }
         : null;
-    
+
+    // v2.28 batch
+    case 'pushbullet':
+      return account.token ? { token: account.token } : null;
+    case 'join':
+      // token = Api Key, chat_id = Device ID（可选，留空 = group.all）
+      return account.token ? { token: account.token, chat_id: account.chat_id } : null;
+    case 'pushsafer':
+      return account.token ? { token: account.token } : null;
+    case 'webex':
+    case 'notifiarr':
+      return account.webhook ? { webhook: account.webhook } : null;
+
+    // v2.29 batch (wave4)
+    case 'guilded':
+    case 'awtrix':
+      return account.webhook ? { webhook: account.webhook } : null;
+    case 'ifttt':
+      // token = Webhooks Key, webhook = 触发事件名
+      return (account.token && account.webhook)
+        ? { token: account.token, webhook: account.webhook }
+        : null;
+    case 'revolt':
+      // token = Bot Token, chat_id = 频道 ID
+      return (account.token && account.chat_id)
+        ? { token: account.token, chat_id: account.chat_id }
+        : null;
+    case 'onesignal':
+      // token = REST API Key, secret = App ID, chat_id = Subscription ID（可选）
+      return (account.token && account.secret)
+        ? { token: account.token, secret: account.secret, chat_id: account.chat_id }
+        : null;
+    case 'sendgrid':
+      // token = API Key, secret = 发件人邮箱, chat_id = 收件人邮箱
+      return (account.token && account.secret && account.chat_id)
+        ? { token: account.token, secret: account.secret, chat_id: account.chat_id }
+        : null;
+    case 'mailgun':
+      // token = API Key, webhook = 发信域名, chat_id = 收件人邮箱
+      return (account.token && account.webhook && account.chat_id)
+        ? { token: account.token, webhook: account.webhook, chat_id: account.chat_id }
+        : null;
+    case 'vonage_sms':
+      // token = API Key, secret = API Secret, chat_id = 收件人手机号
+      return (account.token && account.secret && account.chat_id)
+        ? { token: account.token, secret: account.secret, chat_id: account.chat_id }
+        : null;
+    case 'messagebird':
+      // token = Access Key, chat_id = 收件人手机号
+      return (account.token && account.chat_id)
+        ? { token: account.token, chat_id: account.chat_id }
+        : null;
+    case 'alertzy':
+      return account.token ? { token: account.token } : null;
+
     default:
       return null;
   }
 }
+
+/**
+ * Per-channel result entry returned by sendNotifications.
+ * Every requested channel must produce one entry: success, failure, or
+ * 'no_configuration' when no account/legacy config resolves for it.
+ */
+type ChannelResultEntry = { success: boolean; error?: string; accountId?: number; recipients?: string[] };
+type ChannelResultMap = Record<string, ChannelResultEntry>;
 
 /**
  * Send notifications for an event through specified channels
@@ -331,15 +740,96 @@ function getChannelConfigFromAccount(
  * @param userId - The user's ID
  * @param channels - Array of channel IDs to send through (e.g., ['resend', 'telegram'])
  */
-export async function sendNotifications(event: any, userId: number, channels: string[], opts?: { skipQuietHours?: boolean }): Promise<Record<string, { success: boolean; error?: string; accountId?: number }>> {
+/**
+ * 把节假日文案并入事件正文（checkbox 78）。与 conflictHint / lunarLabel 完全同一套
+ * `customMessage` 渠道契约：有正文就追加，没有就补一个最小正文，绝不覆盖已有内容，
+ * 且同一文案不会重复追加。缺省（未传 label）返回原值 —— 非节假日提醒零变化。
+ */
+export function appendHolidayLabel(
+  customMessage: string | undefined,
+  holidayLabel: string | undefined,
+  event: { date?: unknown; type?: unknown },
+): string | undefined {
+  const label = typeof holidayLabel === 'string' ? holidayLabel.trim() : '';
+  if (!label) return customMessage;
+  if (!customMessage) {
+    return `**日期:** ${String(event.date ?? '')}\n**类型:** ${String(event.type ?? '')}\n🎉 ${label}`;
+  }
+  if (customMessage.includes(label)) return customMessage;
+  return `${customMessage}\n🎉 ${label}`;
+}
+
+/**
+ * checkbox 168: append an optional owner-facing hint (e.g.「该联系人没有邮箱」) to the
+ * OWNER reminder. Same contract as appendHolidayLabel: never overwrites existing content,
+ * never duplicates the hint, and absent hint returns the input unchanged (existing callers
+ * are byte-identical).
+ */
+export function appendOwnerHint(
+  customMessage: string | undefined,
+  ownerHint: string | undefined,
+  event: { date?: unknown; type?: unknown },
+): string | undefined {
+  const hint = typeof ownerHint === 'string' ? ownerHint.trim() : '';
+  if (!hint) return customMessage;
+  if (!customMessage) {
+    return `**日期:** ${String(event.date ?? '')}\n**类型:** ${String(event.type ?? '')}\n💡 ${hint}`;
+  }
+  if (customMessage.includes(hint)) return customMessage;
+  return `${customMessage}\n💡 ${hint}`;
+}
+
+export async function sendNotifications(
+  event: any,
+  userId: number,
+  channels: string[],
+  options?: { skipQuietHours?: boolean; profileId?: number | null; holidayLabel?: string; ownerHint?: string },
+): Promise<ChannelResultMap> {
+  event = normalizeEventForNotification(event as Record<string, unknown>);
   const config = await getUserConfig(userId);
 
-  // Quiet hours check: skip sending, scheduler will retry next minute
-  if (!opts?.skipQuietHours) {
-    const userTimezone = config?.timezone || 'Asia/Shanghai';
-    if (isInQuietHours(config?.quiet_hours_start, config?.quiet_hours_end, userTimezone)) {
-      console.log(`[Notifications] Skipping send during quiet hours for user ${userId}`);
-      return { _quiet_hours: { success: false, error: 'quiet_hours' } };
+  const userTimezone = config?.timezone || 'Asia/Shanghai';
+  if (!options?.skipQuietHours && isInQuietHours(config?.quiet_hours_start, config?.quiet_hours_end, userTimezone)) {
+    console.log(`[Notifications] Skipping send during quiet hours for user ${userId}`);
+    const quietHourResults: ChannelResultMap = {
+      _quiet_hours: { success: false, error: 'quiet_hours' },
+    };
+    for (const ch of new Set(channels)) {
+      quietHourResults[ch] = { success: false, error: 'quiet_hours' };
+    }
+    return quietHourResults;
+  }
+
+  // Vercel / cloud: only HTTP-based channels
+  const requestedChannels = channels.slice();
+  const supportedChannels = filterSupportedChannels(requestedChannels);
+  // Ids dropped by filterSupportedChannels must still be reported (never silently omitted).
+  const droppedChannels = [...new Set(requestedChannels.filter((ch) => !supportedChannels.includes(ch)))];
+  channels = supportedChannels;
+  if (channels.length === 0) {
+    const skippedResults: ChannelResultMap = {
+      _skipped: { success: false, error: 'no_supported_channels' },
+    };
+    for (const ch of droppedChannels) {
+      skippedResults[ch] = { success: false, error: 'unsupported_channel' };
+    }
+    return skippedResults;
+  }
+
+  // checkbox 84: browser Web Push subscriptions live in `push_subscriptions`
+  // (per user), not in notification_accounts. Load them only when the channel is
+  // requested AND VAPID is configured; a missing VAPID key must skip the channel
+  // (no_configuration) instead of throwing out of the dispatcher.
+  let pushSubscriptions: StoredPushSubscription[] = [];
+  if (channels.includes('web_push') && getVapidConfig()) {
+    try {
+      const pushRows = await query(
+        'SELECT endpoint, keys_p256dh, keys_auth FROM push_subscriptions WHERE user_id = $1',
+        [userId],
+      );
+      pushSubscriptions = pushRows.rows as StoredPushSubscription[];
+    } catch (e) {
+      log.warn({ event: 'webpush.subscriptions_load_failed', err: e }, 'Failed to load push subscriptions');
     }
   }
 
@@ -350,6 +840,11 @@ export async function sendNotifications(event: any, userId: number, channels: st
   // Apply default relationship mapping for all channels
   const defaultMappedName = applyRelationshipMapping(event.name, mappings);
   const mappedEvent: any = { ...event, name: defaultMappedName };
+
+  const conflictHint = await getConflictHint(userId, String(event.date).slice(0, 10), Number(event.id) || undefined);
+  if (conflictHint) {
+    mappedEvent.conflictHint = conflictHint;
+  }
   
   // Try to get user-customized template for this event type
   const userTemplate = await getEventTemplate(userId, event.type);
@@ -360,12 +855,47 @@ export async function sendNotifications(event: any, userId: number, channels: st
     const daysUntil = Math.max(0, Math.ceil((eventDate.getTime() - today.getTime()) / (86400 * 1000)));
     const renderedContent = generateNotificationContent(
       userTemplate.template_content,
-      { name: mappedEvent.name, date: event.date, type: event.type, personName: event.personName },
+      {
+        name: mappedEvent.name,
+        date: event.date,
+        type: event.type,
+        personName: event.person_name || event.personName,
+        lunarDate: formatLunarMonthDay(event.lunar_date),
+        calendarType: event.calendar_type,
+      },
       daysUntil,
       blessing,
       event.reminder_time
     );
     mappedEvent.customMessage = renderedContent;
+  }
+
+  if (conflictHint) {
+    const base = mappedEvent.customMessage
+      || `**日期:** ${event.date}\n**类型:** ${event.type}`;
+    mappedEvent.customMessage = `${base}\n\n📅 ${conflictHint}`;
+  }
+
+  // C34 + 169: 默认模板也追加农历标签。仅农历/双历事件会携带 lunar_date；公历事件
+  // （无 lunar_date）逐字节不变。标签原样读自持久化的 lunar_date，绝不重算。
+  const isDualCalendar = event.calendar_type === 'lunar' || event.calendar_type === 'both';
+  const lunarLabel = isDualCalendar ? formatLunarDateLabel(event.lunar_date) : '';
+  if (lunarLabel && !mappedEvent.customMessage) {
+    mappedEvent.customMessage = `**日期:** ${event.date}（${lunarLabel}）\n**类型:** ${event.type}`;
+  } else if (lunarLabel && mappedEvent.customMessage && !mappedEvent.customMessage.includes(lunarLabel)) {
+    mappedEvent.customMessage = `${mappedEvent.customMessage}\n📅 ${lunarLabel}`;
+  }
+
+  // checkbox 78: 节假日文案（默认 keep 模式把节假日名带进正文）。只影响显式传入
+  // holidayLabel 的调用方（事件提醒 + 到期/库存/保养迭代器）；medication 与
+  // document 调用方从不传该选项 → 行为逐字节不变。
+  mappedEvent.customMessage = appendHolidayLabel(mappedEvent.customMessage, options?.holidayLabel, event);
+
+  // checkbox 168: optional one-line hint on the OWNER reminder (e.g. the linked contact has
+  // no email). Appended after template/lunar/holiday rendering so a custom template cannot
+  // overwrite it; never passed by existing callers, so their output is byte-identical.
+  if (options?.ownerHint) {
+    mappedEvent.customMessage = appendOwnerHint(mappedEvent.customMessage, options.ownerHint, event);
   }
   
   // 获取事件绑定的通知账户ID
@@ -383,6 +913,14 @@ export async function sendNotifications(event: any, userId: number, channels: st
   
   // 获取用户所有通知账户
   const allAccounts = await getNotificationAccounts(userId);
+
+  // 档案级通知路由（checkbox 70）：该档案存在显式路由行时，只有这些账户参与
+  // 「未显式绑定账户」的渠道解析与失败回退；没有路由行 = 回退全部启用账户。
+  // 事件级 notification_account_ids 绑定不受影响（下面 boundAccountIds 分支仍优先）。
+  const routedAccountIds = await resolveProfileRoutedAccountIds(userId, options?.profileId);
+  const eligibleAccounts = routedAccountIds === null
+    ? allAccounts
+    : allAccounts.filter((account) => routedAccountIds.has(Number(account.id)));
   
   // 构建账户ID到账户的映射
   const accountsMap = new Map<number, any>();
@@ -397,18 +935,30 @@ export async function sendNotifications(event: any, userId: number, channels: st
     const configs: any[] = [];
     
     if (boundAccountIds.length > 0) {
-      // 找到所有匹配渠道类型的已绑定账户
+      // 找到所有匹配渠道类型的已绑定账户（24h 失败暂停中的账户不参与发送）
       const accountType = channelToAccountType[ch];
       for (const accountId of boundAccountIds) {
         const account = accountsMap.get(accountId);
-        if (account && account.type === accountType && account.is_active) {
+        if (account && account.type === accountType && account.is_active && !isAccountSuspended(account)) {
           const accountConfig = getChannelConfigFromAccount(account, ch);
           if (accountConfig) configs.push(accountConfig);
         }
       }
+    } else {
+      // 未显式绑定时，使用该渠道所有已启用的通知账号（与渠道测试页一致）。
+      // 档案路由存在时只在这些账户里选（eligibleAccounts），否则就是全部启用账户。
+      const accountType = channelToAccountType[ch];
+      if (accountType) {
+        for (const account of eligibleAccounts) {
+          if (account.type === accountType && account.is_active && !isAccountSuspended(account)) {
+            const accountConfig = getChannelConfigFromAccount(account, ch);
+            if (accountConfig) configs.push(accountConfig);
+          }
+        }
+      }
     }
     
-    // 如果没有绑定的账户配置，使用全局配置
+    // 最后回退 legacy user_configs 全局字段
     if (configs.length === 0) {
       const globalConfig: any = {};
       switch (ch) {
@@ -437,12 +987,14 @@ export async function sendNotifications(event: any, userId: number, channels: st
           if (config?.slack_webhook) globalConfig.webhook = config.slack_webhook;
           break;
         case 'wechat':
+        case 'wxpusher':
           if (config?.wxpusher_app_token && config?.wxpusher_uid) {
             globalConfig.token = config.wxpusher_app_token;
             globalConfig.chat_id = config.wxpusher_uid;
           }
           break;
         case 'qq':
+        case 'qmsg':
           if (config?.qmsg_key) {
             globalConfig.token = config.qmsg_key;
             globalConfig.chat_id = config.qmsg_qq;
@@ -453,7 +1005,7 @@ export async function sendNotifications(event: any, userId: number, channels: st
           if (config?.resend_api_key) {
             globalConfig.apiKey = config.resend_api_key;
             // Get email addresses from notification_accounts
-            const emailAccounts = allAccounts.filter(a => (a.type === 'email' || a.type === 'resend') && a.is_active);
+            const emailAccounts = eligibleAccounts.filter(a => (a.type === 'email' || a.type === 'resend') && a.is_active);
             if (emailAccounts.length > 0) {
               globalConfig.emails = emailAccounts.map((a: any) => a.chat_id || a.name);
             } else if (config?.reminder_emails?.length > 0) {
@@ -461,6 +1013,10 @@ export async function sendNotifications(event: any, userId: number, channels: st
               globalConfig.emails = config.reminder_emails;
             }
           }
+          break;
+        case 'web_push':
+          // checkbox 84: per-user browser subscriptions, resolved above (not account-backed).
+          if (pushSubscriptions.length > 0) globalConfig.subscriptions = pushSubscriptions;
           break;
         default:
           if (genericWebhookChannels.has(ch) && channelWebhooks[ch]) {
@@ -479,7 +1035,18 @@ export async function sendNotifications(event: any, userId: number, channels: st
   }
   
   // 发送通知（每个渠道可能有多个账号配置，独立发送）
-  const channelResults: Record<string, { success: boolean; error?: string; accountId?: number }> = {};
+  const channelResults: ChannelResultMap = {};
+  // 每个被请求的渠道都必须出现在结果里：被 filterSupportedChannels 丢弃的报告 unsupported_channel，
+  // 没有任何配置解析出来的报告 no_configuration，而不是静默省略（复选框 12）。
+  for (const ch of droppedChannels) {
+    channelResults[ch] = { success: false, error: 'unsupported_channel' };
+  }
+  for (const ch of channels) {
+    if (!channelConfigsMap[ch] || channelConfigsMap[ch].length === 0) {
+      channelResults[ch] = { success: false, error: 'no_configuration' };
+    }
+  }
+  const channelSendMeta: Record<string, { recipients?: string[] }> = {};
   
   // Build account ID lookup for bound accounts
   const configToAccountId = new Map<any, number>();
@@ -504,12 +1071,13 @@ export async function sendNotifications(event: any, userId: number, channels: st
   const sendTasks: Array<{ channel: string; accountId?: number; promise: Promise<void> }> = channels.flatMap((ch) => {
     const configs = channelConfigsMap[ch];
     if (!configs || configs.length === 0) return [];
-    
-    return configs.map((chConfig) => ({
-      channel: ch,
-      accountId: configToAccountId.get(chConfig),
-      promise: (async () => {
+
+    return configs.map((chConfig) => {
+      const raw = (async () => {
         try {
+        if (!DISPATCHABLE_CHANNELS.has(ch)) {
+          throw new Error(`渠道 ${ch} 未注册主分发分支（DISPATCHABLE_CHANNELS）`);
+        }
         if (ch === 'feishu' && chConfig.webhook) await retryWithBackoff(() => sendFeishuNotification(mappedEvent, chConfig.webhook));
         else if (ch === 'wecom' && chConfig.webhook) await retryWithBackoff(() => sendWeComNotification(mappedEvent, chConfig.webhook));
         else if (ch === 'dingtalk' && chConfig.webhook && chConfig.secret)
@@ -520,89 +1088,100 @@ export async function sendNotifications(event: any, userId: number, channels: st
           await retryWithBackoff(() => sendDiscordNotification(mappedEvent, chConfig.webhook));
         else if (ch === 'slack' && chConfig.webhook)
           await retryWithBackoff(() => sendSlackNotification(mappedEvent, chConfig.webhook));
-        else if (ch === 'wechat' && chConfig.token && chConfig.chat_id)
+        else if (ch === 'googlechat' && chConfig.webhook)
+          await retryWithBackoff(() => sendGoogleChatNotification(mappedEvent, chConfig.webhook));
+        else if (ch === 'irc' && chConfig.webhook)
+          await retryWithBackoff(() => sendIRCNotification(mappedEvent, chConfig.webhook));
+        else if (ch === 'line' && chConfig.token && chConfig.chat_id)
+          await retryWithBackoff(() => sendLINENotification(mappedEvent, chConfig.token, chConfig.chat_id));
+        else if (ch === 'msteams' && chConfig.token && chConfig.chat_id)
+          await retryWithBackoff(() => sendMicrosoftTeamsNotification(mappedEvent, chConfig.token, chConfig.chat_id));
+        else if ((ch === 'wechat' || ch === 'wxpusher') && chConfig.token && chConfig.chat_id)
           await retryWithBackoff(() => sendWxPusherNotification(mappedEvent, chConfig.token, chConfig.chat_id));
-        else if (ch === 'qq' && chConfig.token)
+        else if ((ch === 'qq' || ch === 'qmsg') && chConfig.token)
           await retryWithBackoff(() => sendQmsgNotification(mappedEvent, chConfig.token, chConfig.chat_id));
         else if ((ch === 'email' || ch === 'resend') && chConfig.apiKey) {
-          // 为每个收件人单独发送邮件，应用不同的关系映射（per-recipient）
           const fromEmail = chConfig.fromEmail || 'TimeMark <noreply@timemark.app>';
-          
-          // 解析 reminderConfig（可能是 JSON 字符串）
-          let parsedReminderConfig: any = {};
-          try {
-            const rawConfig = event.reminder_config || event.reminderConfig;
-            if (rawConfig) {
-              parsedReminderConfig = typeof rawConfig === 'string' ? JSON.parse(rawConfig) : rawConfig;
-            }
-          } catch (e) {
-            console.error('[sendNotifications] Failed to parse reminder_config:', e);
-          }
-          
-          // 获取收件人邮箱：只使用事件级别的配置
-          let recipientEmails: string[] = [];
-          
-          // 1. 优先使用事件的 reminderRecipientEmail
-          if (event.reminder_recipient_email) {
-            recipientEmails = [event.reminder_recipient_email];
-          }
-          // 2. 其次使用 reminderConfig.emailRecipients
-          else if (parsedReminderConfig.emailRecipients?.length > 0) {
-            recipientEmails = parsedReminderConfig.emailRecipients;
-          }
-          
-          // 如果没有配置收件人邮箱，跳过此渠道
+          const recipientEmails = resolveRecipientEmails(event, chConfig, config);
+
           if (recipientEmails.length === 0) {
-            console.warn(`[sendNotifications] No recipient emails configured for event ${event.id}, skipping email channel`);
-            return;
+            throw new Error('未配置收件邮箱：请在事件、通知渠道或设置中填写默认邮箱');
           }
-          
-          console.log(`[sendNotifications] Sending email from ${fromEmail} to ${recipientEmails.length} recipients...`);
-          const results = await Promise.allSettled(recipientEmails.map(async (email: string) => {
+
+          const todayKey = new Date().toISOString().slice(0, 10);
+          const minuteKey = new Date().toISOString().slice(0, 16);
+
+          for (const email of recipientEmails) {
             const emailMappedEvent = {
-              ...event,
-              name: applyRelationshipMapping(event.name, mappings, email)
+              ...mappedEvent,
+              name: applyRelationshipMapping(event.name, mappings, email),
             };
-            console.log(`[sendNotifications] Sending to ${email}...`);
+            const idempotencyKey = `reminder-${event.id}-${todayKey}-${userId}-${minuteKey}-${email}`;
             try {
               await retryWithBackoff(() => sendEmailNotification(
                 emailMappedEvent,
                 chConfig.apiKey,
                 fromEmail,
-                email
+                email,
+                idempotencyKey,
+                { markdownTemplate: config?.markdown_email_template, templateStyle: config?.email_template_style },
               ));
-              console.log(`[sendNotifications] ✅ Email sent to ${email}`);
+              await logEmail({
+                userId,
+                eventId: event.id ? Number(event.id) : null,
+                recipient: email,
+                status: 'sent',
+                subject: emailMappedEvent.name,
+                channelType: ch,
+              });
             } catch (error) {
-              console.error(`[sendNotifications] ❌ Failed to send email to ${email}:`, error);
+              const errMsg = error instanceof Error ? error.message : String(error);
+              await logEmail({
+                userId,
+                eventId: event.id ? Number(event.id) : null,
+                recipient: email,
+                status: 'failed',
+                subject: emailMappedEvent.name,
+                errorMessage: errMsg,
+                channelType: ch,
+              });
               throw error;
             }
-          }));
-          // Log any failures
-          const failures = results.filter(r => r.status === 'rejected');
-          if (failures.length > 0) {
-            console.error(`[sendNotifications] ${failures.length} email(s) failed to send`);
           }
+          channelSendMeta[ch] = { recipients: recipientEmails };
         }
         else if (ch === 'smtp' && chConfig.webhook && chConfig.token && chConfig.chat_id) {
           const smtpHost = chConfig.webhook;
           const smtpPort = parseInt(chConfig.secret || '587', 10);
           const password = chConfig.token;
           const fromEmail = chConfig.chat_id;
-          
-          // 获取收件人邮箱：优先使用事件级别的配置
-          let smtpRecipients: string[] = [];
-          if (event.reminder_recipient_email) {
-            smtpRecipients = [event.reminder_recipient_email];
-          } else if (event.reminderConfig?.emailRecipients?.length > 0) {
-            smtpRecipients = event.reminderConfig.emailRecipients;
-          } else {
-            smtpRecipients = [fromEmail]; // 回退到发件人邮箱
+          const smtpRecipients = resolveRecipientEmails(event, chConfig, config);
+          if (smtpRecipients.length === 0) {
+            throw new Error('未配置 SMTP 收件邮箱：请在事件或设置中填写提醒邮箱');
           }
-          
           for (const recipient of smtpRecipients) {
-            await retryWithBackoff(() => sendSmtpNotification(mappedEvent, smtpHost, smtpPort, password, fromEmail, recipient));
+            const emailMappedEvent = {
+              ...mappedEvent,
+              name: applyRelationshipMapping(event.name, mappings, recipient),
+            };
+            await retryWithBackoff(() => sendSmtpNotification(
+              emailMappedEvent,
+              smtpHost,
+              smtpPort,
+              password,
+              fromEmail,
+              recipient,
+              { markdownTemplate: config?.markdown_email_template, templateStyle: config?.email_template_style },
+            ));
           }
+          channelSendMeta[ch] = { recipients: smtpRecipients };
         }
+        else if (ch === 'generic_webhook' && chConfig.webhook)
+          await retryWithBackoff(() => sendGenericWebhookNotification(mappedEvent, chConfig.webhook, ch));
+        else if (ch === 'synologychat' && chConfig.webhook)
+          await retryWithBackoff(() => sendSynologyChatNotification(mappedEvent, chConfig.webhook));
+        else if (ch === 'twitch' && chConfig.webhook)
+          await retryWithBackoff(() => sendTwitchNotification(mappedEvent, chConfig.webhook));
         else if (genericWebhookChannels.has(ch) && chConfig.webhook)
           await retryWithBackoff(() => sendGenericWebhookNotification(mappedEvent, chConfig.webhook, ch));
         // Token-based channels with dedicated APIs
@@ -626,77 +1205,142 @@ export async function sendNotifications(event: any, userId: number, channels: st
           await retryWithBackoff(() => sendMeowNotification(mappedEvent, chConfig.token));
         else if (ch === 'pushme' && chConfig.token)
           await retryWithBackoff(() => sendPushMeNotification(mappedEvent, chConfig.token));
+        else if (ch === 'pushdeer' && chConfig.token)
+          await retryWithBackoff(() => sendPushDeerNotification(mappedEvent, chConfig.token, chConfig.webhook));
+        else if (ch === 'twilio' && chConfig.token && chConfig.secret && chConfig.webhook && chConfig.chat_id)
+          await retryWithBackoff(() => sendTwilioSmsNotification(
+            mappedEvent, chConfig.token, chConfig.secret, chConfig.webhook, chConfig.chat_id,
+          ));
         else if (ch === 'wecomapp' && chConfig.token && chConfig.secret && chConfig.chat_id && chConfig.webhook)
           await retryWithBackoff(() => sendWeComAppNotification(mappedEvent, chConfig.token, chConfig.secret, chConfig.chat_id, chConfig.webhook));
         // Ntfy, Pushover, Apprise
         else if (ch === 'ntfy' && chConfig.webhook && chConfig.token)
           await retryWithBackoff(() => sendNtfyNotification(mappedEvent, chConfig.webhook, chConfig.token));
         else if (ch === 'pushover' && chConfig.token && chConfig.secret)
-          await retryWithBackoff(() => sendPushoverNotification(mappedEvent, chConfig.token, chConfig.secret));
+          await retryWithBackoff(() => sendPushoverNotification(mappedEvent, chConfig.token, chConfig.secret, chConfig.priority));
         else if (ch === 'apprise' && chConfig.webhook)
           await retryWithBackoff(() => sendAppriseNotification(mappedEvent, chConfig.webhook, chConfig.token));
-        // Plugin-based channels
-        else if (ch === 'wechat_personal' && chConfig.sessionData) {
-          const toUser = chConfig.toUser || mappedEvent.personName || 'me';
-          await retryWithBackoff(() => sendWechatNotification(mappedEvent, chConfig.sessionData, toUser));
-        }
-        else if (ch === 'whatsapp' && chConfig.sessionData) {
-          const toUser = chConfig.toUser || mappedEvent.personName || '';
-          await retryWithBackoff(() => sendWhatsappNotification(mappedEvent, chConfig.sessionData, toUser));
-        }
-        else if (ch === 'qq_bot' && chConfig.sessionData) {
-          const toUser = chConfig.toUser || mappedEvent.personName || '';
-          await retryWithBackoff(() => sendQQNotification(mappedEvent, chConfig.sessionData, toUser));
-        }
-        else if (ch === 'signal' && chConfig.sessionData) {
-          const toUser = chConfig.toUser || mappedEvent.personName || '';
-          await retryWithBackoff(() => sendSignalNotification(mappedEvent, chConfig.sessionData, toUser));
-        }
-        else if (ch === 'zalo' && chConfig.sessionData) {
-          const toUser = chConfig.toUser || mappedEvent.personName || '';
-          await retryWithBackoff(() => sendZaloNotification(mappedEvent, chConfig.sessionData, toUser));
-        }
-        else if (ch === 'imessage' && chConfig.webhook && chConfig.token && chConfig.chat_id) {
-          // iMessage via BlueBubbles
-          const sessionData = {
-            serverUrl: chConfig.webhook,
-            password: chConfig.token,
-            sessionId: 'direct'
-          };
-          await retryWithBackoff(() => sendBlueBubblesNotification(mappedEvent, sessionData, chConfig.chat_id));
-        }
-        else if (ch === 'clawbot' && chConfig.sessionData) {
-          const sessionObj = typeof chConfig.sessionData === 'string'
-            ? JSON.parse(chConfig.sessionData)
-            : chConfig.sessionData;
-          const botToken = sessionObj.bot_token;
-          const baseUrl = sessionObj.baseUrl || 'https://ilinkai.weixin.qq.com';
-          const toUser = chConfig.toUser || '';
-          if (botToken && toUser) {
-            await retryWithBackoff(() => sendClawBotNotification(mappedEvent, botToken, toUser, baseUrl));
+        // Wave 2 channels (checkboxes 15-22)
+        else if (ch === 'serverchan3' && chConfig.token)
+          await retryWithBackoff(() => sendServerChan3Notification(mappedEvent, chConfig.token, chConfig.webhook));
+        else if (ch === 'xizhi' && chConfig.token)
+          await retryWithBackoff(() => sendXizhiNotification(mappedEvent, chConfig.token));
+        else if (ch === 'anpush' && chConfig.token)
+          await retryWithBackoff(() => sendAnPushNotification(mappedEvent, chConfig.token, chConfig.chat_id));
+        else if (ch === 'chanify' && chConfig.token)
+          await retryWithBackoff(() => sendChanifyNotification(mappedEvent, chConfig.webhook, chConfig.token));
+        else if (ch === 'pushback' && chConfig.token && chConfig.chat_id)
+          await retryWithBackoff(() => sendPushbackNotification(mappedEvent, chConfig.token, chConfig.chat_id));
+        else if (ch === 'simplepush' && chConfig.token)
+          await retryWithBackoff(() => sendSimplePushNotification(mappedEvent, chConfig.token));
+        else if (ch === 'zulip' && chConfig.webhook && chConfig.token && chConfig.chat_id && chConfig.secret)
+          await retryWithBackoff(() => sendZulipNotification(mappedEvent, chConfig.webhook, chConfig.token, chConfig.chat_id, chConfig.secret));
+        else if (ch === 'rocketchat' && chConfig.webhook)
+          await retryWithBackoff(() => sendRocketChatNotification(mappedEvent, chConfig.webhook));
+        else if (ch === 'fcm' && chConfig.token && chConfig.chat_id)
+          await retryWithBackoff(() => sendFcmNotification(mappedEvent, chConfig.token, chConfig.chat_id));
+        else if (ch === 'twilio_whatsapp' && chConfig.token && chConfig.secret && chConfig.webhook && chConfig.chat_id)
+          await retryWithBackoff(() => sendTwilioWhatsAppNotification(
+            mappedEvent, chConfig.token, chConfig.secret, chConfig.webhook, chConfig.chat_id,
+          ));
+        // v78 batch 3: WhatsApp Cloud API / Kook / Fanbook / Home Assistant
+        else if (ch === 'whatsapp_cloud' && chConfig.token && chConfig.secret && chConfig.chat_id)
+          await retryWithBackoff(() => sendWhatsAppCloudNotification(
+            mappedEvent, chConfig.token, chConfig.secret, chConfig.chat_id,
+          ));
+        else if (ch === 'kook' && chConfig.webhook)
+          await retryWithBackoff(() => sendKookNotification(mappedEvent, chConfig.webhook));
+        else if (ch === 'fanbook' && chConfig.webhook)
+          await retryWithBackoff(() => sendFanbookNotification(mappedEvent, chConfig.webhook));
+        else if (ch === 'homeassistant' && chConfig.webhook && chConfig.token && chConfig.chat_id)
+          await retryWithBackoff(() => sendHomeAssistantNotification(
+            mappedEvent, chConfig.webhook, chConfig.token, chConfig.chat_id,
+          ));
+        // v2.28 batch: PushBullet / Join / PushSafer / Webex / Notifiarr
+        else if (ch === 'pushbullet' && chConfig.token)
+          await retryWithBackoff(() => sendPushBulletNotification(mappedEvent, chConfig.token));
+        else if (ch === 'join' && chConfig.token)
+          await retryWithBackoff(() => sendJoinNotification(mappedEvent, chConfig.token, chConfig.chat_id));
+        else if (ch === 'pushsafer' && chConfig.token)
+          await retryWithBackoff(() => sendPushSaferNotification(mappedEvent, chConfig.token));
+        else if (ch === 'webex' && chConfig.webhook)
+          await retryWithBackoff(() => sendWebexNotification(mappedEvent, chConfig.webhook));
+        else if (ch === 'notifiarr' && chConfig.webhook)
+          await retryWithBackoff(() => sendNotifiarrNotification(mappedEvent, chConfig.webhook));
+        // v2.29 batch (wave4)
+        else if (ch === 'guilded' && chConfig.webhook)
+          await retryWithBackoff(() => sendGuildedNotification(mappedEvent, chConfig.webhook));
+        else if (ch === 'ifttt' && chConfig.token && chConfig.webhook)
+          await retryWithBackoff(() => sendIftttNotification(mappedEvent, chConfig.token, chConfig.webhook));
+        else if (ch === 'revolt' && chConfig.token && chConfig.chat_id)
+          await retryWithBackoff(() => sendRevoltNotification(mappedEvent, chConfig.token, chConfig.chat_id));
+        else if (ch === 'onesignal' && chConfig.token && chConfig.secret)
+          await retryWithBackoff(() => sendOneSignalNotification(mappedEvent, chConfig.token, chConfig.secret, chConfig.chat_id));
+        else if (ch === 'sendgrid' && chConfig.token && chConfig.secret && chConfig.chat_id)
+          await retryWithBackoff(() => sendSendgridNotification(mappedEvent, chConfig.token, chConfig.secret, chConfig.chat_id));
+        else if (ch === 'mailgun' && chConfig.token && chConfig.webhook && chConfig.chat_id)
+          await retryWithBackoff(() => sendMailgunNotification(mappedEvent, chConfig.token, chConfig.webhook, chConfig.chat_id));
+        else if (ch === 'vonage_sms' && chConfig.token && chConfig.secret && chConfig.chat_id)
+          await retryWithBackoff(() => sendVonageSmsNotification(mappedEvent, chConfig.token, chConfig.secret, chConfig.chat_id));
+        else if (ch === 'messagebird' && chConfig.token && chConfig.chat_id)
+          await retryWithBackoff(() => sendMessagebirdNotification(mappedEvent, chConfig.token, chConfig.chat_id));
+        else if (ch === 'alertzy' && chConfig.token)
+          await retryWithBackoff(() => sendAlertzyNotification(mappedEvent, chConfig.token));
+        else if (ch === 'awtrix' && chConfig.webhook)
+          await retryWithBackoff(() => sendAwtrixNotification(mappedEvent, chConfig.webhook));
+        // Browser Web Push (checkbox 84): VAPID, per-user subscriptions.
+        else if (ch === 'web_push' && chConfig.subscriptions) {
+          const delivery = await deliverWebPush(chConfig.subscriptions, buildWebPushPayload(mappedEvent), userId);
+          // 404/410 endpoints were already deleted inside deliverWebPush and are NOT failures —
+          // only transient errors throw, so the retry queue never loops on a dead subscription.
+          if (delivery.failed.length > 0) {
+            throw new Error(`Web Push 发送失败：${delivery.failed[0]?.error ?? 'unknown error'}`);
           }
         }
+        else {
+          throw new Error(`渠道 ${ch} 配置不完整，无法发送`);
+        }
       } catch (e) {
-        console.error(`Failed ${ch}:`, e);
+        log.warn({ event: 'notification.channel_send_failed', channel: ch, err: e }, `Channel ${ch} send failed`);
         throw e;
       }
-      })(),
-    }));
+      })();
+      // v2.30 硬化：生产实测出过一次 fromPromise unhandledRejection 击穿进程
+      // （SMTP 无收件人 throw；理论上 mapWithConcurrency 会同步接上处理器，
+      // 但任何微妙的时序都不该让进程死掉）。shadow no-op catch 让 raw 永远
+      // "已处理"；拒绝语义仍由 raw 本身原样传给并发消费方。
+      void raw.catch(() => undefined);
+      return { channel: ch, accountId: configToAccountId.get(chConfig), promise: raw };
+    });
   });
   
-  const settled = await Promise.allSettled(sendTasks.map(t => t.promise));
-  
-  for (let i = 0; i < settled.length; i++) {
-    const result = settled[i];
-    const task = sendTasks[i];
+  // B23: 渠道发送并发限制 5
+  const settled = await mapWithConcurrency(sendTasks, 5, async (task) => {
+    try {
+      await task.promise;
+      return { task, status: 'fulfilled' as const };
+    } catch (reason) {
+      return { task, status: 'rejected' as const, reason };
+    }
+  });
+
+  for (const result of settled) {
+    const task = result.task;
     const ch = task.channel;
     if (result.status === 'fulfilled') {
-      channelResults[ch] = { success: true, accountId: task.accountId };
-      // Reset consecutive failure count on success
+      const meta = channelSendMeta[ch];
+      channelResults[ch] = {
+        success: true,
+        accountId: task.accountId,
+        ...(meta?.recipients?.length ? { recipients: meta.recipients } : {}),
+      };
+      // Reset consecutive failure count AND clear any 24h failure suspension on success
       if (task.accountId) {
         try {
           await query(
-            `UPDATE notification_accounts SET updated_at = datetime('now') WHERE id = ?`,
+            `UPDATE notification_accounts
+             SET updated_at = CURRENT_TIMESTAMP, suspended_until = NULL
+             WHERE id = $1`,
             [task.accountId]
           );
         } catch { /* ignore */ }
@@ -704,29 +1348,54 @@ export async function sendNotifications(event: any, userId: number, channels: st
     } else {
       const errMsg = result.reason instanceof Error ? result.reason.message : String(result.reason);
       channelResults[ch] = { success: false, error: errMsg, accountId: task.accountId };
-      // Track consecutive failures and auto-disable after 3
       if (task.accountId) {
         await trackConsecutiveFailure(task.accountId, ch, errMsg);
+      }
+      if (event.id) {
+        // Durable write (checkbox 116): the retry row must survive the response, so
+        // it is awaited here — never routed through writeAfterResponse(), which is a
+        // bounded best-effort slot for non-durable work only. A failure is logged,
+        // never rethrown: the send result map is returned regardless of whether the
+        // retry row can be persisted.
+        try {
+          await enqueueNotificationRetry({
+            eventId: Number(event.id),
+            userId,
+            channel: ch,
+            accountId: task.accountId,
+            errorMessage: errMsg,
+          });
+        } catch (retryError) {
+          log.warn(
+            { event: 'notification.retry_enqueue_failed', channel: ch, err: retryError },
+            `Failed to enqueue retry for ${ch}`,
+          );
+        }
       }
     }
   }
   
   // Channel fallback: when primary channel fails, try other active accounts (max 2 fallback attempts)
-  const failedChannels = Object.entries(channelResults).filter(([, r]) => !r.success);
-  if (failedChannels.length > 0 && allAccounts.length > 1) {
+  // 'no_configuration' / 'unsupported_channel' are capability mistakes, not send failures:
+  // they must not trigger fallback sends nor consecutive-failure tracking.
+  const failedChannels = Object.entries(channelResults).filter(
+    ([, r]) => !r.success && r.error !== 'no_configuration' && r.error !== 'unsupported_channel',
+  );
+  if (failedChannels.length > 0 && eligibleAccounts.length > 1 && config?.fallback_enabled !== false) {
     // Collect account IDs already tried
     const triedAccountIds = new Set<number>();
     for (const task of sendTasks) {
       if (task.accountId) triedAccountIds.add(task.accountId);
     }
     
-    // Find other active accounts not already tried
-    const fallbackCandidates = allAccounts.filter(
-      a => a.is_active && !triedAccountIds.has(a.id)
+    // Find other active accounts not already tried (within the profile's routing, if any)
+    const fallbackCandidates = eligibleAccounts.filter(
+      a => a.is_active && !isAccountSuspended(a) && !triedAccountIds.has(a.id)
     );
-    
+
     let fallbackAttempts = 0;
-    const maxFallbacks = 2;
+    // 单用户应用：把每个未尝试过的账户类型都试一遍（上限 6），而不是只试 2 个。
+    const maxFallbacks = 6;
     
     for (const [failedCh] of failedChannels) {
       if (fallbackAttempts >= maxFallbacks) break;
@@ -750,7 +1419,7 @@ export async function sendNotifications(event: any, userId: number, channels: st
         
         try {
           await retryWithBackoff(async () => {
-            await sendSingleChannel(candidateChannel, fallbackConfig, mappedEvent);
+            await sendSingleChannel(candidateChannel, fallbackConfig, mappedEvent, event, config);
           }, 2, 500); // Fewer retries for fallback
           
           channelResults[candidateChannel] = { success: true, accountId: candidate.id };
@@ -758,13 +1427,39 @@ export async function sendNotifications(event: any, userId: number, channels: st
           break; // One successful fallback is enough for this failed channel
         } catch (fallbackErr) {
           const fbErrMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-          console.error(`[Fallback] ${candidateChannel} (account ${candidate.id}) also failed: ${fbErrMsg}`);
-          channelResults[`${candidateChannel}_fallback`] = { success: false, error: fbErrMsg, accountId: candidate.id };
+          log.warn(
+            { event: 'notification.fallback_failed', channel: candidateChannel, accountId: candidate.id, err: fallbackErr },
+            `Fallback ${candidateChannel} (account ${candidate.id}) also failed`,
+          );
+          // `_` 前缀 = 内部标记键：readDelivery 会剔除，不会把回退尝试当成一个真实失败渠道
+          // 混进「部分失败」展示（旧键 `resend_fallback` 会被当成渠道名）。
+          channelResults[`_fallback_${candidateChannel}`] = { success: false, error: fbErrMsg, accountId: candidate.id };
         }
       }
     }
   }
-  
+
+  const successfulChannels = Object.entries(channelResults)
+    .filter(([key, r]) => r.success && !key.startsWith('_'))
+    .map(([ch]) => ch);
+  if (successfulChannels.length > 0) {
+    // C13: 出站 webhook
+    if (config?.outbound_webhook_url) {
+      // Best-effort egress (checkbox 116): outbound webhook delivery is non-durable,
+      // so it rides writeAfterResponse's bounded, logged budget instead of holding
+      // the response open — and must not affect the returned channel result map.
+      writeAfterResponse(
+        () =>
+          sendGenericWebhookNotification(
+            { ...mappedEvent, triggerChannels: successfulChannels },
+            config.outbound_webhook_url,
+            'outbound',
+          ),
+        { label: 'notification.outbound_webhook', mutatesDurableState: false },
+      );
+    }
+  }
+
   return channelResults;
 }
 
@@ -772,7 +1467,10 @@ export async function sendNotifications(event: any, userId: number, channels: st
  * Send a notification through a single channel with given config.
  * Used by fallback logic to dispatch to the correct channel handler.
  */
-async function sendSingleChannel(ch: string, chConfig: any, mappedEvent: any): Promise<void> {
+async function sendSingleChannel(ch: string, chConfig: any, mappedEvent: any, event: any, config: any): Promise<void> {
+  if (!FALLBACK_DISPATCHABLE_CHANNELS.has(ch)) {
+    throw new Error(`No dispatch branch for fallback channel ${ch}`);
+  }
   if (ch === 'feishu' && chConfig.webhook) await sendFeishuNotification(mappedEvent, chConfig.webhook);
   else if (ch === 'wecom' && chConfig.webhook) await sendWeComNotification(mappedEvent, chConfig.webhook);
   else if (ch === 'dingtalk' && chConfig.webhook && chConfig.secret)
@@ -781,9 +1479,39 @@ async function sendSingleChannel(ch: string, chConfig: any, mappedEvent: any): P
     await sendTelegramNotification(mappedEvent, chConfig.token, chConfig.chat_id);
   else if (ch === 'discord' && chConfig.webhook) await sendDiscordNotification(mappedEvent, chConfig.webhook);
   else if (ch === 'slack' && chConfig.webhook) await sendSlackNotification(mappedEvent, chConfig.webhook);
-  else if (ch === 'wechat' && chConfig.token && chConfig.chat_id)
+  else if (ch === 'googlechat' && chConfig.webhook) await sendGoogleChatNotification(mappedEvent, chConfig.webhook);
+  else if (ch === 'irc' && chConfig.webhook) await sendIRCNotification(mappedEvent, chConfig.webhook);
+  else if (ch === 'line' && chConfig.token && chConfig.chat_id)
+    await sendLINENotification(mappedEvent, chConfig.token, chConfig.chat_id);
+  else if (ch === 'msteams' && chConfig.token && chConfig.chat_id)
+    await sendMicrosoftTeamsNotification(mappedEvent, chConfig.token, chConfig.chat_id);
+  else if ((ch === 'wechat' || ch === 'wxpusher') && chConfig.token && chConfig.chat_id)
     await sendWxPusherNotification(mappedEvent, chConfig.token, chConfig.chat_id);
-  else if (ch === 'qq' && chConfig.token) await sendQmsgNotification(mappedEvent, chConfig.token, chConfig.chat_id);
+  else if ((ch === 'qq' || ch === 'qmsg') && chConfig.token) await sendQmsgNotification(mappedEvent, chConfig.token, chConfig.chat_id);
+  // Email-family channels: the fallback chain must cover them too (channel-integrity invariant).
+  // Recipients resolve exactly like the main chain so a failed primary can fall back to email.
+  else if ((ch === 'email' || ch === 'resend') && chConfig.apiKey) {
+    const fromEmail = chConfig.fromEmail || 'TimeMark <noreply@timemark.app>';
+    const recipientEmails = resolveRecipientEmails(event, chConfig, config);
+    if (recipientEmails.length === 0) {
+      throw new Error('未配置收件邮箱：请在事件、通知渠道或设置中填写默认邮箱');
+    }
+    for (const recipient of recipientEmails) {
+      await sendEmailNotification(mappedEvent, chConfig.apiKey, fromEmail, recipient, undefined, {
+        templateStyle: config?.email_template_style,
+      });
+    }
+  }
+  else if (ch === 'smtp' && chConfig.webhook && chConfig.token && chConfig.chat_id) {
+    const smtpRecipients = resolveRecipientEmails(event, chConfig, config);
+    if (smtpRecipients.length === 0) {
+      throw new Error('未配置 SMTP 收件邮箱：请在事件或设置中填写提醒邮箱');
+    }
+    const smtpPort = parseInt(chConfig.secret || '587', 10);
+    for (const recipient of smtpRecipients) {
+      await sendSmtpNotification(mappedEvent, chConfig.webhook, smtpPort, chConfig.token, chConfig.chat_id, recipient, { templateStyle: config?.email_template_style });
+    }
+  }
   else if (ch === 'serverchan' && chConfig.token) await sendServerChanNotification(mappedEvent, chConfig.token);
   else if (ch === 'pushplus' && chConfig.token) await sendPushPlusNotification(mappedEvent, chConfig.token, chConfig.chat_id);
   else if (ch === 'bark' && chConfig.webhook && chConfig.token)
@@ -792,6 +1520,9 @@ async function sendSingleChannel(ch: string, chConfig: any, mappedEvent: any): P
     await sendGotifyNotification(mappedEvent, chConfig.webhook, chConfig.token, chConfig.chat_id ? Number(chConfig.chat_id) : 5);
   else if (ch === 'meow' && chConfig.token) await sendMeowNotification(mappedEvent, chConfig.token);
   else if (ch === 'pushme' && chConfig.token) await sendPushMeNotification(mappedEvent, chConfig.token);
+  else if (ch === 'pushdeer' && chConfig.token) await sendPushDeerNotification(mappedEvent, chConfig.token, chConfig.webhook);
+  else if (ch === 'twilio' && chConfig.token && chConfig.secret && chConfig.webhook && chConfig.chat_id)
+    await sendTwilioSmsNotification(mappedEvent, chConfig.token, chConfig.secret, chConfig.webhook, chConfig.chat_id);
   else if (ch === 'wecomapp' && chConfig.token && chConfig.secret && chConfig.chat_id && chConfig.webhook)
     await sendWeComAppNotification(mappedEvent, chConfig.token, chConfig.secret, chConfig.chat_id, chConfig.webhook);
   else if (ch === 'ntfy' && chConfig.webhook && chConfig.token)
@@ -800,6 +1531,71 @@ async function sendSingleChannel(ch: string, chConfig: any, mappedEvent: any): P
     await sendPushoverNotification(mappedEvent, chConfig.token, chConfig.secret);
   else if (ch === 'apprise' && chConfig.webhook)
     await sendAppriseNotification(mappedEvent, chConfig.webhook, chConfig.token);
+  // Wave 2 channels (checkboxes 15-22)
+  else if (ch === 'serverchan3' && chConfig.token)
+    await sendServerChan3Notification(mappedEvent, chConfig.token, chConfig.webhook);
+  else if (ch === 'xizhi' && chConfig.token) await sendXizhiNotification(mappedEvent, chConfig.token);
+  else if (ch === 'anpush' && chConfig.token)
+    await sendAnPushNotification(mappedEvent, chConfig.token, chConfig.chat_id);
+  else if (ch === 'chanify' && chConfig.token)
+    await sendChanifyNotification(mappedEvent, chConfig.webhook, chConfig.token);
+  else if (ch === 'pushback' && chConfig.token && chConfig.chat_id)
+    await sendPushbackNotification(mappedEvent, chConfig.token, chConfig.chat_id);
+  else if (ch === 'simplepush' && chConfig.token) await sendSimplePushNotification(mappedEvent, chConfig.token);
+  else if (ch === 'zulip' && chConfig.webhook && chConfig.token && chConfig.chat_id && chConfig.secret)
+    await sendZulipNotification(mappedEvent, chConfig.webhook, chConfig.token, chConfig.chat_id, chConfig.secret);
+  else if (ch === 'rocketchat' && chConfig.webhook) await sendRocketChatNotification(mappedEvent, chConfig.webhook);
+  else if (ch === 'fcm' && chConfig.token && chConfig.chat_id)
+    await sendFcmNotification(mappedEvent, chConfig.token, chConfig.chat_id);
+  else if (ch === 'twilio_whatsapp' && chConfig.token && chConfig.secret && chConfig.webhook && chConfig.chat_id)
+    await sendTwilioWhatsAppNotification(mappedEvent, chConfig.token, chConfig.secret, chConfig.webhook, chConfig.chat_id);
+  // v78 batch 3: WhatsApp Cloud API / Kook / Fanbook / Home Assistant
+  else if (ch === 'whatsapp_cloud' && chConfig.token && chConfig.secret && chConfig.chat_id)
+    await sendWhatsAppCloudNotification(mappedEvent, chConfig.token, chConfig.secret, chConfig.chat_id);
+  else if (ch === 'kook' && chConfig.webhook)
+    await sendKookNotification(mappedEvent, chConfig.webhook);
+  else if (ch === 'fanbook' && chConfig.webhook)
+    await sendFanbookNotification(mappedEvent, chConfig.webhook);
+  else if (ch === 'homeassistant' && chConfig.webhook && chConfig.token && chConfig.chat_id)
+    await sendHomeAssistantNotification(mappedEvent, chConfig.webhook, chConfig.token, chConfig.chat_id);
+  // v2.28 batch: PushBullet / Join / PushSafer / Webex / Notifiarr
+  else if (ch === 'pushbullet' && chConfig.token)
+    await sendPushBulletNotification(mappedEvent, chConfig.token);
+  else if (ch === 'join' && chConfig.token)
+    await sendJoinNotification(mappedEvent, chConfig.token, chConfig.chat_id);
+  else if (ch === 'pushsafer' && chConfig.token)
+    await sendPushSaferNotification(mappedEvent, chConfig.token);
+  else if (ch === 'webex' && chConfig.webhook)
+    await sendWebexNotification(mappedEvent, chConfig.webhook);
+  else if (ch === 'notifiarr' && chConfig.webhook)
+    await sendNotifiarrNotification(mappedEvent, chConfig.webhook);
+  // v2.29 batch (wave4)
+  else if (ch === 'guilded' && chConfig.webhook)
+    await sendGuildedNotification(mappedEvent, chConfig.webhook);
+  else if (ch === 'ifttt' && chConfig.token && chConfig.webhook)
+    await sendIftttNotification(mappedEvent, chConfig.token, chConfig.webhook);
+  else if (ch === 'revolt' && chConfig.token && chConfig.chat_id)
+    await sendRevoltNotification(mappedEvent, chConfig.token, chConfig.chat_id);
+  else if (ch === 'onesignal' && chConfig.token && chConfig.secret)
+    await sendOneSignalNotification(mappedEvent, chConfig.token, chConfig.secret, chConfig.chat_id);
+  else if (ch === 'sendgrid' && chConfig.token && chConfig.secret && chConfig.chat_id)
+    await sendSendgridNotification(mappedEvent, chConfig.token, chConfig.secret, chConfig.chat_id);
+  else if (ch === 'mailgun' && chConfig.token && chConfig.webhook && chConfig.chat_id)
+    await sendMailgunNotification(mappedEvent, chConfig.token, chConfig.webhook, chConfig.chat_id);
+  else if (ch === 'vonage_sms' && chConfig.token && chConfig.secret && chConfig.chat_id)
+    await sendVonageSmsNotification(mappedEvent, chConfig.token, chConfig.secret, chConfig.chat_id);
+  else if (ch === 'messagebird' && chConfig.token && chConfig.chat_id)
+    await sendMessagebirdNotification(mappedEvent, chConfig.token, chConfig.chat_id);
+  else if (ch === 'alertzy' && chConfig.token)
+    await sendAlertzyNotification(mappedEvent, chConfig.token);
+  else if (ch === 'awtrix' && chConfig.webhook)
+    await sendAwtrixNotification(mappedEvent, chConfig.webhook);
+  else if (ch === 'generic_webhook' && chConfig.webhook)
+    await sendGenericWebhookNotification(mappedEvent, chConfig.webhook, ch);
+  else if (ch === 'synologychat' && chConfig.webhook)
+    await sendSynologyChatNotification(mappedEvent, chConfig.webhook);
+  else if (ch === 'twitch' && chConfig.webhook)
+    await sendTwitchNotification(mappedEvent, chConfig.webhook);
   else if (genericWebhookChannels.has(ch) && chConfig.webhook)
     await sendGenericWebhookNotification(mappedEvent, chConfig.webhook, ch);
   else throw new Error(`No valid config for channel ${ch}`);
@@ -807,30 +1603,74 @@ async function sendSingleChannel(ch: string, chConfig: any, mappedEvent: any): P
 
 /**
  * Track consecutive failures for a notification account.
- * After 3 consecutive failures, auto-disable the account.
+ *
+ * After 3 consecutive failures the account is SUSPENDED for 24h instead of being
+ * hard-disabled. The old `is_active = FALSE` silently removed the channel from every
+ * resolver and the user's reminders just stopped arriving with no trace in the UI.
+ * A suspension auto-expires, is cleared by a successful send / channel test / manual
+ * retry, and shows up in the channels page.
  */
-async function trackConsecutiveFailure(accountId: number, channelType: string, errorMsg: string): Promise<void> {
+async function trackConsecutiveFailure(accountId: number, channelType: string, _errorMsg: string): Promise<void> {
   try {
     // Count recent consecutive failures for this account
     const result = await query(
-      `SELECT COUNT(*) as fail_count FROM event_trigger_logs 
-       WHERE account_id = ? AND channel_type = ? AND status = 'failed'
+      `SELECT COUNT(*) as fail_count FROM event_trigger_logs
+       WHERE account_id = $1 AND channel_type = $2 AND status = 'failed'
        AND id > COALESCE(
-         (SELECT MAX(id) FROM event_trigger_logs WHERE account_id = ? AND channel_type = ? AND status = 'success'),
+         (SELECT MAX(id) FROM event_trigger_logs WHERE account_id = $3 AND channel_type = $4 AND status = 'success'),
          0
        )`,
       [accountId, channelType, accountId, channelType]
     );
     const consecutiveFailures = (result.rows[0]?.fail_count || 0) + 1; // +1 for current failure
-    
+
     if (consecutiveFailures >= 3) {
-      await query(
-        `UPDATE notification_accounts SET is_active = 0, updated_at = datetime('now') WHERE id = ?`,
-        [accountId]
+      const current = await query(
+        'SELECT suspended_until FROM notification_accounts WHERE id = $1',
+        [accountId],
       );
-      console.log(`[Notifications] Channel ${channelType} (account ${accountId}) disabled after 3 consecutive failures`);
+      const alreadySuspended = !!(current.rows[0] as { suspended_until?: string | null } | undefined)?.suspended_until;
+      if (!alreadySuspended) {
+        await query(
+          `UPDATE notification_accounts
+           SET suspended_until = NOW() + INTERVAL '24 hours', updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1`,
+          [accountId],
+        );
+        log.warn(
+          { event: 'notification.account_suspended', accountId, channelType },
+          `Account ${accountId} (${channelType}) suspended for 24h after ${consecutiveFailures} consecutive failures`,
+        );
+      }
     }
   } catch (error) {
-    console.error('[Notifications] Failed to track consecutive failure:', error);
+    log.warn(
+      { event: 'notification.consecutive_failure_track_failed', accountId, channelType, err: error },
+      'Failed to track consecutive failure',
+    );
   }
 }
+
+/** True when the account is inside a 24h failure suspension (still is_active). */
+export function isAccountSuspended(account: { suspended_until?: string | Date | null } | undefined): boolean {
+  if (!account?.suspended_until) return false;
+  const until = new Date(account.suspended_until);
+  return Number.isFinite(until.getTime()) && until.getTime() > Date.now();
+}
+import {
+  sendPushBulletNotification,
+  sendJoinNotification,
+  sendPushSaferNotification,
+  sendWebexNotification,
+  sendNotifiarrNotification,
+  sendGuildedNotification,
+  sendIftttNotification,
+  sendRevoltNotification,
+  sendOneSignalNotification,
+  sendSendgridNotification,
+  sendMailgunNotification,
+  sendVonageSmsNotification,
+  sendMessagebirdNotification,
+  sendAlertzyNotification,
+  sendAwtrixNotification,
+} from './extended-channels.service.js';

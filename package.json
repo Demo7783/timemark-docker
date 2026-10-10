@@ -1,6 +1,6 @@
 {
   "name": "timemark-docker",
-  "version": "2.16.0",
+  "version": "2.30.0",
   "private": true,
   "workspaces": [
     "frontend",
@@ -14,6 +14,9 @@
     "build:frontend": "pnpm --filter frontend build",
     "build:backend": "pnpm --filter backend build",
     "build": "pnpm build:shared && pnpm build:frontend && pnpm build:backend"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0"
   },
   "packageManager": "pnpm@9.12.0",
   "engines": {

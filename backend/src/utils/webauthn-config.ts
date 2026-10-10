@@ -1,5 +1,5 @@
 import type { Context } from 'hono';
-import { getRequestOrigin } from './client-ip.js';
+import { CANONICAL_ORIGIN } from './allowed-origins.js';
 
 export interface WebAuthnRuntimeConfig {
   rpID: string;
@@ -8,10 +8,6 @@ export interface WebAuthnRuntimeConfig {
 }
 
 export function resolveRequestOrigin(c: Context): string {
-  // A fixed deployment origin takes precedence over request-controlled headers.
-  const configuredOrigin = process.env.WEBAUTHN_ORIGIN;
-  if (configuredOrigin) return configuredOrigin;
-
   const headerOrigin = c.req.header('Origin');
   if (headerOrigin) return headerOrigin;
 
@@ -24,7 +20,13 @@ export function resolveRequestOrigin(c: Context): string {
     }
   }
 
-  return getRequestOrigin(c);
+  const host = c.req.header('x-forwarded-host') || c.req.header('host');
+  if (host) {
+    const proto = c.req.header('x-forwarded-proto') || 'https';
+    return `${proto}://${host}`;
+  }
+
+  return process.env.WEBAUTHN_ORIGIN || CANONICAL_ORIGIN;
 }
 
 export function getWebAuthnConfig(c: Context): WebAuthnRuntimeConfig {

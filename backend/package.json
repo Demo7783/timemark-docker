@@ -1,6 +1,6 @@
 {
   "name": "@timemark/backend",
-  "version": "2.16.0",
+  "version": "2.30.0",
   "engines": {
     "node": ">=22"
   },
@@ -12,26 +12,30 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@hono/node-server": "^1.8.0",
+    "@hono/node-server": "^2.1.1",
+    "@pdf-lib/fontkit": "1.1.1",
+    "@vercel/blob": "^2.8.0",
+    "@vercel/functions": "^3.9.9",
+    "@simplewebauthn/server": "^13.3.2",
     "@tencent-weixin/openclaw-weixin": "^1.0.0",
     "@timemark/shared": "workspace:*",
-    "axios": "^1.6.7",
+    "axios": "^1.20.0",
     "bcryptjs": "^2.4.3",
     "croner": "^9.0.0",
     "dotenv": "^16.4.5",
-    "hono": "^4.0.0",
+    "hono": "^4.13.9",
     "ics": "^3.12.0",
     "lunar-javascript": "^1.7.7",
-    "nodemailer": "^8.0.6",
+    "nodemailer": "^10.0.10",
     "nostr-tools": "^2.10.4",
     "otplib": "^12.0.1",
+    "pdf-lib": "1.17.1",
     "pino": "^10.3.1",
     "qrcode": "^1.5.3",
-    "resend": "^3.2.0",
+    "resend": "^6.30.0",
     "sql.js": "^1.11.0",
     "web-push": "^3.6.7",
-    "@simplewebauthn/server": "^13.3.2",
-    "zod": "^3.22.4"
+    "zod": "^4.6.5"
   },
   "optionalDependencies": {
     "baileys": "^6.10.0",
@@ -40,13 +44,13 @@
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
-    "@types/node": "^20.11.0",
-    "@types/nodemailer": "^8.0.0",
+    "@types/node": "^22.0.0",
+    "@types/nodemailer": "^8.0.2",
     "@types/pino": "^7.0.5",
     "@types/qrcode": "^1.5.5",
     "@types/web-push": "^3.6.4",
     "tsx": "^4.7.0",
-    "typescript": "^5.3.3",
-    "vitest": "^1.6.1"
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.2"
   }
 }

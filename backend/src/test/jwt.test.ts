@@ -4,19 +4,22 @@ import { generateAccessToken, generateRefreshToken, verifyToken } from '../utils
 describe('JWT token use', () => {
   it('distinguishes access tokens from refresh tokens', async () => {
     const access = await generateAccessToken('7', 'session-token');
-    const refreshTokenId = 'unit-refresh-token-id';
-    const refresh = await generateRefreshToken('7', 'session-token', refreshTokenId);
+    const refresh = await generateRefreshToken('7', 'session-token', true);
 
-    expect(await verifyToken(access)).toMatchObject({
+    expect(await verifyToken(access, undefined, 'access')).toMatchObject({
       userId: '7',
       sessionToken: 'session-token',
-      tokenUse: 'access',
+      typ: 'access',
+      rememberMe: false,
     });
-    expect(await verifyToken(refresh)).toMatchObject({
+    expect(await verifyToken(refresh, undefined, 'refresh')).toMatchObject({
       userId: '7',
       sessionToken: 'session-token',
-      tokenUse: 'refresh',
-      refreshTokenId,
+      typ: 'refresh',
+      rememberMe: true,
     });
+    // typ 闸门：access 不能当 refresh 用（/refresh 依赖此判定）
+    expect(await verifyToken(access, undefined, 'refresh')).toBeNull();
+    expect(await verifyToken(refresh, undefined, 'access')).toBeNull();
   });
 });

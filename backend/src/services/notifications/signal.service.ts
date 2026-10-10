@@ -1,4 +1,4 @@
-import { getBlessing } from '../../../../shared/src/blessings.js';
+import { getBlessing } from '@timemark/shared/blessings';
 import { spawn, exec } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';

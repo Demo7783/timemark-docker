@@ -1,4 +1,6 @@
 import { Hono } from 'hono';
+import { z } from 'zod';
+import { isValidIanaTimezone } from '../utils/timezone.js';
 import { authMiddleware } from '../middleware/auth.middleware.js';
 import {
   saveUserConfig,
@@ -13,10 +15,14 @@ import {
   deleteRelationshipMapping,
   getReminderSettings,
   saveReminderSettings,
+  saveNotificationDefaults,
   getEventTemplates,
   getEventTemplate,
   saveEventTemplate,
   deleteEventTemplate,
+  saveAlertSettings,
+  getDigestPreferences,
+  saveDigestPreferences,
 } from '../services/config.service.js';
 import {
   createNotificationAccountSchema,
@@ -26,8 +32,18 @@ import {
   updateRelationshipMappingSchema,
   saveReminderSettingsSchema,
   saveEventTemplateSchema,
+  formatZodError,
 } from '@timemark/shared';
 import type { User } from '@timemark/shared';
+import { isSupportedChannel } from '../services/notifications/supported-channels.js';
+import { testConnection } from '../services/notifications/test-connection.js';
+import { getChannelTemplate } from '../services/notifications/channels.config.js';
+import { query } from '../db/index.js';
+import { resolveEmailRecipientForTest } from '../utils/notification-recipients.js';
+import { logAudit } from '../services/audit.service.js';
+import { maskNotificationAccountForClient } from '../utils/notification-account-client.js';
+import { maskUserConfigForClient } from '../utils/user-config-client.js';
+import { logFireAndForget } from '../utils/logger.js';
 
 const config = new Hono<{ Variables: { user: User } }>();
 
@@ -37,17 +53,44 @@ config.use('*', authMiddleware);
 config.get('/', async (c) => {
   const user = c.get('user');
   const data = await getUserConfig(Number(user.id));
-  return c.json({ success: true, data: data || {} });
+  return c.json({ success: true, data: maskUserConfigForClient(data) });
 });
 
 config.post('/', async (c) => {
   const user = c.get('user');
   const body = await c.req.json().catch(() => ({}));
-  const parsed = saveUserConfigSchema.safeParse(body);
+    const timezoneInput = (body as { timezone?: unknown }).timezone;
+    if (timezoneInput != null && timezoneInput !== '' && !isValidIanaTimezone(timezoneInput)) {
+      return c.json({ success: false, error: 'Invalid IANA timezone' }, 400);
+    }
+    const parsed = saveUserConfigSchema.safeParse(body);
   if (!parsed.success) {
-    return c.json({ success: false, error: 'Validation failed', details: parsed.error.flatten() }, 400);
+    return c.json({ success: false, error: formatZodError(parsed.error), details: z.flattenError(parsed.error) }, 400);
   }
   await saveUserConfig(Number(user.id), parsed.data);
+  await logAudit(Number(user.id), 'update', 'user_config', user.id, { keys: Object.keys(parsed.data) });
+  return c.json({ success: true });
+});
+
+config.post('/alert-settings', async (c) => {
+  const user = c.get('user');
+  const body = await c.req.json().catch(() => ({}));
+  const alertEmails = Array.isArray(body.alert_emails)
+    ? body.alert_emails.filter((e: unknown) => typeof e === 'string' && e.includes('@'))
+    : undefined;
+  const alertAccountIds = Array.isArray(body.alert_account_ids)
+    ? body.alert_account_ids.map(Number).filter((n: number) => n > 0)
+    : undefined;
+  const alertChannels = Array.isArray(body.alert_channels)
+    ? body.alert_channels.filter((x: unknown) => typeof x === 'string')
+    : undefined;
+
+  await saveAlertSettings(Number(user.id), {
+    alert_emails: alertEmails,
+    alert_account_ids: alertAccountIds,
+    alert_channels: alertChannels,
+  });
+  await logAudit(Number(user.id), 'update', 'alert_settings', user.id, {});
   return c.json({ success: true });
 });
 
@@ -56,16 +99,54 @@ config.post('/', async (c) => {
 config.get('/accounts', async (c) => {
   const user = c.get('user');
   const accounts = await getNotificationAccounts(Number(user.id));
-  return c.json({ success: true, data: accounts });
+  return c.json({
+    success: true,
+    data: accounts.map((a) => maskNotificationAccountForClient(a as unknown as Record<string, unknown>)),
+  });
+});
+
+// v79 渠道配置脱敏导出：给重新部署/迁移用。所有敏感列都过同一个客户端脱敏器
+// （token 只剩尾 4 位等），导出文件可直接随仓库/网盘保存而不泄露凭据。
+config.get('/accounts/export', async (c) => {
+  const user = c.get('user');
+  const accounts = await getNotificationAccounts(Number(user.id));
+  const exportedAt = new Date().toISOString();
+  const payload = {
+    format: 'timemark-channels-backup',
+    version: 1,
+    exportedAt,
+    accounts: accounts.map((a) => maskNotificationAccountForClient(a as unknown as Record<string, unknown>)),
+  };
+  return c.json({ success: true, data: payload }, 200, {
+    'Content-Disposition': `attachment; filename="timemark-channels-${exportedAt.slice(0, 10)}.json"`,
+  });
 });
 
 config.post('/accounts', async (c) => {
   const user = c.get('user');
+  try {
   const body = await c.req.json().catch(() => ({}));
   
   const parsed = createNotificationAccountSchema.safeParse(body);
   if (!parsed.success) {
-    return c.json({ success: false, error: 'Invalid input', details: parsed.error.flatten() }, 400);
+    return c.json({ success: false, error: formatZodError(parsed.error), details: z.flattenError(parsed.error) }, 400);
+  }
+  if (!isSupportedChannel(parsed.data.type)) {
+    return c.json({ success: false, error: '该通知渠道在云端部署中不可用' }, 400);
+  }
+  if (parsed.data.configMethod === 'plugin') {
+    return c.json({ success: false, error: '插件类通知渠道在云端部署中不可用' }, 400);
+  }
+  if (parsed.data.type === 'smtp') {
+    if (!parsed.data.chatId?.trim() || !parsed.data.chatId.includes('@')) {
+      return c.json({ success: false, error: '请填写完整的发件人邮箱' }, 400);
+    }
+    if (!parsed.data.token?.trim()) {
+      return c.json({ success: false, error: '请填写邮箱授权码或应用专用密码' }, 400);
+    }
+    if (!parsed.data.webhook?.trim() || !parsed.data.secret?.trim()) {
+      return c.json({ success: false, error: '请填写 SMTP 服务器和端口' }, 400);
+    }
   }
   
   const account = await createNotificationAccount(Number(user.id), {
@@ -79,18 +160,58 @@ config.post('/accounts', async (c) => {
     session_data: parsed.data.sessionData || undefined,
     plugin_package: parsed.data.pluginPackage || undefined,
   });
+
+  const tpl = getChannelTemplate(parsed.data.type);
+  if (tpl) {
+    const userId = Number(user.id);
+    const smtpFromEmail =
+      parsed.data.type === 'smtp' ? parsed.data.chatId || undefined : undefined;
+    const testChatId = await resolveEmailRecipientForTest(
+      userId,
+      parsed.data.type,
+      smtpFromEmail ?? (parsed.data.chatId || undefined),
+    );
+    testConnection({
+      type: parsed.data.type,
+      configMethod: parsed.data.configMethod || tpl.configMethod,
+      webhook: parsed.data.webhook || undefined,
+      token: parsed.data.token || undefined,
+      chatId: parsed.data.type === 'smtp' ? (parsed.data.chatId || testChatId) : testChatId,
+      secret: parsed.data.secret || undefined,
+    }).then((result) => {
+      const status = result.success ? 'healthy' : 'unhealthy';
+      return query(
+        `UPDATE notification_accounts SET connection_status = $1, last_test_result = $2, last_test_at = CURRENT_TIMESTAMP WHERE id = $3`,
+        [status, result.success ? 'success' : 'failed', account.id],
+      );
+    }).catch(
+      logFireAndForget(
+        'config.account_probe_persist_failed',
+        'Background connection probe result could not be persisted',
+      ),
+    );
+  }
   
-  return c.json({ success: true, data: account }, 201);
+  await logAudit(Number(user.id), 'create', 'notification_account', account.id, { type: parsed.data.type, name: parsed.data.name });
+  return c.json({ success: true, data: maskNotificationAccountForClient(account as unknown as Record<string, unknown>) }, 201);
+  } catch (error: unknown) {
+    console.error('[config] create notification account failed:', error);
+    return c.json({ success: false, error: '保存失败，请检查配置后重试' }, 500);
+  }
 });
 
 config.put('/accounts/:id', async (c) => {
   const user = c.get('user');
   const id = parseInt(c.req.param('id'));
+  try {
   const body = await c.req.json().catch(() => ({}));
   
   const parsed = updateNotificationAccountSchema.safeParse(body);
   if (!parsed.success) {
-    return c.json({ success: false, error: 'Invalid input', details: parsed.error.flatten() }, 400);
+    return c.json({ success: false, error: formatZodError(parsed.error), details: z.flattenError(parsed.error) }, 400);
+  }
+  if (parsed.data.configMethod === 'plugin') {
+    return c.json({ success: false, error: '插件类通知渠道在云端部署中不可用' }, 400);
   }
   
   const account = await updateNotificationAccount(id, Number(user.id), {
@@ -108,8 +229,17 @@ config.put('/accounts/:id', async (c) => {
   if (!account) {
     return c.json({ success: false, error: 'Account not found' }, 404);
   }
-  
-  return c.json({ success: true, data: account });
+
+  await logAudit(Number(user.id), 'update', 'notification_account', id, {
+    name: parsed.data.name,
+    isActive: parsed.data.isActive,
+    type: account.type,
+  });
+  return c.json({ success: true, data: maskNotificationAccountForClient(account as unknown as Record<string, unknown>) });
+  } catch (error: unknown) {
+    console.error('[config] update notification account failed:', error);
+    return c.json({ success: false, error: '保存失败，请检查配置后重试' }, 500);
+  }
 });
 
 config.delete('/accounts/:id', async (c) => {
@@ -121,7 +251,8 @@ config.delete('/accounts/:id', async (c) => {
   if (!deleted) {
     return c.json({ success: false, error: 'Account not found' }, 404);
   }
-  
+
+  await logAudit(Number(user.id), 'delete', 'notification_account', id);
   return c.json({ success: true });
 });
 
@@ -145,7 +276,7 @@ config.post('/relationships', async (c) => {
   
   const parsed = createRelationshipMappingSchema.safeParse(body);
   if (!parsed.success) {
-    return c.json({ success: false, error: 'Validation failed', details: parsed.error.flatten() }, 400);
+    return c.json({ success: false, error: formatZodError(parsed.error), details: z.flattenError(parsed.error) }, 400);
   }
   
   const mapping = await createRelationshipMapping(Number(user.id), {
@@ -166,7 +297,7 @@ config.put('/relationships/:id', async (c) => {
   
   const parsed = updateRelationshipMappingSchema.safeParse(body);
   if (!parsed.success) {
-    return c.json({ success: false, error: 'Validation failed', details: parsed.error.flatten() }, 400);
+    return c.json({ success: false, error: formatZodError(parsed.error), details: z.flattenError(parsed.error) }, 400);
   }
   
   const mapping = await updateRelationshipMapping(id, Number(user.id), {
@@ -210,7 +341,7 @@ config.post('/reminders', async (c) => {
   
   const parsed = saveReminderSettingsSchema.safeParse(body);
   if (!parsed.success) {
-    return c.json({ success: false, error: 'Validation failed', details: parsed.error.flatten() }, 400);
+    return c.json({ success: false, error: formatZodError(parsed.error), details: z.flattenError(parsed.error) }, 400);
   }
   
   await saveReminderSettings(Number(user.id), {
@@ -221,6 +352,143 @@ config.post('/reminders', async (c) => {
   });
   
   return c.json({ success: true });
+});
+
+config.get('/notification-advanced', async (c) => {
+  const user = c.get('user');
+  const row = await query(
+    `SELECT markdown_email_template, notification_preset, api_scopes, email_template_style, reminder_catchup_minutes, fallback_enabled
+     FROM user_configs WHERE user_id = $1`,
+    [Number(user.id)],
+  );
+  const r = row.rows[0] || {};
+  return c.json({
+    success: true,
+    data: {
+      markdown_email_template: r.markdown_email_template ?? null,
+      notification_preset: r.notification_preset ?? null,
+      api_scopes: r.api_scopes ?? 'read,write',
+      email_template_style: r.email_template_style ?? 'classic',
+      reminder_catchup_minutes: r.reminder_catchup_minutes ?? null,
+      fallback_enabled: r.fallback_enabled !== false,
+    },
+  });
+});
+
+config.post('/notification-advanced', async (c) => {
+  const user = c.get('user');
+  const body = await c.req.json().catch(() => ({}));
+  const userId = Number(user.id);
+  const sets: string[] = [];
+  const params: unknown[] = [];
+  let idx = 1;
+
+  if (typeof body.markdown_email_template === 'string') {
+    sets.push(`markdown_email_template = $${idx++}`);
+    params.push(body.markdown_email_template.slice(0, 8000));
+  } else if (body.markdown_email_template === null) {
+    sets.push(`markdown_email_template = NULL`);
+  }
+
+  if (typeof body.notification_preset === 'string') {
+    sets.push(`notification_preset = $${idx++}`);
+    params.push(body.notification_preset.slice(0, 50));
+  } else if (body.notification_preset === null) {
+    sets.push(`notification_preset = NULL`);
+  }
+
+  if (typeof body.api_scopes === 'string') {
+    const allowed = ['read', 'write'];
+    const scopes = body.api_scopes.split(',').map((s: string) => s.trim()).filter((s: string) => allowed.includes(s));
+    sets.push(`api_scopes = $${idx++}`);
+    params.push(scopes.length ? scopes.join(',') : 'read');
+  }
+
+  // v78: 邮件模板风格（classic/card/minimal）
+  if (typeof body.email_template_style === 'string' && ['classic', 'card', 'minimal'].includes(body.email_template_style)) {
+    sets.push(`email_template_style = $${idx++}`);
+    params.push(body.email_template_style);
+  }
+
+  // v78: 每用户补发窗口（0-1440 分钟；null = 部署默认）
+  if (body.reminder_catchup_minutes === null) {
+    sets.push(`reminder_catchup_minutes = NULL`);
+  } else if (body.reminder_catchup_minutes !== undefined) {
+    const minutes = Math.trunc(Number(body.reminder_catchup_minutes));
+    if (Number.isFinite(minutes) && minutes >= 0 && minutes <= 1440) {
+      sets.push(`reminder_catchup_minutes = $${idx++}`);
+      params.push(minutes);
+    }
+  }
+
+  // v78: 渠道自动回退开关（关闭后主渠道失败不再尝试其他渠道）
+  if (typeof body.fallback_enabled === 'boolean') {
+    sets.push(`fallback_enabled = $${idx++}`);
+    params.push(body.fallback_enabled);
+  }
+
+  if (sets.length === 0) {
+    return c.json({ success: false, error: '无有效字段' }, 400);
+  }
+
+  params.push(userId);
+  await query(
+    `INSERT INTO user_configs (user_id) VALUES ($${idx})
+     ON CONFLICT (user_id) DO UPDATE SET ${sets.join(', ')}`,
+    params,
+  );
+  return c.json({ success: true });
+});
+
+config.post('/notification-defaults', async (c) => {
+  const user = c.get('user');
+  const body = await c.req.json().catch(() => ({}));
+  const defaultTestEmail = typeof body.default_test_email === 'string' ? body.default_test_email.trim().toLowerCase() : undefined;
+  const reminderEmails = Array.isArray(body.reminder_emails)
+    ? body.reminder_emails
+        .filter((e: unknown) => typeof e === 'string')
+        .map((e: string) => e.trim().toLowerCase())
+        .filter((e: string) => e.includes('@'))
+    : undefined;
+
+  if (defaultTestEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(defaultTestEmail)) {
+    return c.json({ success: false, error: '默认邮箱格式无效' }, 400);
+  }
+
+  await saveNotificationDefaults(Number(user.id), {
+    default_test_email: defaultTestEmail ?? null,
+    reminder_emails: reminderEmails,
+  });
+  return c.json({ success: true });
+});
+
+// ============ 周期摘要偏好（checkbox 80）============
+
+config.get('/digest', async (c) => {
+  const user = c.get('user');
+  const prefs = await getDigestPreferences(Number(user.id));
+  return c.json({ success: true, data: prefs });
+});
+
+config.post('/digest', async (c) => {
+  const user = c.get('user');
+  const body = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  const b = body as Record<string, unknown>;
+  const saved = await saveDigestPreferences(Number(user.id), {
+    enabled: b.enabled !== false,
+    period: b.period === 'yearly' ? 'yearly' : 'monthly',
+    recipients: b.recipients,
+    sections: b.sections,
+    channelAccountId: typeof b.channelAccountId === 'number' ? b.channelAccountId : null,
+    // v2.30 方向 A：日报/周报排程（service 内做 HH:mm/星期归一）
+    dailyEnabled: b.dailyEnabled === true,
+    dailyTime: typeof b.dailyTime === 'string' ? b.dailyTime : undefined,
+    weeklyEnabled: b.weeklyEnabled === true,
+    weeklyDay: typeof b.weeklyDay === 'number' ? b.weeklyDay : undefined,
+    weeklyTime: typeof b.weeklyTime === 'string' ? b.weeklyTime : undefined,
+  });
+  await logAudit(Number(user.id), 'update', 'digest_settings', user.id, {});
+  return c.json({ success: true, data: saved });
 });
 
 // ============ 事件模板管理 ============
@@ -245,7 +513,7 @@ config.post('/templates', async (c) => {
   
   const parsed = saveEventTemplateSchema.safeParse(body);
   if (!parsed.success) {
-    return c.json({ success: false, error: 'Validation failed', details: parsed.error.flatten() }, 400);
+    return c.json({ success: false, error: formatZodError(parsed.error), details: z.flattenError(parsed.error) }, 400);
   }
   
   const template = await saveEventTemplate(

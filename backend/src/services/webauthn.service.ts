@@ -32,7 +32,7 @@ async function storeChallenge(challenge: string, userId: number | null, type: 'r
   }
   await query(
     `INSERT INTO webauthn_challenges (challenge, user_id, type, expires_at)
-     VALUES ($1, $2, $3, datetime('now','+5 minutes'))`,
+     VALUES ($1, $2, $3, NOW() + INTERVAL '5 minutes')`,
     [challenge, userId, type],
   );
 }
@@ -40,8 +40,8 @@ async function storeChallenge(challenge: string, userId: number | null, type: 'r
 async function consumeChallenge(challenge: string, type: string, userId?: number | null): Promise<boolean> {
   const result = await query(
     `DELETE FROM webauthn_challenges
-     WHERE challenge = $1 AND type = $2 AND expires_at > datetime('now')
-       AND (($3 IS NULL AND user_id IS NULL) OR user_id IS $3)
+     WHERE challenge = $1 AND type = $2 AND expires_at > NOW()
+       AND ($3::int IS NULL OR user_id IS NOT DISTINCT FROM $3)
      RETURNING challenge`,
     [challenge, type, userId ?? null],
   );
@@ -69,7 +69,7 @@ export async function createRegistrationOptions(
   userId: number,
   username: string,
   config: WebAuthnRuntimeConfig,
-  deviceName?: string,
+  _deviceName?: string,
 ): Promise<PublicKeyCredentialCreationOptionsJSON> {
   const existing = await query(
     'SELECT credential_id, transports FROM webauthn_credentials WHERE user_id = $1',

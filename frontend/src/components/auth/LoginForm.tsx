@@ -1,50 +1,347 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { motion } from 'framer-motion';
 import { useAuthStore } from '@/stores/auth.store';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Lock, User } from 'lucide-react';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { Lock, User, Fingerprint } from 'lucide-react';
 import { LockIcon } from '@/components/icons';
+import { api } from '@/lib/api';
+import { isPasskeySupported } from '@/lib/webauthn';
+
+declare global {
+  interface Window {
+    turnstile?: {
+      render: (
+        el: HTMLElement,
+        opts: {
+          sitekey: string;
+          callback: (token: string) => void;
+          'expired-callback'?: () => void;
+          'error-callback'?: () => void;
+          'timeout-callback'?: () => void;
+          theme?: 'light' | 'dark' | 'auto';
+          size?: 'normal' | 'compact';
+          appearance?: 'always' | 'execute' | 'interaction-only';
+        },
+      ) => string;
+      reset: (id: string) => void;
+      remove: (id: string) => void;
+    };
+  }
+}
 
 const containerVariants = { hidden: { opacity: 0 }, visible: { opacity: 1, transition: { staggerChildren: 0.08 } } };
-const itemVariants = { hidden: { opacity: 0, y: 15 }, visible: { opacity: 1, y: 0, transition: { type: 'spring', stiffness: 300, damping: 24 } } };
+const itemVariants = { hidden: { opacity: 0, y: 15 }, visible: { opacity: 1, y: 0, transition: { type: 'spring', stiffness: 300, damping: 24 } as const } };
+
+function formatLockTime(totalSeconds: number): string {
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  if (m > 0) return `${m} 分 ${s} 秒`;
+  return `${s} 秒`;
+}
 
 export function LoginForm() {
-  const [username, setUsername] = useState('');
+  // v79: 预填上次成功登录的用户名（只存用户名，不存密码）
+  const [username, setUsername] = useState(() => {
+    try {
+      return localStorage.getItem('timemark_last_username') || '';
+    } catch {
+      return '';
+    }
+  });
   const [password, setPassword] = useState('');
   const [rememberMe, setRememberMe] = useState(false);
-  const[error, setError] = useState('');
+  const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const[lockoutSeconds, setLockoutSeconds] = useState(0);
+  const [lockoutSeconds, setLockoutSeconds] = useState(0);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [totpCode, setTotpCode] = useState('');
+  const [showTotp, setShowTotp] = useState(false);
+  const [turnstileToken, setTurnstileToken] = useState('');
+  const [turnstileSiteKey, setTurnstileSiteKey] = useState<string | null>(null);
+  const [turnstileReady, setTurnstileReady] = useState(false);
+  // v2.30：验证配置异常不再静默——加载失败/服务端开启但站点密钥缺失都要可见
+  const [turnstileConfigError, setTurnstileConfigError] = useState('');
+  const turnstileRef = useRef<HTMLDivElement | null>(null);
+  const widgetIdRef = useRef<string | null>(null);
+  const pendingSubmitRef = useRef(false);
+  const credentialsRef = useRef({ username: '', password: '', rememberMe: false, totpCode: '' });
   const login = useAuthStore((state) => state.login);
+  const loginPasskey = useAuthStore((state) => state.loginPasskey);
+  const navigate = useNavigate();
+  const location = useLocation();
+  const passkeySupported = isPasskeySupported();
+
+  const isLocked = lockoutSeconds > 0;
+
+  useEffect(() => {
+    credentialsRef.current = { username, password, rememberMe, totpCode };
+  }, [username, password, rememberMe, totpCode]);
+
+  const startLockoutCountdown = (seconds: number) => {
+    if (seconds <= 0) return;
+    setLockoutSeconds(seconds);
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => {
+      setLockoutSeconds((prev) => {
+        if (prev <= 1) {
+          if (timerRef.current) clearInterval(timerRef.current);
+          timerRef.current = null;
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  };
+
+  const resetTurnstile = useCallback(() => {
+    setTurnstileToken('');
+    if (widgetIdRef.current && window.turnstile) {
+      window.turnstile.reset(widgetIdRef.current);
+    }
+  }, []);
+
+  const submitLogin = useCallback(async (turnstileOverride?: string) => {
+    const { username: u, password: p, rememberMe: rm, totpCode: totp } = credentialsRef.current;
+    const trimmedUsername = u.trim();
+    const trimmedPassword = p.trim();
+    const token = turnstileOverride || turnstileToken || undefined;
+
+    if (trimmedUsername.length < 3) {
+      setError('用户名至少3个字符');
+      return;
+    }
+    if (trimmedPassword.length < 8) {
+      setError('密码至少8个字符');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const { mustChangePassword } = await login(trimmedUsername, trimmedPassword, rm, {
+        turnstileToken: token,
+        totpCode: totp.trim() || undefined,
+      });
+      // v79: 登录成功后记住用户名（只存用户名，绝不存密码），下次自动预填
+      try {
+        localStorage.setItem('timemark_last_username', trimmedUsername);
+      } catch { /* 隐私模式下静默跳过 */ }
+      if (mustChangePassword) {
+        navigate('/settings?changePassword=1', { replace: true });
+      } else {
+        const from = (location.state as { from?: { pathname?: string } })?.from?.pathname;
+        navigate(from && from !== '/login' ? from : '/dashboard', { replace: true });
+      }
+    } catch (err: unknown) {
+      const e = err as Error & {
+        locked?: boolean;
+        remainingSeconds?: number;
+        requiresTotp?: boolean;
+        code?: string;
+      };
+      const message = e.message || '登录失败';
+      const code = e.code || '';
+
+      if (e.locked || code === 'account_locked' || code === 'ip_blocked' || message.includes('锁定') || message.includes('频繁')) {
+        const sec = e.remainingSeconds
+          || parseInt(message.match(/剩余\s*(\d+)\s*秒/)?.[1] || '0', 10)
+          || parseInt(message.match(/(\d+)\s*秒/)?.[1] || '0', 10);
+        if (sec > 0) startLockoutCountdown(sec);
+        setError(message.replace(/^HTTP \d+:\s*/, ''));
+      } else if (e.requiresTotp || code === 'totp_required' || message.includes('双因素')) {
+        setShowTotp(true);
+        setError('请输入双因素验证码');
+      } else if (code === 'invalid_credentials' || message.includes('密码错误') || message.includes('还剩')) {
+        setError('用户名或密码错误');
+        if (turnstileSiteKey) resetTurnstile();
+      } else if (code.startsWith('turnstile_') || message.includes('人机验证')) {
+        setError(message);
+        resetTurnstile();
+      } else if (code === 'validation_failed' || message.includes('参数无效')) {
+        setError(message);
+      } else {
+        setError(message);
+      }
+    } finally {
+      setLoading(false);
+      pendingSubmitRef.current = false;
+    }
+  }, [login, navigate, location.state, resetTurnstile, turnstileSiteKey, turnstileToken]);
+
+  const submitLoginRef = useRef(submitLogin);
+  submitLoginRef.current = submitLogin;
+
+  useEffect(() => () => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    if (widgetIdRef.current && window.turnstile) {
+      try {
+        window.turnstile.remove(widgetIdRef.current);
+      } catch {
+        // ignore
+      }
+      widgetIdRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    const preconnect = document.createElement('link');
+    preconnect.rel = 'preconnect';
+    preconnect.href = 'https://challenges.cloudflare.com';
+    document.head.appendChild(preconnect);
+    return () => {
+      document.head.removeChild(preconnect);
+    };
+  }, []);
+
+  useEffect(() => {
+    api.get<{ siteKey: string | null; enabled: boolean; misconfigured?: boolean }>('/auth/turnstile-config')
+      .then((cfg) => {
+        if (cfg.enabled && cfg.siteKey) {
+          setTurnstileSiteKey(cfg.siteKey);
+        } else if (cfg.enabled && !cfg.siteKey) {
+          // v2.30 事故教训：服务端要求验证但站点密钥缺失时，widget 会凭空消失，
+          // 用户对着空表单反复重试还以为自己密码错了——必须显式说明。
+          setTurnstileConfigError('服务端已开启人机验证，但站点密钥（TURNSTILE_SITE_KEY）未配置，暂时无法登录。请联系管理员在部署平台补齐后重试。');
+        }
+      })
+      .catch(() => {
+        setTurnstileConfigError('人机验证配置加载失败（网络异常或服务暂不可用）。可尝试刷新页面；若持续出现，登录可能暂时不可用。');
+      });
+  }, []);
+
+  const mountWidget = useCallback(() => {
+    if (!turnstileSiteKey || !turnstileRef.current || !window.turnstile || widgetIdRef.current) {
+      return false;
+    }
+    const isDark = document.documentElement.classList.contains('dark');
+    widgetIdRef.current = window.turnstile.render(turnstileRef.current, {
+      sitekey: turnstileSiteKey,
+      theme: isDark ? 'dark' : 'light',
+      size: 'normal',
+      appearance: 'always',
+      callback: (token: string) => {
+        setTurnstileToken(token);
+        setError('');
+        if (pendingSubmitRef.current) {
+          void submitLoginRef.current(token);
+        }
+      },
+      'expired-callback': () => {
+        setTurnstileToken('');
+        // 过期后立即重置组件自动开新挑战，免去用户手动再点
+        if (widgetIdRef.current && window.turnstile) {
+          try { window.turnstile.reset(widgetIdRef.current); } catch { /* ignore */ }
+        }
+      },
+      'error-callback': () => {
+        setTurnstileToken('');
+        setError('人机验证加载失败，请刷新页面重试');
+      },
+      'timeout-callback': () => {
+        setTurnstileToken('');
+        if (widgetIdRef.current && window.turnstile) {
+          try { window.turnstile.reset(widgetIdRef.current); } catch { /* ignore */ }
+        }
+      },
+    });
+    setTurnstileReady(true);
+    return true;
+  }, [turnstileSiteKey]);
+
+  const loadTurnstileScript = useCallback((): Promise<void> => {
+    if (window.turnstile) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const base = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+      let script = document.querySelector<HTMLScriptElement>(`script[src^="${base}"]`);
+      if (!script) {
+        script = document.createElement('script');
+        script.src = `${base}?render=explicit`;
+        script.async = true;
+        document.body.appendChild(script);
+      }
+      const done = () => {
+        if (window.turnstile) resolve();
+        else reject(new Error('turnstile unavailable'));
+      };
+      script.addEventListener('load', done, { once: true });
+      script.addEventListener('error', () => reject(new Error('turnstile script failed')), { once: true });
+      if (window.turnstile) resolve();
+    });
+  }, []);
+
+  const bindTurnstileContainer = useCallback((node: HTMLDivElement | null) => {
+    turnstileRef.current = node;
+    if (!node || !turnstileSiteKey) return;
+    void loadTurnstileScript()
+      .then(() => {
+        if (!mountWidget()) {
+          requestAnimationFrame(() => mountWidget());
+        }
+      })
+      .catch(() => setError('人机验证脚本加载失败，请检查网络或刷新页面'));
+  }, [turnstileSiteKey, loadTurnstileScript, mountWidget]);
+
+  useEffect(() => {
+    if (!turnstileSiteKey) return;
+    let cancelled = false;
+    let frames = 0;
+    const retryMount = () => {
+      if (cancelled || mountWidget()) return;
+      if (frames++ < 30) requestAnimationFrame(retryMount);
+    };
+    void loadTurnstileScript().then(() => {
+      if (!cancelled) retryMount();
+    }).catch(() => {
+      if (!cancelled) setError('人机验证脚本加载失败，请检查网络或刷新页面');
+    });
+    return () => { cancelled = true; };
+  }, [turnstileSiteKey, loadTurnstileScript, mountWidget]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isLocked) return;
+
     setError('');
     const trimmedUsername = username.trim();
     const trimmedPassword = password.trim();
     if (trimmedUsername.length < 3) return setError('用户名至少3个字符');
-    if (trimmedPassword.length < 6) return setError('密码至少6个字符');
-    
+    if (trimmedPassword.length < 8) return setError('密码至少8个字符');
+
+    if (turnstileSiteKey) {
+      if (!turnstileReady) {
+        setError('人机验证加载中，请稍候再试');
+        return;
+      }
+      if (!turnstileToken) {
+        pendingSubmitRef.current = true;
+        setError('请先完成下方人机验证');
+        return;
+      }
+    }
+
+    await submitLogin();
+  };
+
+  const handlePasskeyLogin = async () => {
+    if (isLocked) return;
+    const trimmedUsername = username.trim();
+    if (trimmedUsername.length < 3) {
+      setError('请先输入用户名');
+      return;
+    }
+    setError('');
     setLoading(true);
     try {
-      await login(trimmedUsername, trimmedPassword, rememberMe);
-    } catch (err: any) {
-      const message = err.message || '登录失败';
-      if (message.includes('429') || message.includes('锁定')) {
-        const match = message.match(/(\d+)\s*秒/);
-        if (match) {
-          setLockoutSeconds(parseInt(match[1]));
-          const timer = setInterval(() => {
-            setLockoutSeconds(prev => { if (prev <= 1) { clearInterval(timer); return 0; } return prev - 1; });
-          }, 1000);
-        }
-        setError(message);
-      } else if (message.includes('401') || message.includes('Invalid')) {
-        setError('用户名或密码错误');
+      await loginPasskey(trimmedUsername, rememberMe, totpCode || undefined);
+    } catch (err: unknown) {
+      const e = err as Error & { requiresTotp?: boolean; code?: string };
+      if (e.requiresTotp || e.message?.includes('双因素')) {
+        setShowTotp(true);
+        setError('请输入双因素验证码后重试 Passkey 登录');
       } else {
-        setError(message);
+        setError(e.message || 'Passkey 登录失败');
       }
     } finally {
       setLoading(false);
@@ -52,7 +349,7 @@ export function LoginForm() {
   };
 
   return (
-    <Card className="w-full glass-panel border-0 ring-1 ring-black/5 dark:ring-white/10 rounded-[2.5rem] overflow-hidden shadow-2xl">
+    <Card className="w-full glass-panel border-0 ring-1 ring-black/5 dark:ring-white/10 rounded-[2.5rem] shadow-2xl overflow-visible">
       <CardHeader className="text-center pb-4 pt-12">
         <motion.div
           initial={{ scale: 0, rotate: -10 }}
@@ -69,32 +366,89 @@ export function LoginForm() {
         <p className="text-sm text-slate-500 dark:text-slate-400 mt-2 font-medium">掌控您的每一个倒数时刻</p>
       </CardHeader>
       <CardContent className="px-10 pb-12">
-        <motion.form onSubmit={handleSubmit} className="space-y-6" variants={containerVariants} initial="hidden" animate="visible">
+        <motion.form onSubmit={handleSubmit} className="space-y-6" variants={containerVariants} initial="hidden" animate="visible" aria-label="登录表单">
           <motion.div variants={itemVariants}>
             <div className="relative group">
-              <User className="absolute left-4 top-3.5 h-5 w-5 text-slate-400 group-focus-within:text-primary-500 transition-colors z-10" />
-              <Input type="text" placeholder="用户名" className="pl-12" value={username} onChange={(e) => setUsername(e.target.value)} required />
+              <User className="absolute left-4 top-3.5 h-5 w-5 text-slate-400 group-focus-within:text-primary-500 transition-colors z-10" aria-hidden />
+              <Input
+                type="text"
+                placeholder="用户名"
+                className="pl-12"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                disabled={isLocked || loading}
+                required
+                aria-label="用户名"
+                autoComplete="username"
+              />
             </div>
           </motion.div>
           <motion.div variants={itemVariants}>
             <div className="relative group">
-              <Lock className="absolute left-4 top-3.5 h-5 w-5 text-slate-400 group-focus-within:text-primary-500 transition-colors z-10" />
-              <Input type="password" placeholder="密码" className="pl-12" value={password} onChange={(e) => setPassword(e.target.value)} required />
+              <Lock className="absolute left-4 top-3.5 h-5 w-5 text-slate-400 group-focus-within:text-primary-500 transition-colors z-10" aria-hidden />
+              <Input
+                type="password"
+                placeholder="密码"
+                className="pl-12"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                disabled={isLocked || loading}
+                required
+                aria-label="密码"
+                autoComplete="current-password"
+              />
             </div>
           </motion.div>
-          <motion.div variants={itemVariants} className="flex items-center gap-3 pt-1 alive-interactive w-max" onClick={() => setRememberMe(!rememberMe)}>
-             <input type="checkbox" checked={rememberMe} readOnly className="peer w-5 h-5 rounded-md border-slate-300 dark:border-slate-600 text-primary-500 focus:ring-primary-500/30 bg-white dark:bg-black/50 transition-all" />
+          {showTotp && (
+            <motion.div variants={itemVariants} className="space-y-2">
+              {/* inputMode="text", not "numeric": recovery codes contain letters, and a numeric
+                  keypad on mobile makes them impossible to type. */}
+              <Input placeholder="双因素验证码，或恢复码" value={totpCode} onChange={(e) => setTotpCode(e.target.value)} disabled={isLocked || loading} aria-label="双因素验证码或恢复码" inputMode="text" autoComplete="one-time-code" />
+              <p className="text-xs text-hint text-center">
+                验证器丢了？用安全中心签发的恢复码之一登录（格式 xxxxx-xxxxx，每个只能用一次）。
+              </p>
+            </motion.div>
+          )}
+          {turnstileConfigError && (
+            <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} role="alert" className="text-sm text-amber-700 dark:text-amber-300 bg-amber-50/80 dark:bg-amber-900/30 px-4 py-3 rounded-2xl border border-amber-200 dark:border-amber-800/50">
+              {turnstileConfigError}
+            </motion.div>
+          )}
+          {turnstileSiteKey && (
+            <div className="space-y-2">
+              <div
+                ref={bindTurnstileContainer}
+                className="turnstile-host"
+                aria-label="Cloudflare 人机验证"
+              />
+              {!turnstileReady && (
+                <p className="text-xs text-hint text-center">人机验证加载中…</p>
+              )}
+            </div>
+          )}
+          <motion.div variants={itemVariants} className="flex items-center gap-3 pt-1 alive-interactive w-max" onClick={() => !isLocked && setRememberMe(!rememberMe)}>
+             <input type="checkbox" checked={rememberMe} readOnly disabled={isLocked} aria-label="保持登录 30 天" className="peer w-5 h-5 rounded-md border-slate-300 dark:border-slate-600 text-primary-500 focus:ring-primary-500/30 bg-white dark:bg-black/50 transition-all disabled:opacity-50" />
              <label className="text-sm font-medium text-slate-700 dark:text-slate-300 select-none cursor-pointer">保持登录（30天）</label>
           </motion.div>
-          {error && (
+          {isLocked && (
+            <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="text-sm text-amber-700 dark:text-amber-300 bg-amber-50/80 dark:bg-amber-900/30 px-4 py-3 rounded-2xl border border-amber-200 dark:border-amber-800/50">
+              账户已锁定，请等待 {formatLockTime(lockoutSeconds)} 后再试。锁定期间无法提交登录。
+            </motion.div>
+          )}
+          {error && !isLocked && (
             <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="text-sm text-red-600 dark:text-red-400 bg-red-50/80 dark:bg-red-900/30 px-4 py-3 rounded-2xl border border-red-200 dark:border-red-800/50 backdrop-blur-md">
               {error}
             </motion.div>
           )}
-          <motion.div variants={itemVariants} className="pt-4">
-            <Button type="submit" variant="vision" size="lg" className="w-full text-base font-semibold shadow-lg shadow-primary-500/20" disabled={loading || lockoutSeconds > 0}>
-              {loading ? '登录中...' : lockoutSeconds > 0 ? `锁定 (${lockoutSeconds}s)` : '登 录'}
+          <motion.div variants={itemVariants} className="pt-4 space-y-3">
+            <Button type="submit" variant="vision" size="lg" className="w-full text-base font-semibold shadow-lg shadow-primary-500/20 min-h-11" disabled={loading || isLocked} aria-label="登录">
+              {loading ? '登录中...' : isLocked ? `锁定中 (${formatLockTime(lockoutSeconds)})` : '登 录'}
             </Button>
+            {passkeySupported && (
+              <Button type="button" variant="outline" size="lg" className="w-full min-h-11" onClick={handlePasskeyLogin} disabled={loading || isLocked} aria-label="使用 Passkey 登录">
+                <Fingerprint className="w-4 h-4 mr-2" /> 使用 Passkey 登录
+              </Button>
+            )}
           </motion.div>
         </motion.form>
       </CardContent>

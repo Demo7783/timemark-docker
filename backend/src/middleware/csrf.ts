@@ -1,17 +1,5 @@
 import type { Context, Next } from 'hono';
 import { getConfiguredOrigins, isAllowedOrigin } from '../utils/allowed-origins.js';
-import { getRequestOrigin } from '../utils/client-ip.js';
-
-/**
- * CSRF 保护中间件
- *
- * HttpOnly Cookie 认证会自动携带凭据，存在 CSRF 风险，因此仍验证 Origin/Referer。
- * LAN 访问无需手动配置 CORS_ORIGIN；只允许 Origin 与实际请求 scheme、host、port 完全一致时通过。
- *
- * 保护范围：
- * - POST, PUT, DELETE, PATCH
- * - 排除 GET, HEAD, OPTIONS
- */
 
 export function csrfProtection() {
   const allowedOrigins = getConfiguredOrigins();
@@ -22,21 +10,38 @@ export function csrfProtection() {
       return next();
     }
 
-    // webhook / inbox 公开端点不受 CSRF 限制（与 vercel 一致）
     if (c.req.path.startsWith('/api/webhook/') || c.req.path.startsWith('/api/inbox/receive/') || c.req.path === '/api/csp-report') {
+      return next();
+    }
+
+    // checkbox 103: the MCP Streamable-HTTP endpoint authenticates with a scoped Bearer agent
+    // token (`tmt_...`), which a browser never attaches automatically (it is not a cookie), so
+    // classic CSRF does not apply. Exempt ONLY this exact path and ONLY when such a Bearer
+    // credential is present; every other non-GET /api/* request still needs Origin/Referer or
+    // Bearer + X-Requested-With, so CSRF for the rest of the app is unchanged.
+    if (c.req.path === '/api/mcp' && /^Bearer\s+tmt_/i.test(c.req.header('Authorization') ?? '')) {
+      return next();
+    }
+
+    // checkbox 115: the scheduler tick is machine-to-machine (cron-job.org POSTs it with
+    // `Authorization: Bearer <CRON_SECRET>` - validated timing-safely in routes/agent-scheduler.ts -
+    // and no browser Origin). A Bearer credential is never attached automatically by a browser,
+    // so classic CSRF does not apply; same rationale as the /api/mcp exemption above. The route
+    // answers 401 for any wrong secret, so this only removes the X-Requested-With requirement.
+    if (c.req.path === '/api/agent/scheduler/start' && /^Bearer\s+/i.test(c.req.header('Authorization') ?? '')) {
       return next();
     }
 
     const origin = c.req.header('Origin');
     const referer = c.req.header('Referer');
-    const appOrigin = getRequestOrigin(c);
+    const host = c.req.header('host') ?? c.req.header('x-forwarded-host');
 
     let requestOrigin = origin;
     if (!requestOrigin && referer) {
       try {
         requestOrigin = new URL(referer).origin;
       } catch {
-        // invalid referer
+        // ignore invalid referer
       }
     }
 
@@ -50,8 +55,8 @@ export function csrfProtection() {
       return c.json({ success: false, error: 'Missing origin or authorization' }, 403);
     }
 
-    if (!isAllowedOrigin(requestOrigin, appOrigin, allowedOrigins)) {
-      console.warn(`[CSRF] Blocked request from origin: ${requestOrigin} appOrigin: ${appOrigin}`);
+    if (!isAllowedOrigin(requestOrigin, host, allowedOrigins)) {
+      console.warn(`[CSRF] Blocked request from origin: ${requestOrigin} host: ${host}`);
       return c.json({ success: false, error: 'Origin not allowed' }, 403);
     }
 

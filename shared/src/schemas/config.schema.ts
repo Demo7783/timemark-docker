@@ -24,49 +24,56 @@ export const updateNotificationAccountSchema = z.object({
   pluginPackage: z.string().optional().nullable(),
 });
 
-export const saveUserConfigSchema = z.object({
+export const saveUserConfigSchema = z.looseObject({
   resend_api_key: z.string().optional().nullable(),
   github_token: z.string().optional().nullable(),
-  feishu_webhook: z.string().url().optional().nullable(),
-  wecom_webhook: z.string().url().optional().nullable(),
-  dingtalk_webhook: z.string().url().optional().nullable(),
+  feishu_webhook: z.url().optional().nullable(),
+  wecom_webhook: z.url().optional().nullable(),
+  dingtalk_webhook: z.url().optional().nullable(),
   dingtalk_secret: z.string().optional().nullable(),
   telegram_bot_token: z.string().optional().nullable(),
   telegram_chat_id: z.string().optional().nullable(),
-  discord_webhook: z.string().url().optional().nullable(),
-  slack_webhook: z.string().url().optional().nullable(),
+  discord_webhook: z.url().optional().nullable(),
+  slack_webhook: z.url().optional().nullable(),
   wxpusher_app_token: z.string().optional().nullable(),
   wxpusher_uid: z.string().optional().nullable(),
   qmsg_key: z.string().optional().nullable(),
   qmsg_qq: z.string().optional().nullable(),
-  channel_webhooks: z.record(z.string()).optional().nullable(),
-  reminder_emails: z.array(z.string().email()).optional(),
+  channel_webhooks: z.record(z.string(), z.string()).optional().nullable(),
+  reminder_emails: z.array(z.email()).optional(),
   alert_channels: z.array(z.string()).optional(),
+  alert_emails: z.array(z.email()).optional(),
+  alert_account_ids: z.array(z.number().int().positive()).optional(),
   timezone: z.string().max(50).optional().nullable(),
-}).passthrough();
+  default_test_email: z.email().optional().nullable(),
+});
 
 export const testConnectionSchema = z.object({
-  type: z.string().min(1),
+  accountId: z.coerce.number().int().positive().optional(),
+  type: z.string().min(1).optional(),
   configMethod: z.enum(['webhook', 'token', 'plugin']).optional().default('webhook'),
   webhook: z.string().optional().nullable(),
   token: z.string().optional().nullable(),
   chatId: z.string().optional().nullable(),
   secret: z.string().optional().nullable(),
   sessionData: z.any().optional().nullable(),
-});
+}).refine(
+  (data) => data.accountId != null || Boolean(data.type?.trim()),
+  { message: '请提供 accountId 或渠道类型 type', path: ['accountId'] },
+);
 
 export const createRelationshipMappingSchema = z.object({
   event_id: z.number().int().positive('event_id is required'),
   from_relation: z.string().min(1, 'from_relation is required').max(100),
   to_relation: z.string().min(1, 'to_relation is required').max(100),
-  recipient_email: z.string().email().optional().nullable(),
+  recipient_email: z.email().optional().nullable(),
   recipient_type: z.string().max(50).optional().nullable(),
 });
 
 export const updateRelationshipMappingSchema = z.object({
   from_relation: z.string().min(1).max(100).optional(),
   to_relation: z.string().min(1).max(100).optional(),
-  recipient_email: z.string().email().optional().nullable(),
+  recipient_email: z.email().optional().nullable(),
   recipient_type: z.string().max(50).optional().nullable(),
 });
 
@@ -74,7 +81,7 @@ export const saveReminderSettingsSchema = z.object({
   enabled: z.boolean().optional(),
   dailyTime: z.string().max(10).optional().nullable(),
   daysBeforeList: z.array(z.number().int().min(0)).optional(),
-  emailAddresses: z.array(z.string().email()).optional(),
+  emailAddresses: z.array(z.email()).optional(),
 });
 
 export const saveEventTemplateSchema = z.object({

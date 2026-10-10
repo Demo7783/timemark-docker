@@ -1,6 +1,7 @@
 import { z } from 'zod';
+import { cadenceDaysSchema } from '../types/crm.js';
 
-const emailField = z.string().email('邮箱格式不正确').optional().or(z.literal(''));
+const emailField = z.email('邮箱格式不正确').optional().or(z.literal(''));
 const optionalText = z.string().max(200).optional().or(z.literal(''));
 
 export const labeledValueSchema = z.object({
@@ -28,9 +29,17 @@ const contactBaseSchema = z.object({
   channelAccountIds: z.array(z.number().int().positive()).default([]),
   /** 与我的关系（见 contact-relationship.ts 预设列表） */
   relationship: optionalText,
+  /** v79: 联系人生日（YYYY-MM-DD）——未建生日事件也能触发祝福 */
+  birthDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, '生日格式应为 YYYY-MM-DD').optional().or(z.literal('')),
+  /** v79: 该联系人退出祝福（greeting_opt_out） */
+  greetingOptOut: z.boolean().optional(),
   /** 性别：用于非亲属称呼先生/女士 */
   gender: z.enum(['male', 'female', 'unknown']).optional().default('unknown'),
   notes: z.string().max(500).optional(),
+  /** 联系节奏天数（预设 7/14/30/60/90/180/365 或自定义正整数）；null 清除 */
+  cadenceDays: cadenceDaysSchema.nullish(),
+  /** 是否启用节奏提醒（checkbox 62 的提醒任务读取该开关） */
+  cadenceEnabled: z.boolean().optional(),
 });
 
 function hasAnyContactMethod(d: z.infer<typeof contactBaseSchema>): boolean {
@@ -44,7 +53,7 @@ export const contactSendEmailSchema = z.object({
   subject: z.string().min(1, '主题不能为空').max(200),
   html: z.string().min(1, '内容不能为空').max(50000),
   /** 指定收件邮箱；留空则发往联系人全部邮箱 */
-  recipientEmails: z.array(z.string().email()).min(1).max(20).optional(),
+  recipientEmails: z.array(z.email()).min(1).max(20).optional(),
 });
 
 export const createFixedContactSchema = contactBaseSchema.refine(hasAnyContactMethod, {

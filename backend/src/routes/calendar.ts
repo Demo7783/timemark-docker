@@ -1,8 +1,16 @@
 import { Hono } from 'hono';
 import { authMiddleware } from '../middleware/auth.middleware.js';
 import { getEventsByUserId } from '../services/event.service.js';
+import { query } from '../db/index.js';
+import { isSafePublicUrl } from '../utils/url-safety.js';
+import {
+  createIcsFeed,
+  defaultIcsFeedName,
+  listIcsFeeds,
+  parseIcsFeedFilter,
+  revokeIcsFeed,
+} from '../services/ics-feed.service.js';
 import type { User } from '@timemark/shared';
-import { getRequestOrigin } from '../utils/client-ip.js';
 
 const calendar = new Hono<{ Variables: { user: User } }>();
 
@@ -65,14 +73,11 @@ calendar.get('/google', async (c) => {
  * GET /api/calendar/apple
  */
 calendar.get('/apple', async (c) => {
-  const user = c.get('user');
-  const events = await getEventsByUserId(user.id);
-
   // Apple Calendar 使用 webcal:// 协议订阅
   // 这里返回 .ics 文件的 URL，用户可以订阅
-  const origin = getRequestOrigin(c);
-  const host = new URL(origin).host;
-  const icsUrl = `${origin}/api/calendar/export.ics`;
+  const host = c.req.header('Host') || 'localhost:3000';
+  const protocol = c.req.header('X-Forwarded-Proto') || 'http';
+  const icsUrl = `${protocol}://${host}/api/calendar/export.ics`;
 
   return c.json({
     success: true,
@@ -81,6 +86,137 @@ calendar.get('/apple', async (c) => {
       directUrl: icsUrl,
     },
   });
+});
+
+/**
+ * CalDAV 回写开关（checkbox 86）
+ * GET  /api/calendar/caldav-writeback  读取当前状态（默认关闭）
+ * POST /api/calendar/caldav-writeback  更新开关 / 目标集合 URL
+ *
+ * 回写只写入用户显式配置的 CalDAV 集合，复用既有的 Basic Auth 凭据；
+ * 实体来源为外部同步（importSource）或目标集合与导入 URL 相同时会被
+ * caldav-sync 的循环守卫跳过。
+ */
+calendar.get('/caldav-writeback', async (c) => {
+  const user = c.get('user');
+  const res = await query(
+    `SELECT caldav_writeback_enabled, caldav_writeback_url, caldav_username, caldav_password_encrypted
+       FROM user_configs WHERE user_id = $1`,
+    [Number(user.id)],
+  );
+  const row = (res.rows[0] as Record<string, unknown> | undefined) ?? {};
+  return c.json({
+    success: true,
+    data: {
+      enabled: row.caldav_writeback_enabled === true,
+      url: typeof row.caldav_writeback_url === 'string' ? row.caldav_writeback_url : null,
+      hasCredentials: Boolean(row.caldav_username) || Boolean(row.caldav_password_encrypted),
+    },
+  });
+});
+
+calendar.post('/caldav-writeback', async (c) => {
+  const user = c.get('user');
+  const body = await c.req.json<Record<string, unknown>>().catch((): Record<string, unknown> => ({}));
+  const userId = Number(user.id);
+
+  const current = await query(
+    `SELECT caldav_writeback_enabled, caldav_writeback_url FROM user_configs WHERE user_id = $1`,
+    [userId],
+  );
+  const currentRow = (current.rows[0] as Record<string, unknown> | undefined) ?? {};
+
+  let enabled = currentRow.caldav_writeback_enabled === true;
+  if ('enabled' in body) {
+    if (typeof body.enabled !== 'boolean') {
+      return c.json({ success: false, error: 'enabled 必须是布尔值' }, 400);
+    }
+    enabled = body.enabled;
+  }
+
+  let url = typeof currentRow.caldav_writeback_url === 'string' ? currentRow.caldav_writeback_url : '';
+  if ('url' in body) {
+    if (body.url !== null && typeof body.url !== 'string') {
+      return c.json({ success: false, error: 'url 必须是字符串' }, 400);
+    }
+    url = typeof body.url === 'string' ? body.url.trim() : '';
+    if (url) {
+      const safe = await isSafePublicUrl(url);
+      if (!safe.safe) {
+        return c.json({ success: false, error: safe.reason || 'URL 不安全' }, 400);
+      }
+    }
+  }
+
+  if (enabled && !url) {
+    return c.json({ success: false, error: '启用回写前请先配置 CalDAV 日历集合 URL' }, 400);
+  }
+
+  await query(
+    `INSERT INTO user_configs (user_id, caldav_writeback_enabled, caldav_writeback_url)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (user_id) DO UPDATE SET
+       caldav_writeback_enabled = EXCLUDED.caldav_writeback_enabled,
+       caldav_writeback_url = EXCLUDED.caldav_writeback_url`,
+    [userId, enabled, url || null],
+  );
+
+  return c.json({ success: true, data: { enabled, url: url || null } });
+});
+
+/**
+ * 公开 ICS 订阅源（checkbox 89）
+ * GET    /api/calendar/ics-feeds       列出当前用户的订阅源（永不返回令牌或哈希）
+ * POST   /api/calendar/ics-feeds       创建保存的筛选器（一次性返回明文令牌 + 订阅 URL）
+ * DELETE /api/calendar/ics-feeds/:id   撤销（软删除；公开路由下一次请求即 404）
+ *
+ * 令牌只存 SHA-256 哈希，明文仅在创建响应中出现一次；正文仅含 VEVENT 摘要，
+ * 不含证件号、备注或金额。公开读取路径为 /api/public/ics/:token.ics。
+ */
+calendar.get('/ics-feeds', async (c) => {
+  const user = c.get('user');
+  const feeds = await listIcsFeeds(Number(user.id));
+  return c.json({ success: true, data: { feeds } });
+});
+
+calendar.post('/ics-feeds', async (c) => {
+  const user = c.get('user');
+  const body = await c.req
+    .json<Record<string, unknown>>()
+    .catch((): Record<string, unknown> => ({}));
+
+  const filter = parseIcsFeedFilter(body.filter);
+  if (!filter) {
+    return c.json(
+      { success: false, error: 'filter 无效：需要 { type: "category" | "profile" | "contact", value }' },
+      400,
+    );
+  }
+
+  const rawName = typeof body.name === 'string' ? body.name.trim() : '';
+  const name = rawName ? rawName.slice(0, 80) : defaultIcsFeedName(filter);
+  const { feed, token } = await createIcsFeed(Number(user.id), name, filter);
+
+  const host = c.req.header('Host') || 'localhost';
+  const protocol = c.req.header('X-Forwarded-Proto') || 'https';
+  const url = `${protocol}://${host}/api/public/ics/${token}.ics`;
+  return c.json(
+    { success: true, data: { ...feed, url, webcalUrl: url.replace(/^https/, 'webcal') } },
+    201,
+  );
+});
+
+calendar.delete('/ics-feeds/:id', async (c) => {
+  const user = c.get('user');
+  const id = Number(c.req.param('id'));
+  if (!Number.isInteger(id) || id <= 0) {
+    return c.json({ success: false, error: '无效的订阅源 ID' }, 400);
+  }
+  const revoked = await revokeIcsFeed(Number(user.id), id);
+  if (!revoked) {
+    return c.json({ success: false, error: '订阅源不存在或已撤销' }, 404);
+  }
+  return c.json({ success: true });
 });
 
 /**

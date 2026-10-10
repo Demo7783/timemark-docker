@@ -1,4 +1,5 @@
 import type { ReminderConfig, ContactLabeledEntry } from '@timemark/shared';
+import { channelForAccountType } from './channel-account-type';
 import {
   normalizeEmail,
   resolveContactGreetingName,
@@ -22,40 +23,12 @@ export interface FixedContactForEvent {
   phones?: ContactLabeledEntry[];
 }
 
-/** 通知账号 type → 事件表单 channel value */
-export const ACCOUNT_TYPE_TO_CHANNEL: Record<string, string> = {
-  email: 'email',
-  resend: 'resend',
-  smtp: 'smtp',
-  feishu: 'feishu',
-  wecom: 'wecom',
-  dingtalk: 'dingtalk',
-  telegram: 'telegram',
-  discord: 'discord',
-  slack: 'slack',
-  googlechat: 'googlechat',
-  irc: 'irc',
-  synologychat: 'synologychat',
-  twitch: 'twitch',
-  line: 'line',
-  matrix: 'matrix',
-  mattermost: 'mattermost',
-  msteams: 'msteams',
-  nextcloudtalk: 'nextcloud_talk',
-  wxpusher: 'wxpusher',
-  qmsg: 'qmsg',
-  serverchan: 'serverchan',
-  pushplus: 'pushplus',
-  bark: 'bark',
-  gotify: 'gotify',
-  meow: 'meow',
-  pushme: 'pushme',
-  pushdeer: 'pushdeer',
-  wecomapp: 'wecomapp',
-  ntfy: 'ntfy',
-  pushover: 'pushover',
-  apprise: 'apprise',
-};
+/**
+ * 账号 type → 事件渠道 value。
+ * 以前是一张手抄的整表（44 项），抄漏就让联系人的渠道绑定选不中；现在 identity 由
+ * channelForAccountType 兜住，只有历史别名需要显式处理。它返回的是**规范**渠道 id，
+ * 与选择器渲染的 value 一致，否则联系人勾了渠道用户在表单里看不到。
+ */
 
 function getContactEmails(contact: FixedContactForEvent): string[] {
   const set = new Set<string>();
@@ -86,7 +59,7 @@ export function mergeContactIntoReminderConfig(
   for (const id of contact.channel_account_ids || []) {
     const acc = accounts.find((a) => Number(a.id) === id);
     if (!acc) continue;
-    const ch = ACCOUNT_TYPE_TO_CHANNEL[acc.type] || acc.type;
+    const ch = channelForAccountType(acc.type);
     channels.add(ch);
     accountIds.add(String(acc.id));
   }
@@ -101,7 +74,7 @@ export function mergeContactIntoReminderConfig(
 
 export function applyContactAsPerson(
   contact: FixedContactForEvent,
-  prev: { personName?: string; name?: string; type?: string },
+  prev: { personName?: string | null; name?: string; type?: string },
 ): Partial<{ personName: string; name: string }> {
   const personName = resolveContactPersonName(contact);
   const updates: Partial<{ personName: string; name: string }> = {
@@ -119,7 +92,7 @@ export function applyContactsAsReminders(
   contacts: FixedContactForEvent[],
   accounts: Array<{ id: string | number; type: string }>,
   existingConfig: ReminderConfig,
-  prev: { reminderRecipientName?: string },
+  prev: { reminderRecipientName?: string | null },
 ): {
   reminderRecipientName: string;
   reminderRecipientEmail?: string;

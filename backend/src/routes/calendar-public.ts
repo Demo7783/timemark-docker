@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { createHash } from 'crypto';
+import { normalizeTimezone } from '../utils/timezone.js';
 import { query } from '../db/index.js';
 import { getEventsByUserId } from '../services/event.service.js';
 import { getUserConfig } from '../services/config.service.js';
@@ -49,15 +50,10 @@ async function resolveUserIdByFeedToken(token: string): Promise<number | null> {
   );
   if (legacy.rows.length) return legacy.rows[0].user_id as number;
 
-  // SQLite 等价于 PG 的 `calendar_feed_tokens @> '[{"token":x}]'::jsonb`：
-  // 数组中存在任一元素其 $.token 等于给定 token（元素可含其他键，语义一致）
   const multi = await query(
     `SELECT user_id FROM user_configs
-     WHERE EXISTS (
-       SELECT 1 FROM json_each(calendar_feed_tokens)
-       WHERE json_extract(value, '$.token') = $1
-     )`,
-    [token],
+     WHERE calendar_feed_tokens @> $1::jsonb`,
+    [JSON.stringify([{ token }])],
   );
   if (multi.rows.length) return multi.rows[0].user_id as number;
   return null;
@@ -73,7 +69,7 @@ calendarPublic.get('/feed/:token.ics', async (c) => {
 
   const config = await getUserConfig(userId);
   const events = await getEventsByUserId(String(userId));
-  const tz = config?.timezone || 'Asia/Shanghai';
+  const tz = normalizeTimezone(config?.timezone || 'Asia/Shanghai');
   const ics = generateICS(events as unknown as Array<Record<string, unknown>>, tz);
   const etag = `"${createHash('sha256').update(ics).digest('hex').slice(0, 16)}"`;
 

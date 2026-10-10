@@ -2,20 +2,10 @@ import { query } from '../db/index.js';
 import { verifyPassword } from '../utils/password.js';
 import { randomUUID } from 'crypto';
 import { authenticator } from 'otplib';
-import { BlockList, isIP } from 'node:net';
 import type { User } from '@timemark/shared';
+import { createLogger } from '../utils/logger.js';
 
-const LOOPBACK_IPS = new BlockList();
-LOOPBACK_IPS.addSubnet('127.0.0.0', 8, 'ipv4');
-LOOPBACK_IPS.addAddress('::1', 'ipv6');
-LOOPBACK_IPS.addSubnet('::ffff:127.0.0.0', 104, 'ipv6');
-
-function isLoopbackIp(ip: string): boolean {
-  const family = isIP(ip);
-  if (family === 4) return LOOPBACK_IPS.check(ip, 'ipv4');
-  if (family === 6) return LOOPBACK_IPS.check(ip, 'ipv6');
-  return false;
-}
+const log = createLogger('auth');
 
 export type LoginUser = User & {
   totpSecret?: string | null;
@@ -125,7 +115,10 @@ export async function createLoginLog(
       [id, userId, username, ip, userAgent, fingerprint, success ? true : false, reason || null],
     );
   } catch (error) {
-    console.error('[createLoginLog] Failed:', error);
+    log.warn(
+      { event: 'auth.login_log_write_failed', err: error, success, reason: reason ?? null },
+      'Failed to write login log',
+    );
   }
 }
 
@@ -293,13 +286,13 @@ export async function getIpBlockStatus(ip: string): Promise<{ isBlocked: boolean
 
 /** 统计该 IP 近 1 小时失败次数，超阈值则封禁 */
 export async function evaluateIpBlock(ip: string): Promise<void> {
-  if (!ip || isLoopbackIp(ip)) return;
+  if (!ip || ip === '127.0.0.1') return;
 
   const countResult = await query(
-    `SELECT COUNT(*) AS count FROM login_logs
+    `SELECT COUNT(*)::int AS count FROM login_logs
      WHERE ip_address = $1 AND success = FALSE
        AND COALESCE(failure_reason, '') NOT IN ('turnstile_failed', 'locked_attempt', 'totp_invalid')
-       AND login_time > datetime('now', '-1 hour')`,
+       AND login_time > NOW() - INTERVAL '1 hour'`,
     [ip],
   );
   const count = countResult.rows[0]?.count ?? 0;

@@ -21,6 +21,8 @@ export const AVAILABLE_VARIABLES = [
   { key: '{{days_until}}', label: '距离天数', example: '3' },
   { key: '{{blessing}}', label: '祝福语', example: '生日快乐！' },
   { key: '{{reminder_time}}', label: '提醒时间', example: '09:00' },
+  { key: '{{lunar_date}}', label: '农历日期', example: '正月初一' },
+  { key: '{{calendar_type}}', label: '历法类型', example: '农历' },
 ];
 
 // 预设模板
@@ -29,7 +31,7 @@ export const PRESET_TEMPLATES: NotificationTemplate[] = [
   {
     id: 'birthday',
     name: '生日提醒',
-    content: '🎂 {{person_name}} 的生日还有 {{days_until}} 天！{{blessing}}',
+    content: '{{person_name}}的生日还有{{days_until}}天。{{blessing}}',
     isPreset: true,
     variables: ['person_name', 'days_until', 'blessing'],
     description: '适用于生日提醒，包含被提醒人和祝福语',
@@ -37,7 +39,7 @@ export const PRESET_TEMPLATES: NotificationTemplate[] = [
   {
     id: 'birthday_simple',
     name: '生日简洁版',
-    content: '🎂 {{event_name}} 还有 {{days_until}} 天',
+    content: '{{event_name}}还有{{days_until}}天',
     isPreset: true,
     variables: ['event_name', 'days_until'],
     description: '简洁的生日提醒',
@@ -199,29 +201,57 @@ export const PRESET_TEMPLATES: NotificationTemplate[] = [
     variables: ['event_name', 'days_until', 'blessing'],
     description: '适用于毕业典礼等',
   },
-  // 婚礼模板
+  // 农历生日
   {
-    id: 'wedding',
-    name: '婚礼提醒',
-    content: '💒 {{event_name}} 还有 {{days_until}} 天！\n💍 {{blessing}}',
+    id: 'birthday_lunar',
+    name: '农历生日',
+    content: '🎂 {{person_name}} 的农历生日还有 {{days_until}} 天！\n🌙 农历：{{lunar_date}}\n📅 公历：{{event_date}}\n🎉 {{blessing}}',
     isPreset: true,
-    variables: ['event_name', 'days_until', 'blessing'],
-    description: '适用于婚礼、订婚等',
+    variables: ['person_name', 'days_until', 'lunar_date', 'event_date', 'blessing'],
+    description: '农历生日提醒，含双历日期',
   },
-  // 医疗模板
   {
-    id: 'medical',
-    name: '医疗提醒',
-    content: '🏥 {{event_name}} 还有 {{days_until}} 天\n📋 请带好病历和医保卡',
+    id: 'birthday_both',
+    name: '双历生日',
+    content: '🎂 {{person_name}} 生日提醒（公历+农历）\n📅 公历：{{event_date}} | 🌙 农历：{{lunar_date}}\n还有 {{days_until}} 天 · {{blessing}}',
+    isPreset: true,
+    variables: ['person_name', 'days_until', 'event_date', 'lunar_date', 'blessing'],
+    description: '同时记录公历与农历的生日',
+  },
+  // 传统节日
+  {
+    id: 'spring_festival',
+    name: '春节提醒',
+    content: '🧧 {{event_name}} 还有 {{days_until}} 天！记得准备年货和红包～',
     isPreset: true,
     variables: ['event_name', 'days_until'],
-    description: '适用于体检、复诊、手术等',
+  },
+  {
+    id: 'mid_autumn',
+    name: '中秋提醒',
+    content: '🥮 {{event_name}} 还有 {{days_until}} 天！月圆人团圆。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+  },
+  {
+    id: 'dragon_boat',
+    name: '端午提醒',
+    content: '🐲 {{event_name}} 还有 {{days_until}} 天！记得吃粽子。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+  },
+  {
+    id: 'qixi',
+    name: '七夕提醒',
+    content: '💕 {{event_name}} 还有 {{days_until}} 天！',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
   },
   // 通用模板
   {
     id: 'generic',
     name: '通用提醒',
-    content: '📅 {{event_name}} 还有 {{days_until}} 天',
+    content: '提醒一下：{{event_name}}还有{{days_until}}天。',
     isPreset: true,
     variables: ['event_name', 'days_until'],
     description: '适用于所有类型的事件',
@@ -229,19 +259,262 @@ export const PRESET_TEMPLATES: NotificationTemplate[] = [
   {
     id: 'detailed',
     name: '详细提醒',
-    content: '📅 事件：{{event_name}}\n📆 日期：{{event_date}}\n👤 被提醒人：{{person_name}}\n⏰ 距离：{{days_until}} 天\n🎉 {{blessing}}',
+    content: '{{event_name}}，日期{{event_date}}，还有{{days_until}}天。{{blessing}}',
     isPreset: true,
     variables: ['event_name', 'event_date', 'person_name', 'days_until', 'blessing'],
     description: '显示完整的事件信息',
   },
+  // 到期中心模板（D1：按 kind 的模板家族，事件类型为 expiry_<kind>）
+  {
+    id: 'expiry_subscription',
+    name: '订阅续费提醒',
+    content: '📦 {{event_name}} 还有 {{days_until}} 天到期，记得确认订阅续费。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于会员/软件订阅等周期扣费项目',
+  },
+  {
+    id: 'expiry_bill',
+    name: '账单缴费提醒',
+    content: '🧾 {{event_name}} 还有 {{days_until}} 天到期，请及时缴费。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于房租/水电/话费等账单',
+  },
+  {
+    id: 'expiry_insurance',
+    name: '保险续保提醒',
+    content: '🛡️ {{event_name}} 还有 {{days_until}} 天到期，记得办理续保。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于车险/医疗险等保险到期',
+  },
+  {
+    id: 'expiry_domain',
+    name: '域名到期提醒',
+    content: '🌐 {{event_name}} 还有 {{days_until}} 天到期，请及时续费以免解析中断。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于域名/证书等到期',
+  },
+  {
+    id: 'expiry_warranty',
+    name: '保修到期提醒',
+    content: '🔧 {{event_name}} 还有 {{days_until}} 天过保，如有问题请尽快送修。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于家电/数码产品保修到期',
+  },
+  {
+    id: 'expiry_custom',
+    name: '自定义到期提醒',
+    content: '📌 {{event_name}} 还有 {{days_until}} 天到期。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于其它需要跟踪到期日的项目',
+  },
+  // 库存模板（D12：按 category 的模板家族，事件类型为 inventory_<category>）
+  {
+    id: 'inventory_food',
+    name: '食品保质期提醒',
+    content: '🥛 {{event_name}} 还有 {{days_until}} 天到保质期，记得优先食用。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于牛奶/生鲜等食品库存',
+  },
+  {
+    id: 'inventory_medicine',
+    name: '药品有效期提醒',
+    content: '💊 {{event_name}} 还有 {{days_until}} 天过期，请及时更换或补货。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于家庭药箱药品',
+  },
+  {
+    id: 'inventory_supply',
+    name: '耗材补货提醒',
+    content: '🧴 {{event_name}} 还有 {{days_until}} 天到期，注意库存并及时补货。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于日化/纸品等耗材',
+  },
+  {
+    id: 'inventory_other',
+    name: '库存到期提醒',
+    content: '📦 {{event_name}} 还有 {{days_until}} 天到期。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于其它需要跟踪保质期的库存',
+  },
+  // 保养模板（D12：按 asset_kind 的模板家族，事件类型为 maintenance_<kind>）
+  {
+    id: 'maintenance_vehicle',
+    name: '车辆保养提醒',
+    content: '🚗 {{event_name}} 还有 {{days_until}} 天到保养日期，记得预约。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于汽车/摩托等车辆保养',
+  },
+  {
+    id: 'maintenance_appliance',
+    name: '家电保养提醒',
+    content: '🔌 {{event_name}} 还有 {{days_until}} 天到保养日期。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于空调/净水器等家电保养',
+  },
+  {
+    id: 'maintenance_device',
+    name: '设备保养提醒',
+    content: '🛠️ {{event_name}} 还有 {{days_until}} 天到保养日期。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于发电机/仪器等设备保养',
+  },
+  {
+    id: 'maintenance_other',
+    name: '保养提醒',
+    content: '🗓️ {{event_name}} 还有 {{days_until}} 天到保养日期。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于其它定期保养项目',
+  },
+  // 证件模板（D2，todo 55：按 kind 的模板家族，事件类型为 document_<kind>）
+  {
+    id: 'document_passport',
+    name: '护照到期提醒',
+    content: '🛂 {{event_name}} 还有 {{days_until}} 天到期，请及时安排换发。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于护照到期（默认提前 180/90/30/7/0 天提醒）',
+  },
+  {
+    id: 'document_visa',
+    name: '签证到期提醒',
+    content: '✈️ {{event_name}} 还有 {{days_until}} 天到期，请提前规划续签。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于签证到期（默认提前 180/90/30/7/0 天提醒）',
+  },
+  {
+    id: 'document_id_card',
+    name: '身份证到期提醒',
+    content: '🪪 {{event_name}} 还有 {{days_until}} 天到期，请及时换领。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于身份证等身份证件',
+  },
+  {
+    id: 'document_driver_license',
+    name: '驾照到期提醒',
+    content: '🚗 {{event_name}} 还有 {{days_until}} 天到期，记得办理换证。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于驾驶证到期换证',
+  },
+  {
+    id: 'document_certificate',
+    name: '证书到期提醒',
+    content: '📜 {{event_name}} 还有 {{days_until}} 天到期，请留意有效期。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于资格证书、职业证书等',
+  },
+  {
+    id: 'document_policy',
+    name: '保单到期提醒',
+    content: '🛡️ {{event_name}} 还有 {{days_until}} 天到期，记得续保。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于保险保单到期',
+  },
+  {
+    id: 'document_contract',
+    name: '合同到期提醒',
+    content: '📄 {{event_name}} 还有 {{days_until}} 天到期，请确认是否续签。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于租约、服务合同到期',
+  },
+  {
+    id: 'document_other',
+    name: '证件到期提醒',
+    content: '📌 {{event_name}} 还有 {{days_until}} 天到期。',
+    isPreset: true,
+    variables: ['event_name', 'days_until'],
+    description: '适用于其它需要跟踪有效期的证件',
+  },
+  {
+    id: 'document_expired',
+    name: '证件已过期',
+    content: '⚠️ {{event_name}} 已过期（到期日 {{event_date}}），请尽快处理。',
+    isPreset: true,
+    variables: ['event_name', 'event_date'],
+    description: '证件过期后的最终提醒（每本证件只发一次）',
+  },
+  // 个人 CRM（D4，checkbox 62）：联系节奏提醒（每周期至多一条）
+  {
+    id: 'contact_cadence',
+    name: '关系维系提醒',
+    content: '🤝 该联系 {{event_name}} 了（已超过设定的联系间隔），记得问候一下。',
+    isPreset: true,
+    variables: ['event_name', 'event_date'],
+    description: '到期联系人提醒：每个联系周期至多一条，记录互动后重新计时',
+  },
+  // 习惯打卡（D6，checkbox 64/65）
+  {
+    id: 'habit_reminder',
+    name: '习惯打卡提醒',
+    content: '⏰ 习惯打卡：{{event_name}}，别忘了今天的目标。',
+    isPreset: true,
+    variables: ['event_name', 'event_date'],
+    description: '按习惯的提醒时刻与计划星期发送',
+  },
+  {
+    id: 'habit_streak_risk',
+    name: '习惯连胜告急',
+    content: '🔥 {{event_name}} 今天还没达标，连续记录即将中断。',
+    isPreset: true,
+    variables: ['event_name', 'event_date'],
+    description: '每晚（默认 20:00）目标未达成时的一条连胜保护提醒',
+  },
+  // 家庭用药（D3，checkbox 73）：按 schedule_times 的每个时刻发送
+  {
+    id: 'medication_reminder',
+    name: '服药提醒',
+    content: '💊 服药提醒：{{event_name}}，请按计划服药（{{reminder_time}}）。',
+    isPreset: true,
+    variables: ['event_name', 'reminder_time', 'event_date'],
+    description: '按用药计划的每个时刻发送；支持 10 分钟稍后提醒与 +30 分钟升级提醒',
+  },
+  {
+    id: 'medication_snooze',
+    name: '服药稍后提醒',
+    content: '💊 稍后提醒：该服用 {{event_name}} 了（{{reminder_time}}）。',
+    isPreset: true,
+    variables: ['event_name', 'reminder_time', 'event_date'],
+    description: '用户点击「稍后提醒」后 10 分钟再发一条',
+  },
+  {
+    id: 'medication_escalation',
+    name: '服药升级提醒',
+    content: '⏰ 仍未记录服药：{{event_name}}（计划 {{reminder_time}}），请尽快服用或标记。',
+    isPreset: true,
+    variables: ['event_name', 'reminder_time', 'event_date'],
+    description: '计划时刻 +30 分钟后仍未记录时的升级提醒（仅一次）',
+  },
 ];
+
+/** 批量邮件预设 — 见 broadcast-templates.ts */
+export { BROADCAST_PRESET_TEMPLATES, BROADCAST_TEMPLATE_CATEGORIES, buildBroadcastEmail, renderBroadcastTemplate } from './broadcast-templates.js';
+export type { BroadcastTemplateCategory, BroadcastGreetingVariant } from './broadcast-templates.js';
 
 // 事件类型到模板的映射
 export const EVENT_TYPE_TEMPLATES: Record<string, string[]> = {
-  birthday: ['birthday', 'birthday_simple', 'birthday_detailed', 'generic', 'detailed'],
+  birthday: ['birthday', 'birthday_lunar', 'birthday_both', 'birthday_simple', 'birthday_detailed', 'generic', 'detailed'],
   exam: ['exam', 'exam_urgent', 'generic', 'detailed'],
   anniversary: ['anniversary', 'anniversary_simple', 'generic', 'detailed'],
-  holiday: ['holiday', 'holiday_family', 'generic', 'detailed'],
+  holiday: ['holiday', 'holiday_family', 'spring_festival', 'mid_autumn', 'dragon_boat', 'qixi', 'generic', 'detailed'],
   meeting: ['meeting', 'generic', 'detailed'],
   deadline: ['deadline', 'deadline_urgent', 'generic', 'detailed'],
   travel: ['travel', 'generic', 'detailed'],
@@ -249,6 +522,42 @@ export const EVENT_TYPE_TEMPLATES: Record<string, string[]> = {
   wedding: ['wedding', 'anniversary', 'generic', 'detailed'],
   medical: ['medical', 'generic', 'detailed'],
   other: ['generic', 'detailed'],
+  // 到期中心（D1）：kind → expiry_<kind> 模板家族
+  expiry_subscription: ['expiry_subscription', 'generic', 'detailed'],
+  expiry_bill: ['expiry_bill', 'generic', 'detailed'],
+  expiry_insurance: ['expiry_insurance', 'generic', 'detailed'],
+  expiry_domain: ['expiry_domain', 'generic', 'detailed'],
+  expiry_warranty: ['expiry_warranty', 'generic', 'detailed'],
+  expiry_custom: ['expiry_custom', 'generic', 'detailed'],
+  // 库存（D12）：category → inventory_<category> 模板家族
+  inventory_food: ['inventory_food', 'generic', 'detailed'],
+  inventory_medicine: ['inventory_medicine', 'generic', 'detailed'],
+  inventory_supply: ['inventory_supply', 'generic', 'detailed'],
+  inventory_other: ['inventory_other', 'generic', 'detailed'],
+  // 保养（D12）：asset_kind → maintenance_<kind> 模板家族
+  maintenance_vehicle: ['maintenance_vehicle', 'generic', 'detailed'],
+  maintenance_appliance: ['maintenance_appliance', 'generic', 'detailed'],
+  maintenance_device: ['maintenance_device', 'generic', 'detailed'],
+  maintenance_other: ['maintenance_other', 'generic', 'detailed'],
+  // 证件（D2）：kind → document_<kind> 模板家族；过期有独立家族
+  document_passport: ['document_passport', 'generic', 'detailed'],
+  document_visa: ['document_visa', 'generic', 'detailed'],
+  document_id_card: ['document_id_card', 'generic', 'detailed'],
+  document_driver_license: ['document_driver_license', 'generic', 'detailed'],
+  document_certificate: ['document_certificate', 'generic', 'detailed'],
+  document_policy: ['document_policy', 'generic', 'detailed'],
+  document_contract: ['document_contract', 'generic', 'detailed'],
+  document_other: ['document_other', 'generic', 'detailed'],
+  document_expired: ['document_expired', 'generic', 'detailed'],
+  // 个人 CRM（D4）：联系节奏提醒
+  contact_cadence: ['contact_cadence', 'generic', 'detailed'],
+  // 习惯打卡（D6）：定时打卡 / 连胜告急
+  habit_reminder: ['habit_reminder', 'generic', 'detailed'],
+  habit_streak_risk: ['habit_streak_risk', 'generic', 'detailed'],
+  // 家庭用药（D3）：按时刻提醒 / 稍后 / 升级
+  medication_reminder: ['medication_reminder', 'generic', 'detailed'],
+  medication_snooze: ['medication_snooze', 'medication_reminder', 'generic'],
+  medication_escalation: ['medication_escalation', 'medication_reminder', 'generic'],
 };
 
 /**
@@ -266,6 +575,8 @@ export function renderTemplate(template: string, data: Record<string, string>): 
     '{{days_until}}': data.days_until || '',
     '{{blessing}}': data.blessing || '',
     '{{reminder_time}}': data.reminder_time || '',
+    '{{lunar_date}}': data.lunar_date || '',
+    '{{calendar_type}}': data.calendar_type || '',
   };
   
   // 中文变量映射
@@ -277,6 +588,8 @@ export function renderTemplate(template: string, data: Record<string, string>): 
     '{{天数}}': data.days_until || '',
     '{{祝福语}}': data.blessing || '',
     '{{时间}}': data.reminder_time || '',
+    '{{农历}}': data.lunar_date || '',
+    '{{历法}}': data.calendar_type || '',
   };
   
   // 替换英文变量
@@ -302,6 +615,41 @@ export function getEventTypeLabel(type: string): string {
     anniversary: '纪念日',
     holiday: '节日',
     other: '其他',
+    // 到期中心（D1）
+    expiry_subscription: '订阅',
+    expiry_bill: '账单',
+    expiry_insurance: '保险',
+    expiry_domain: '域名',
+    expiry_warranty: '保修',
+    expiry_custom: '到期项',
+    // 库存（D12）
+    inventory_food: '食品',
+    inventory_medicine: '药品',
+    inventory_supply: '耗材',
+    inventory_other: '库存',
+    // 保养（D12）
+    maintenance_vehicle: '车辆保养',
+    maintenance_appliance: '家电保养',
+    maintenance_device: '设备保养',
+    maintenance_other: '保养',
+    // 证件（D2，todo 55）
+    document_passport: '护照',
+    document_visa: '签证',
+    document_id_card: '身份证',
+    document_driver_license: '驾驶证',
+    document_certificate: '证书',
+    document_policy: '保单',
+    document_contract: '合同',
+    document_other: '证件',
+    document_expired: '证件已过期',
+    // 个人 CRM / 习惯（wave 8）
+    contact_cadence: '关系维系',
+    habit_reminder: '习惯打卡',
+    habit_streak_risk: '习惯连胜',
+    // 家庭用药（D3）
+    medication_reminder: '服药提醒',
+    medication_snooze: '服药稍后提醒',
+    medication_escalation: '服药升级提醒',
   };
   return labels[type] || type;
 }
@@ -316,6 +664,8 @@ export function generateNotificationContent(
     date: string;
     type: string;
     personName?: string;
+    lunarDate?: string;
+    calendarType?: string;
   },
   daysUntil: number,
   blessing: string,
@@ -333,9 +683,106 @@ export function generateNotificationContent(
     days_until: String(daysUntil),
     blessing: blessing,
     reminder_time: reminderTime || '',
+    lunar_date: event.lunarDate || '',
+    calendar_type: event.calendarType === 'lunar' ? '农历' : event.calendarType === 'both' ? '双历' : '公历',
   };
   
   return renderTemplate(templateContent, data);
+}
+
+/**
+ * 模板正文里引用到的 `{{变量}}` 名称（按首次出现顺序去重）。
+ *
+ * 供 AI 翻译路径（checkbox 108）校验：译文必须原样保留源模板声明的每个占位符，
+ * 因此调用方用「源占位符集合 == 译文占位符集合」判定是否接受模型输出。
+ */
+export function templatePlaceholders(content: string): string[] {
+  const names: string[] = [];
+  const pattern = /\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g;
+  let match: RegExpExecArray | null = pattern.exec(content);
+  while (match !== null) {
+    const name = match[1];
+    if (!names.includes(name)) names.push(name);
+    match = pattern.exec(content);
+  }
+  return names;
+}
+
+// ============================================================
+// 农历双历展示（checkbox 169）
+// ============================================================
+
+/** 农历月份中文名（序号 1-12）。 */
+export const LUNAR_MONTH_NAMES = [
+  '正月', '二月', '三月', '四月', '五月', '六月',
+  '七月', '八月', '九月', '十月', '冬月', '腊月',
+] as const;
+
+/** 农历日期中文名（初一..三十）。 */
+export const LUNAR_DAY_NAMES = [
+  '初一', '初二', '初三', '初四', '初五', '初六', '初七', '初八', '初九', '初十',
+  '十一', '十二', '十三', '十四', '十五', '十六', '十七', '十八', '十九', '二十',
+  '廿一', '廿二', '廿三', '廿四', '廿五', '廿六', '廿七', '廿八', '廿九', '三十',
+] as const;
+
+/** 归一化后的农历月日。 */
+export interface PersistedLunarDateParts {
+  /** 正数月份（闰月由 isLeap 表达）。 */
+  month: number;
+  day: number;
+  isLeap: boolean;
+}
+
+/**
+ * 解析持久化的 `events.lunar_date`（JSON 字符串或对象，`{year,month,day,isLeap}`）。
+ *
+ * 闰月既可能由 `isLeap:true` 标记，也可能由 lunar-javascript 约定的**负数月份**编码
+ * （如 `-2` 表示闰二月）；两者都归一化为 `{month: 正数, isLeap: true}`。缺失、格式畸形、
+ * 或月/日越界一律返回 `null` —— 调用方必须优雅降级，绝不猜一个日期（错的日期是最坏结果）。
+ */
+export function parseLunarDateParts(raw: unknown): PersistedLunarDateParts | null {
+  let data: unknown = raw;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    try {
+      data = JSON.parse(trimmed);
+    } catch {
+      return null;
+    }
+  }
+  if (!data || typeof data !== 'object') return null;
+  const record = data as Record<string, unknown>;
+  const rawMonth = Number(record.month);
+  const day = Number(record.day);
+  if (!Number.isInteger(rawMonth) || rawMonth === 0 || Math.abs(rawMonth) > 12) return null;
+  if (!Number.isInteger(day) || day < 1 || day > LUNAR_DAY_NAMES.length) return null;
+  return {
+    month: Math.abs(rawMonth),
+    day,
+    isLeap: record.isLeap === true || rawMonth < 0,
+  };
+}
+
+/**
+ * 农历月日中文文本，如 `八月十五`、闰月 `闰二月廿一`（不含「农历」前缀，与
+ * `{{lunar_date}}` 变量的文档示例 `正月初一` 一致）。缺失/畸形返回 `''`。
+ */
+export function formatLunarMonthDay(raw: unknown): string {
+  const parts = parseLunarDateParts(raw);
+  if (!parts) return '';
+  const monthName = LUNAR_MONTH_NAMES[parts.month - 1];
+  const dayName = LUNAR_DAY_NAMES[parts.day - 1];
+  if (!monthName || !dayName) return '';
+  return `${parts.isLeap ? '闰' : ''}${monthName}${dayName}`;
+}
+
+/**
+ * 带「农历」前缀的展示标签，如 `农历八月十五`。缺失/畸形返回 `''`（优雅降级）。
+ */
+export function formatLunarDateLabel(raw: unknown): string {
+  const monthDay = formatLunarMonthDay(raw);
+  return monthDay ? `农历${monthDay}` : '';
 }
 
 /**

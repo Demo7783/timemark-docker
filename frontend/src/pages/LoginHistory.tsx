@@ -1,16 +1,18 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { ShieldCheck, Monitor, Smartphone, Globe, MapPin, ArrowLeft, Trash2, RefreshCw } from 'lucide-react';
+import { ShieldCheck, Monitor, Smartphone, Globe, MapPin, Trash2 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { useNavigate } from 'react-router-dom';
+import { PageHeader } from '@/components/layout/PageHeader';
+import { EmptyState } from '@/components/ui/empty-state';
+import { SkeletonCard } from '@/components/ui/skeleton-card';
 import { api } from '@/lib/api';
 
 const containerVariants = { hidden: { opacity: 0 }, visible: { opacity: 1, transition: { staggerChildren: 0.1 } } };
-const itemVariants = { hidden: { opacity: 0, y: 15 }, visible: { opacity: 1, y: 0, transition: { type: 'spring', stiffness: 300, damping: 24 } } };
+const itemVariants = { hidden: { opacity: 0, y: 15 }, visible: { opacity: 1, y: 0, transition: { type: 'spring', stiffness: 300, damping: 24 } as const } };
 
 interface LoginLog {
-  id: number;
+  id: string;
   ip_address: string;
   username?: string;
   user_agent: string;
@@ -18,6 +20,7 @@ interface LoginLog {
   success: boolean;
   failure_reason?: string;
   login_time: string;
+  geo?: string;
 }
 
 // Helper to get device icon
@@ -56,10 +59,10 @@ const getOSName = (userAgent: string): string => {
 };
 
 export default function LoginHistory() {
-  const navigate = useNavigate();
   const [logs, setLogs] = useState<LoginLog[]>([]);
   const [loading, setLoading] = useState(true);
   const [clearing, setClearing] = useState(false);
+  const [ipFilter, setIpFilter] = useState('');
 
   useEffect(() => {
     fetchLogs();
@@ -68,16 +71,12 @@ export default function LoginHistory() {
   const fetchLogs = async () => {
     setLoading(true);
     try {
-      const data = await api.get<LoginLog[]>('/auth/login-history');
+      const q = ipFilter ? `?ip=${encodeURIComponent(ipFilter)}` : '';
+      const data = await api.get<LoginLog[]>(`/auth/login-history${q}`);
       setLogs(data);
     } catch (error) {
       console.error('Failed to fetch login history:', error);
-      // Use mock data on error
-      setLogs([
-        { id: 1, ip_address: '192.168.1.100', user_agent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0', success: true, login_time: new Date().toISOString() },
-        { id: 2, ip_address: '113.89.23.45', user_agent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Safari/605.1', success: true, login_time: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString() },
-        { id: 3, ip_address: '45.33.12.9', user_agent: 'Mozilla/5.0', success: false, failure_reason: 'Invalid credentials', login_time: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString() },
-      ]);
+      setLogs([]);
     } finally {
       setLoading(false);
     }
@@ -90,10 +89,10 @@ export default function LoginHistory() {
     try {
       await api.delete('/auth/login-history');
       setLogs([]);
+      alert('登录历史已清空');
     } catch (error) {
       console.error('Failed to clear logs:', error);
-      setLogs([]);
-      alert('日志已清空');
+      alert('清空失败，请稍后重试');
     } finally {
       setClearing(false);
     }
@@ -124,57 +123,40 @@ export default function LoginHistory() {
     return `${year}/${month}/${day} ${hour}:${minute}`;
   };
 
-  const getLocation = (ip: string) => {
+  const getLocation = (log: LoginLog) => {
+    if (log.geo) return log.geo;
+    const ip = log.ip_address;
+    if (!ip) return '未知';
     if (ip.startsWith('192.168') || ip.startsWith('10.') || ip.startsWith('172.')) {
-      return '内网访问';
+      return '内网';
     }
-    if (ip === '127.0.0.1') return '本地';
-    return '广东深圳';
+    if (ip === '127.0.0.1' || ip === '::1') return '本地';
+    return '公网';
   };
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="min-h-screen pb-24">
-      <header className="sticky top-6 z-40 px-4 max-w-4xl mx-auto">
-        <div className="glass-panel rounded-full px-6 py-3.5 flex justify-between items-center ring-1 ring-black/5 dark:ring-white/10 shadow-sm">
-          <div className="flex items-center gap-4">
-            <Button variant="ghost" size="icon" className="rounded-full" onClick={() => navigate(-1)}><ArrowLeft size={20} /></Button>
-            <div>
-              <h1 className="text-xl font-bold text-slate-900 dark:text-white tracking-tight">登录历史</h1>
-              <p className="text-xs text-slate-500 dark:text-slate-400 font-medium">查看近期登录记录与设备</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            <Button variant="ghost" size="icon" className="rounded-full" onClick={fetchLogs} disabled={loading}>
-              <RefreshCw size={20} className={loading ? 'animate-spin' : ''} />
-            </Button>
+      <PageHeader
+        title="登录历史"
+        subtitle="查看近期登录记录与设备"
+        actions={
+          <>
+            <input className="text-xs px-2 py-1 rounded-full border bg-transparent w-24" placeholder="筛选IP" value={ipFilter} onChange={(e) => setIpFilter(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && fetchLogs()} />
+            <Button variant="ghost" size="sm" className="rounded-full" onClick={() => window.open('/api/auth/login-history/export', '_blank')}>导出</Button>
             <Button variant="ghost" size="sm" className="rounded-full text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30" onClick={clearLogs} disabled={clearing || logs.length === 0}>
               <Trash2 size={16} className="mr-1" />
               清空
             </Button>
-          </div>
-        </div>
-      </header>
+          </>
+        }
+        onRefresh={fetchLogs}
+        refreshing={loading}
+      />
       <main className="max-w-4xl mx-auto px-6 py-10 mt-2">
         {loading ? (
-          <div className="space-y-4">
-            {[1, 2, 3, 4].map((i) => (
-              <div key={i} className="glass-panel rounded-[2.5rem] p-6 animate-pulse">
-                <div className="flex gap-6">
-                  <div className="w-16 h-16 rounded-[1.5rem] bg-slate-200/60 dark:bg-slate-700/50"></div>
-                  <div className="flex-1">
-                    <div className="h-5 bg-slate-200/60 dark:bg-slate-700/50 rounded-full w-1/3 mb-3"></div>
-                    <div className="h-4 bg-slate-200/60 dark:bg-slate-700/50 rounded-full w-1/2"></div>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
+          <SkeletonCard count={4} />
         ) : logs.length === 0 ? (
-          <div className="text-center py-16 glass-panel rounded-[2.5rem] ring-1 ring-black/5 dark:ring-white/10">
-            <ShieldCheck size={48} className="mx-auto text-slate-300 dark:text-slate-600 mb-4" />
-            <h3 className="text-xl font-bold text-slate-900 dark:text-white mb-2">暂无登录记录</h3>
-            <p className="text-slate-500 dark:text-slate-400">您的登录历史将在此处显示</p>
-          </div>
+          <EmptyState icon={ShieldCheck} title="暂无登录记录" description="您的登录历史将在此处显示" />
         ) : (
           <motion.div variants={containerVariants} initial="hidden" animate="visible" className="relative">
             <div className="absolute left-[2.25rem] top-8 bottom-8 w-px bg-gradient-to-b from-primary-500/40 via-slate-200 dark:via-slate-700 to-transparent z-0"></div>
@@ -200,7 +182,7 @@ export default function LoginHistory() {
                           </div>
                           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 mt-2 text-sm font-medium text-slate-500 dark:text-slate-400">
                             <span className="flex items-center gap-1.5">
-                              <MapPin size={14} /> {getLocation(log.ip_address)}
+                              <MapPin size={14} /> {getLocation(log)}
                             </span>
                             <span className="flex items-center gap-1.5">
                               {deviceName} / {osName}

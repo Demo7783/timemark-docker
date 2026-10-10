@@ -1,51 +1,99 @@
 import { sign, verify } from 'hono/jwt';
+import { SESSION_TTL } from './session-ttl.js';
 
 const DEFAULT_JWT_SECRET = 'change-this-secret-in-production';
+const DEV_ONLY_SECRET = DEFAULT_JWT_SECRET;
 
-export function isSecureSecret(): boolean {
-  const current = process.env.JWT_SECRET || DEFAULT_JWT_SECRET;
-  return current !== DEFAULT_JWT_SECRET && current.length >= 32;
+function isProductionEnv(): boolean {
+  return !!(process.env.VERCEL || process.env.NODE_ENV === 'production');
 }
 
-export interface TokenPayload {
-  userId: string;
-  sessionToken?: string;
-  tokenUse: 'access' | 'refresh';
-  refreshTokenId?: string;
-}
-
-function resolveSecret(secret?: string): string {
-  const resolved = secret || process.env.JWT_SECRET || DEFAULT_JWT_SECRET;
-  // 生产环境禁止静默使用公开的默认密钥（vercel 同款加固）。
-  // 正常启动路径中 initSecretKeys() 会先生成并写入随机 JWT_SECRET，因此不受影响。
-  if (process.env.NODE_ENV === 'production' && (!resolved || resolved === DEFAULT_JWT_SECRET || resolved.length < 32)) {
-    throw new Error('JWT_SECRET is missing or too weak for production — refusing to sign tokens with a publicly-known default');
+function resolveJwtSecret(secret?: string): string {
+  const resolved = secret || process.env.JWT_SECRET || (isProductionEnv() ? undefined : DEV_ONLY_SECRET);
+  if (!resolved) {
+    throw new Error('JWT_SECRET must be set in production (>= 32 characters)');
+  }
+  if (isProductionEnv() && (resolved === DEFAULT_JWT_SECRET || resolved.length < 32)) {
+    throw new Error('JWT_SECRET must be a secure random value (>= 32 characters) in production');
   }
   return resolved;
 }
 
-export async function generateAccessToken(userId: string, sessionToken?: string, rememberMe: boolean = false, secret?: string): Promise<string> {
-  const expiresIn = rememberMe ? 60 * 60 : 15 * 60;
-  const payload: Record<string, unknown> = { userId, tokenUse: 'access', exp: Math.floor(Date.now() / 1000) + expiresIn };
+// 安全检查函数
+export function isSecureSecret(): boolean {
+  const current = process.env.JWT_SECRET;
+  return !!current && current !== DEFAULT_JWT_SECRET && current.length >= 32;
+}
+
+export type TokenType = 'access' | 'refresh';
+
+export interface TokenPayload {
+  userId: string;
+  sessionToken?: string;
+  /** Absent on tokens minted before this claim existed; see verifyToken(). */
+  typ?: TokenType;
+  /**
+   * Whether the session was created with "stay signed in". Carried on the refresh
+   * token so `/refresh` reads the mode instead of re-deriving it from the remaining
+   * lifetime — that re-derivation silently downgraded a 30-day session once it had
+   * under 24h left. Absent on pre-existing tokens; treated as `false` (the safe
+   * direction: degrade to a session cookie rather than silently extend).
+   */
+  rememberMe?: boolean;
+}
+
+export async function generateAccessToken(
+  userId: string,
+  sessionToken?: string,
+  rememberMe: boolean = false,
+  secret?: string,
+): Promise<string> {
+  const expiresIn = rememberMe ? SESSION_TTL.accessRememberSeconds : SESSION_TTL.accessShortSeconds;
+  const payload: Record<string, unknown> = {
+    userId,
+    typ: 'access',
+    exp: Math.floor(Date.now() / 1000) + expiresIn,
+  };
   if (sessionToken) payload.sessionToken = sessionToken;
-  return sign(payload, resolveSecret(secret));
+  return sign(payload, resolveJwtSecret(secret));
 }
 
-export async function generateRefreshToken(userId: string, sessionToken: string, refreshTokenId: string, secret?: string): Promise<string> {
-  const payload: Record<string, unknown> = { userId, sessionToken, tokenUse: 'refresh', refreshTokenId, exp: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60 };
-  return sign(payload, resolveSecret(secret));
+export async function generateRefreshToken(
+  userId: string,
+  sessionToken?: string,
+  rememberMe: boolean = false,
+  secret?: string,
+): Promise<string> {
+  const payload: Record<string, unknown> = {
+    userId,
+    typ: 'refresh',
+    rememberMe,
+    exp: Math.floor(Date.now() / 1000) + SESSION_TTL.refreshCookieSeconds,
+  };
+  if (sessionToken) payload.sessionToken = sessionToken;
+  return sign(payload, resolveJwtSecret(secret));
 }
 
-export async function verifyToken(token: string, secret?: string): Promise<TokenPayload | null> {
+export async function verifyToken(
+  token: string,
+  secret?: string,
+  expectedType?: TokenType,
+): Promise<TokenPayload | null> {
   try {
-    const payload = await verify(token, resolveSecret(secret), 'HS256');
-    const tokenUse = payload.tokenUse;
-    const userId = payload.userId;
-    const sessionToken = typeof payload.sessionToken === 'string' ? payload.sessionToken : undefined;
-    const refreshTokenId = typeof payload.refreshTokenId === 'string' ? payload.refreshTokenId : undefined;
-    if ((tokenUse !== 'access' && tokenUse !== 'refresh') || typeof userId !== 'string' || !userId) return null;
-    if (tokenUse === 'refresh' && (!sessionToken || !refreshTokenId)) return null;
-    return { userId, sessionToken, tokenUse, refreshTokenId };
+    const payload = await verify(token, resolveJwtSecret(secret), 'HS256');
+    if (expectedType) {
+      // A token minted before the typ claim existed carries no typ. Treat it as an access
+      // token only, so already-issued cookies keep working until they expire while a legacy
+      // refresh token is rejected at /refresh and the user simply logs in again.
+      const actualType = payload.typ === undefined ? 'access' : payload.typ;
+      if (actualType !== expectedType) return null;
+    }
+    return {
+      userId: payload.userId as string,
+      sessionToken: payload.sessionToken as string | undefined,
+      typ: payload.typ as TokenType | undefined,
+      rememberMe: payload.rememberMe === true,
+    };
   } catch {
     return null;
   }

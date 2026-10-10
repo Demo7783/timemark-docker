@@ -1,13 +1,13 @@
 import { query } from '../db/index.js';
 import { randomUUID } from 'crypto';
 import type { Session } from '@timemark/shared';
+import { SESSION_TTL } from '../utils/session-ttl.js';
 
 export async function createSession(userId: string, deviceFingerprint: string, isTrusted: boolean, rememberMe: boolean = false): Promise<{ session: Session; accessToken: string; refreshToken: string }> {
   const { generateAccessToken, generateRefreshToken } = await import('../utils/jwt.js');
   
   const token = randomUUID();
-  const refreshTokenId = randomUUID();
-  const expiresIn = rememberMe ? 30 * 24 * 60 * 60 * 1000 : 8 * 60 * 60 * 1000;
+  const expiresIn = (rememberMe ? SESSION_TTL.sessionRememberSeconds : SESSION_TTL.sessionShortSeconds) * 1000;
   const expiresAt = new Date(Date.now() + expiresIn).toISOString();
 
   // Convert userId string to integer for database
@@ -17,13 +17,15 @@ export async function createSession(userId: string, deviceFingerprint: string, i
   }
 
   const result = await query(
-    'INSERT INTO sessions (user_id, token, device_fingerprint, is_trusted, expires_at, refresh_token_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
-    [numericUserId, token, deviceFingerprint, isTrusted ? 1 : 0, expiresAt, refreshTokenId]
+    'INSERT INTO sessions (user_id, token, device_fingerprint, is_trusted, expires_at) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+    [numericUserId, token, deviceFingerprint, isTrusted ? true : false, expiresAt]
   );
 
   const id = result.rows[0].id;
   const accessToken = await generateAccessToken(userId, token, rememberMe);
-  const refreshToken = await generateRefreshToken(userId, token, refreshTokenId);
+  // rememberMe travels on the refresh token so /refresh can read it back instead of
+  // re-deriving the mode from the remaining lifetime (which downgraded long sessions).
+  const refreshToken = await generateRefreshToken(userId, token, rememberMe);
 
   return {
     session: { id, userId, token, deviceFingerprint, isTrusted, expiresAt },
@@ -33,8 +35,13 @@ export async function createSession(userId: string, deviceFingerprint: string, i
 }
 
 export async function getSessionByToken(token: string): Promise<Session | null> {
+  // Absolute deadline only: `expires_at` is written once at creation and never
+  // extended, so a refresh never slides the session. There is deliberately no idle
+  // timeout yet — `sessions` has no `last_active_at` column. OWASP asks for both an
+  // idle and an absolute timeout; adding idle needs that column plus renewal capped
+  // by SESSION_TTL, i.e. a migration. Do not mistake this for an oversight.
   const result = await query(
-    "SELECT * FROM sessions WHERE token = $1 AND julianday(expires_at) > julianday('now')",
+    "SELECT * FROM sessions WHERE token = $1 AND expires_at > NOW()",
     [token]
   );
   if (result.rows.length === 0) return null;
@@ -42,21 +49,32 @@ export async function getSessionByToken(token: string): Promise<Session | null> 
   return { id: row.id, userId: row.user_id, token: row.token, deviceFingerprint: row.device_fingerprint, isTrusted: row.is_trusted, expiresAt: row.expires_at };
 }
 
-export async function rotateSessionRefreshToken(
-  sessionToken: string,
-  currentRefreshTokenId: string,
-  nextRefreshTokenId: string,
-): Promise<boolean> {
+/**
+ * Sliding renewal for a REMEMBERED session: push `expires_at` out to now+30d.
+ * Called from /auth/refresh when the refresh token carries rememberMe, so an
+ * actively used "stay signed in" session never hits its absolute deadline
+ * mid-usage (it used to hard-expire at exactly 30 days, dropping the user out).
+ * The ceiling still rolls: a session abandoned for 30 days dies regardless.
+ * Returns the new expiry, or null when the session row no longer exists.
+ */
+export async function renewRememberedSession(token: string): Promise<Date | null> {
+  const expiresAt = new Date(Date.now() + SESSION_TTL.sessionRememberSeconds * 1000).toISOString();
   const result = await query(
-    `UPDATE sessions SET refresh_token_id = $1
-     WHERE token = $2 AND refresh_token_id = $3 AND julianday(expires_at) > julianday('now')`,
-    [nextRefreshTokenId, sessionToken, currentRefreshTokenId],
+    `UPDATE sessions SET expires_at = $1
+     WHERE token = $2 AND expires_at > NOW()
+     RETURNING expires_at`,
+    [expiresAt, token],
   );
-  return result.rowCount === 1;
+  const row = result.rows[0] as { expires_at?: unknown } | undefined;
+  return row?.expires_at ? new Date(String(row.expires_at)) : null;
 }
 
 export async function deleteSession(token: string): Promise<void> {
   await query('DELETE FROM sessions WHERE token = $1', [token]);
+}
+
+export async function deleteSessionById(sessionId: string): Promise<void> {
+  await query('DELETE FROM sessions WHERE id = $1', [sessionId]);
 }
 
 export async function deleteAllUserSessions(userId: string, exceptToken?: string): Promise<void> {
@@ -69,10 +87,6 @@ export async function deleteAllUserSessions(userId: string, exceptToken?: string
   await query('DELETE FROM sessions WHERE user_id = $1', [numericUserId]);
 }
 
-export async function deleteSessionById(sessionId: string): Promise<void> {
-  await query('DELETE FROM sessions WHERE id = $1', [sessionId]);
-}
-
 export async function markDeviceAsTrusted(sessionId: string): Promise<void> {
-  await query('UPDATE sessions SET is_trusted = 1 WHERE id = $1', [sessionId]);
+  await query('UPDATE sessions SET is_trusted = TRUE WHERE id = $1', [sessionId]);
 }

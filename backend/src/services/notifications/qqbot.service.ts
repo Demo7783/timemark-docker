@@ -1,4 +1,4 @@
-import { getBlessing } from '../../../../shared/src/blessings.js';
+import { getBlessing } from '@timemark/shared/blessings';
 
 let oicq: typeof import('oicq') | undefined;
 let oicqLoadError: Error | undefined;

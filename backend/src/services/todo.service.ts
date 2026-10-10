@@ -10,13 +10,21 @@ export function todoOccurrenceDate(eventDate: string): string {
   return eventDate.slice(0, 10);
 }
 
-export async function listTodoCompletions(userId: number): Promise<TodoCompletionRow[]> {
+export async function listTodoCompletions(userId: number, profileId?: number | null): Promise<TodoCompletionRow[]> {
+  // Optional profile filter (checkbox 69): a completion belongs to the event's profile.
+  // Omitted = all profiles, byte-identical to the pre-profile API shape.
+  const params: number[] = [userId];
+  let profileClause = '';
+  if (profileId != null) {
+    params.push(profileId);
+    profileClause = ' AND event_id IN (SELECT id FROM events WHERE user_id = $1 AND profile_id = $2)';
+  }
   const result = await query(
-    `SELECT event_id, occurrence_date, completed_at
+    `SELECT event_id, occurrence_date::text AS occurrence_date, completed_at
      FROM todo_completions
-     WHERE user_id = $1
+     WHERE user_id = $1${profileClause}
      ORDER BY completed_at DESC`,
-    [userId],
+    params,
   );
   return result.rows as TodoCompletionRow[];
 }
@@ -28,7 +36,7 @@ export async function markTodoComplete(
 ): Promise<void> {
   await query(
     `INSERT INTO todo_completions (user_id, event_id, occurrence_date)
-     VALUES ($1, $2, $3)
+     VALUES ($1, $2, $3::date)
      ON CONFLICT (user_id, event_id, occurrence_date) DO UPDATE SET completed_at = CURRENT_TIMESTAMP`,
     [userId, eventId, occurrenceDate],
   );
@@ -41,7 +49,7 @@ export async function unmarkTodoComplete(
 ): Promise<boolean> {
   const result = await query(
     `DELETE FROM todo_completions
-     WHERE user_id = $1 AND event_id = $2 AND occurrence_date = $3
+     WHERE user_id = $1 AND event_id = $2 AND occurrence_date = $3::date
      RETURNING id`,
     [userId, eventId, occurrenceDate],
   );
@@ -52,7 +60,7 @@ export async function unmarkTodoComplete(
 export async function purgeOldTodoCompletions(retentionDays = 365): Promise<number> {
   const result = await query(
     `DELETE FROM todo_completions
-     WHERE occurrence_date < date('now', '-' || $1 || ' days')`,
+     WHERE occurrence_date < CURRENT_DATE - ($1::int * INTERVAL '1 day')`,
     [retentionDays],
   );
   return result.rowCount ?? 0;

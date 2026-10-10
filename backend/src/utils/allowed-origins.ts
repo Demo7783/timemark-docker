@@ -1,27 +1,9 @@
-/** Shared CORS / CSRF origin rules — synced from timemark-vercel, adapted for docker (LAN IP friendly) */
+/** Shared CORS / CSRF origin rules — production uses canonical domain only */
 
 export const CANONICAL_ORIGIN = 'https://timemark.the37777777.top';
 
-function normalizeHttpOrigin(value: string): string | null {
-  if (value.includes('*')) return null;
-  try {
-    const url = new URL(value);
-    if ((url.protocol !== 'http:' && url.protocol !== 'https:')
-      || url.username
-      || url.password
-      || url.pathname !== '/'
-      || url.search
-      || url.hash) {
-      return null;
-    }
-    return url.origin;
-  } catch {
-    return null;
-  }
-}
-
 export function getConfiguredOrigins(): string[] {
-  const origins: string[] = [
+  const origins = [
     'http://localhost:3000',
     'http://127.0.0.1:3000',
     'http://localhost:5173',
@@ -29,49 +11,55 @@ export function getConfiguredOrigins(): string[] {
   ];
 
   const corsOrigin = process.env.CORS_ORIGIN;
-  if (corsOrigin) {
-    // Cookie-auth responses cannot safely authorize every origin.
-    origins.push(
-      ...corsOrigin.split(',')
-        .map((origin) => normalizeHttpOrigin(origin.trim()))
-        .filter((origin): origin is string => origin !== null),
-    );
+  if (corsOrigin && corsOrigin !== '*') {
+    origins.push(...corsOrigin.split(',').map((o) => o.trim()).filter(Boolean));
+  } else if (process.env.VERCEL || process.env.NODE_ENV === 'production') {
+    origins.push(CANONICAL_ORIGIN);
   }
 
-  // Docker/NAS 默认只信任本地回环 + 与请求 origin 完全一致（覆盖 LAN 访问）；
-  // 不再把作者个人域名硬编码进所有部署的默认允许列表。
-  // 需要额外公网来源时，通过 CORS_ORIGIN 显式配置。
+  // Vercel preview URLs only when explicitly enabled (default: off)
+  if (process.env.ALLOW_VERCEL_PREVIEW === 'true' && process.env.VERCEL_URL) {
+    origins.push(`https://${process.env.VERCEL_URL}`);
+  }
+
+  if (!corsOrigin && !origins.includes(CANONICAL_ORIGIN)) {
+    origins.push(CANONICAL_ORIGIN);
+  }
 
   return [...new Set(origins)];
 }
-
-// 别名：docker 历史命名兼容
-export const getAllowedOrigins = getConfiguredOrigins;
 
 export function isVercelAppOrigin(origin: string): boolean {
   return /^https:\/\/[\w-]+\.vercel\.app$/.test(origin);
 }
 
-export function originMatchesRequest(
-  origin: string,
-  requestOrigin: string | undefined,
-): boolean {
-  if (!requestOrigin) return false;
-  const normalizedOrigin = normalizeHttpOrigin(origin);
-  const normalizedRequestOrigin = normalizeHttpOrigin(requestOrigin);
-  return normalizedOrigin !== null && normalizedOrigin === normalizedRequestOrigin;
+export function originMatchesHost(origin: string, host: string | undefined): boolean {
+  if (!host) return false;
+  try {
+    const url = new URL(origin);
+    return url.host === host;
+  } catch {
+    return false;
+  }
 }
 
 export function isAllowedOrigin(
   origin: string | undefined,
-  requestOrigin: string | undefined,
+  host: string | undefined,
   allowedOrigins: string[],
 ): boolean {
-  if (!origin || allowedOrigins.includes('*')) return false;
-  const normalizedOrigin = normalizeHttpOrigin(origin);
-  if (!normalizedOrigin) return false;
-  if (originMatchesRequest(origin, requestOrigin)) return true;
-  return allowedOrigins.includes(normalizedOrigin);
+  if (!origin) return false;
+  if (allowedOrigins.includes('*')) return true;
+  if (process.env.ALLOW_VERCEL_PREVIEW === 'true' && isVercelAppOrigin(origin)) return true;
+  if (originMatchesHost(origin, host)) return true;
+
+  return allowedOrigins.some((allowed) => {
+    if (origin === allowed) return true;
+    if (allowed.startsWith('*.')) {
+      return origin.endsWith(allowed.slice(2));
+    }
+    return false;
+  });
 }
 
 export function resolveSafeAppOrigin(
@@ -82,17 +70,16 @@ export function resolveSafeAppOrigin(
   const h = host?.trim();
   if (h) {
     const candidate = `${proto}://${h}`;
-    if (isAllowedOrigin(candidate, candidate, getConfiguredOrigins())) {
+    if (isAllowedOrigin(candidate, h, getConfiguredOrigins())) {
       return candidate;
     }
   }
-  // 不再把作者个人域名作为通用兜底；无法解析时退回本地默认。
-  return 'http://localhost:3000';
+  return CANONICAL_ORIGIN;
 }
 
-export function resolveCorsOrigin(origin: string | undefined, requestOrigin: string | undefined): string {
+export function resolveCorsOrigin(origin: string | undefined, host: string | undefined): string {
   const allowed = getConfiguredOrigins();
   if (!origin) return allowed[0] ?? 'http://localhost:5173';
-  if (isAllowedOrigin(origin, requestOrigin, allowed)) return origin;
+  if (isAllowedOrigin(origin, host, allowed)) return origin;
   return allowed[0] ?? 'http://localhost:5173';
 }

@@ -1,13 +1,27 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
-import { Bell, ArrowLeft, Trash2, RefreshCw, CheckCircle2, XCircle, Clock, Calendar } from 'lucide-react';
+import { Bell, Trash2, RefreshCw, CheckCircle2, XCircle, Calendar, AlertCircle, SkipForward } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
 import { Badge } from '@/components/ui/badge';
+import { PageHeader } from '@/components/layout/PageHeader';
+import { EmptyState } from '@/components/ui/empty-state';
+import { SkeletonCard } from '@/components/ui/skeleton-card';
 import { Button } from '@/components/ui/button';
-import { useNavigate } from 'react-router-dom';
 import { api } from '@/lib/api';
+import { readDelivery, type DeliveryOutcome } from '@timemark/shared';
+import { ChannelIcon } from '@/components/channels/ChannelIcon';
+import { fetchChannelTemplates } from '@/lib/channel-templates';
+import { EventReminderLogs } from '@/components/reminder/EventReminderLogs';
+
+/**
+ * v2.26 C：/reminders（提醒记录）并入本页 —— 两个页面展示的是同一类数据
+ * （事件提醒投递历史），只保留一个入口。tab 支持深链（?tab=reminders），
+ * 旧链接 /reminders 由 App.tsx 重定向过来。
+ */
+type LogsTab = 'delivery' | 'reminders';
 
 const containerVariants = { hidden: { opacity: 0 }, visible: { opacity: 1, transition: { staggerChildren: 0.1 } } };
-const itemVariants = { hidden: { opacity: 0, y: 15 }, visible: { opacity: 1, y: 0, transition: { type: 'spring', stiffness: 300, damping: 24 } } };
+const itemVariants = { hidden: { opacity: 0, y: 15 }, visible: { opacity: 1, y: 0, transition: { type: 'spring', stiffness: 300, damping: 24 } as const } };
 
 interface ChannelResult {
   success: boolean;
@@ -23,20 +37,44 @@ interface TriggerLog {
   trigger_date: string;
   status: string;
   channels?: string;
-  channel_results?: string;
+  /** JSONB：线上是已解析对象，历史 TEXT 列才是 JSON 字符串 */
+  channel_results?: object | string | null;
   error_message?: string;
+  /** v2.28 C15：重试时后端写入的结构化逐渠道错误（此前前端从未展示） */
+  error_details?: string | null;
   created_at: string;
 }
 
-interface TriggerLogsResponse {
-  data: TriggerLog[];
-  pagination: { total: number; limit: number; offset: number };
-}
-
-const getStatusIcon = (status: string) => {
-  if (status === 'success') return CheckCircle2;
-  if (status === 'failed') return XCircle;
-  return Clock;
+/**
+ * 真实投递结果 → 展示样式。
+ *
+ * 落库的 status 只有 success/failed/skipped，而「部分失败」（3 个渠道到了、1 个没到）
+ * 被记成 success。只看 status 的话，这个页面会把部分失败画成绿色对勾，并且
+ * **永远不渲染重试按钮** —— 后端已经放行的那条重试路径根本走不到。
+ * 所以这里和提醒记录页共用同一个 readDelivery 判定。
+ */
+const OUTCOME_STYLE: Record<DeliveryOutcome, {
+  label: string;
+  badge: 'success' | 'destructive' | 'secondary';
+  Icon: typeof CheckCircle2;
+  box: string;
+}> = {
+  delivered: {
+    label: '成功', badge: 'success', Icon: CheckCircle2,
+    box: 'bg-white/90 dark:bg-slate-800/90 text-emerald-500 border-white/60 dark:border-white/10',
+  },
+  partial: {
+    label: '部分失败', badge: 'secondary', Icon: AlertCircle,
+    box: 'bg-amber-50/90 dark:bg-amber-900/40 text-amber-600 border-amber-100 dark:border-amber-800/50',
+  },
+  failed: {
+    label: '失败', badge: 'destructive', Icon: XCircle,
+    box: 'bg-red-50/90 dark:bg-red-900/40 text-red-600 border-red-100 dark:border-red-800/50',
+  },
+  skipped: {
+    label: '已跳过', badge: 'secondary', Icon: SkipForward,
+    box: 'bg-slate-50/90 dark:bg-slate-800/90 text-slate-500 border-slate-200 dark:border-white/10',
+  },
 };
 
 const getEventTypeLabel = (type?: string): string => {
@@ -50,52 +88,82 @@ const getEventTypeLabel = (type?: string): string => {
   return type ? (labels[type] || type) : '未知';
 };
 
-const formatTime = (timeStr: string) => {
-  if (!timeStr) return '';
-  const match = timeStr.match(/^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}):(\d{2}))?/);
-  if (!match) return timeStr;
-
-  const year = parseInt(match[1]);
-  const month = parseInt(match[2]);
-  const day = parseInt(match[3]);
-  const hour = match[4] ? parseInt(match[4]) : 0;
-  const minute = match[5] ? parseInt(match[5]) : 0;
-
-  const targetTime = new Date(year, month - 1, day, hour, minute).getTime();
-  const now = Date.now();
-  const diff = now - targetTime;
-
-  if (diff < 60000) return '刚刚';
-  if (diff < 3600000) return `${Math.floor(diff / 60000)}分钟前`;
-  if (diff < 86400000) return `${Math.floor(diff / 3600000)}小时前`;
-  if (diff < 172800000) return '昨天';
-
-  return `${year}/${String(month).padStart(2, '0')}/${String(day).padStart(2, '0')} ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
-};
+import { formatRelativeTime } from '@/lib/format-time';
 
 export default function TriggerLogs() {
-  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [tab, setTab] = useState<LogsTab>(() =>
+    searchParams.get('tab') === 'reminders' ? 'reminders' : 'delivery',
+  );
+  // v2.25: 渠道徽章显示图标（模板 id → icon 名）
+  const [templateIcons, setTemplateIcons] = useState<Record<string, string>>({});
+
   const [logs, setLogs] = useState<TriggerLog[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [clearing, setClearing] = useState(false);
+  const [statusFilter, setStatusFilter] = useState('');
+  const [channelFilter, setChannelFilter] = useState('');
 
-  useEffect(() => {
-    fetchLogs();
-  }, []);
+  const switchTab = (next: LogsTab) => {
+    setTab(next);
+    setSearchParams(next === 'reminders' ? { tab: 'reminders' } : {}, { replace: true });
+  };
 
-  const fetchLogs = async () => {
+  // v2.28 C15：分页游标（服务器锚定，本地删除不影响 offset 语义；本页无删除，
+  // 保留与 Inbox 同模式以防未来加入）。
+  const nextOffsetRef = useRef(0);
+
+  const fetchLogs = async (offset = 0) => {
     setLoading(true);
     try {
-      const res = await api.get<TriggerLogsResponse>('/trigger-logs?limit=100');
-      setLogs(res.data || []);
-      setTotal(res.pagination?.total || 0);
+      const params = new URLSearchParams({ limit: '100', offset: String(offset) });
+      // 状态下拉选的是「真实投递结果」（outcome）而不是裸 status：部分失败落库时
+      // status='success'，按 status 筛会把绿色标签混进"成功"、且"失败"里漏掉它。
+      if (statusFilter) params.set('outcome', statusFilter);
+      if (channelFilter) params.set('channel', channelFilter);
+      const res = await api.getRaw<TriggerLog[]>(`/trigger-logs?${params.toString()}`);
+      const page = res.data || [];
+      // v2.28 C15：加载更多 —— offset>0 追加
+      setLogs((prev) => (offset > 0 ? [...prev, ...page] : page));
+      nextOffsetRef.current = offset + page.length;
+      setTotal((res.pagination?.total as number) || 0);
     } catch (error) {
       console.error('Failed to fetch trigger logs:', error);
-      setLogs([]);
+      if (offset === 0) setLogs([]);
     } finally {
       setLoading(false);
     }
+  };
+
+  useEffect(() => {
+    fetchLogs();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statusFilter, channelFilter]);
+
+  // v2.25: 渠道徽章图标（模板目录是单飞缓存，会话内只拉一次）
+  useEffect(() => {
+    fetchChannelTemplates()
+      .then((templates) => {
+        setTemplateIcons(Object.fromEntries(templates.map((t) => [t.id, t.icon])));
+      })
+      .catch(() => undefined);
+  }, []);
+
+  const exportCsv = async () => {
+    const token = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken');
+    const response = await fetch('/api/trigger-logs/export.csv', {
+      credentials: 'include',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!response.ok) return alert('导出失败');
+    const blob = await response.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `trigger-logs-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    window.URL.revokeObjectURL(url);
   };
 
   const clearLogs = async () => {
@@ -106,6 +174,7 @@ export default function TriggerLogs() {
       await api.delete('/trigger-logs');
       setLogs([]);
       setTotal(0);
+      nextOffsetRef.current = 0;
     } catch (error) {
       console.error('Failed to clear trigger logs:', error);
     } finally {
@@ -123,11 +192,48 @@ export default function TriggerLogs() {
     }
   };
 
-  const parseChannelResults = (resultsStr?: string): Record<string, ChannelResult> => {
-    if (!resultsStr) return {};
+  const [retryingId, setRetryingId] = useState<number | null>(null);
+  const [retryingAll, setRetryingAll] = useState(false);
+
+  const retryLog = async (logId: number) => {
+    setRetryingId(logId);
     try {
-      const parsed = typeof resultsStr === 'string' ? JSON.parse(resultsStr) : resultsStr;
-      return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {};
+      await api.post(`/trigger-logs/${logId}/retry`, {});
+      await fetchLogs();
+      alert('已重新发送，请查看更新后的状态');
+    } catch (error) {
+      alert(error instanceof Error ? error.message : '重试失败');
+    } finally {
+      setRetryingId(null);
+    }
+  };
+
+  // v79 批量重试：把近 7 天真实失败（含部分失败）的提醒一次性逐条补发（后端单次上限 10 条）
+  const retryAllFailed = async () => {
+    if (!confirm('将把近 7 天内失败/部分失败的提醒逐条重新发送（单次最多 10 条），继续？')) return;
+    setRetryingAll(true);
+    try {
+      const res = await api.post<{ attempted: number; retried: number; failed: number; candidates: number }>(
+        '/trigger-logs/retry-failed',
+        {},
+      );
+      await fetchLogs();
+      alert(`批量重试完成：成功 ${res.retried} 条，仍失败 ${res.failed} 条（候选 ${res.candidates} 条）`);
+    } catch (error) {
+      alert(error instanceof Error ? error.message : '批量重试失败');
+    } finally {
+      setRetryingAll(false);
+    }
+  };
+
+  // `channel_results` 是 JSONB：线上是已解析对象，历史 TEXT 列才是 JSON 字符串，两种都要认。
+  const parseChannelResults = (results?: object | string | null): Record<string, ChannelResult> => {
+    if (!results) return {};
+    try {
+      const parsed = typeof results === 'string' ? JSON.parse(results) : results;
+      return (parsed && typeof parsed === 'object' && !Array.isArray(parsed))
+        ? (parsed as Record<string, ChannelResult>)
+        : {};
     } catch {
       return {};
     }
@@ -135,60 +241,129 @@ export default function TriggerLogs() {
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="min-h-screen pb-24">
-      <header className="sticky top-6 z-40 px-4 max-w-4xl mx-auto">
-        <div className="glass-panel rounded-full px-6 py-3.5 flex justify-between items-center ring-1 ring-black/5 dark:ring-white/10 shadow-sm">
-          <div className="flex items-center gap-4">
-            <Button variant="ghost" size="icon" className="rounded-full" onClick={() => navigate(-1)}><ArrowLeft size={20} /></Button>
-            <div>
-              <h1 className="text-xl font-bold text-slate-900 dark:text-white tracking-tight">提醒日志</h1>
-              <p className="text-xs text-slate-500 dark:text-slate-400 font-medium">共 {total} 条提醒记录</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            <Button variant="ghost" size="icon" className="rounded-full" onClick={fetchLogs} disabled={loading}>
-              <RefreshCw size={20} className={loading ? 'animate-spin' : ''} />
+      <PageHeader
+        title="提醒日志"
+        subtitle={tab === 'reminders' ? '事件维度的提醒发送记录' : `共 ${total} 条提醒记录`}
+        actions={tab === 'delivery' && (
+          <>
+            <Button variant="ghost" size="sm" className="rounded-full min-h-11" onClick={retryAllFailed} disabled={retryingAll}>
+              {retryingAll ? <RefreshCw size={16} className="mr-1 animate-spin" /> : null}
+              {retryingAll ? '重试中' : '重试全部失败'}
+            </Button>
+            <Button variant="ghost" size="sm" className="rounded-full min-h-11" onClick={exportCsv}>
+              导出 CSV
             </Button>
             <Button variant="ghost" size="sm" className="rounded-full text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30" onClick={clearLogs} disabled={clearing || logs.length === 0}>
               <Trash2 size={16} className="mr-1" />
               清空
             </Button>
-          </div>
+          </>
+        )}
+        onRefresh={tab === 'delivery' ? () => fetchLogs() : undefined}
+        refreshing={loading}
+      />
+      <div className="max-w-4xl mx-auto px-6 mt-3">
+        <div className="inline-flex rounded-full glass-panel p-1 ring-1 ring-black/5 dark:ring-white/10" role="tablist" aria-label="日志类型">
+          {([
+            ['delivery', '投递明细'],
+            ['reminders', '事件提醒'],
+          ] as Array<[LogsTab, string]>).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              role="tab"
+              aria-selected={tab === value}
+              onClick={() => switchTab(value)}
+              className={`px-4 h-9 rounded-full text-sm font-medium transition-colors ${
+                tab === value
+                  ? 'bg-primary-500 text-white shadow'
+                  : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
         </div>
-      </header>
+      </div>
+      {tab === 'delivery' && (
+        <div className="max-w-4xl mx-auto px-6 mt-3 flex flex-wrap gap-2">
+          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="h-11 px-3 rounded-xl border text-sm" aria-label="状态筛选">
+            <option value="">全部状态</option>
+            <option value="delivered">成功</option>
+            <option value="partial">部分失败</option>
+            <option value="failed">失败</option>
+            <option value="skipped">跳过</option>
+          </select>
+          {/* v2.28 C15：渠道筛选从自由文本改为下拉（id 来自渠道模板目录） */}
+          <select
+            value={channelFilter}
+            onChange={(e) => setChannelFilter(e.target.value)}
+            className="h-11 px-3 rounded-xl border text-sm bg-white dark:bg-slate-800"
+            aria-label="渠道筛选"
+          >
+            <option value="">全部渠道</option>
+            {Object.keys(templateIcons).map((id) => (
+              <option key={id} value={id}>{id}</option>
+            ))}
+          </select>
+        </div>
+      )}
+      {tab === 'reminders' ? (
+        <main className="max-w-4xl mx-auto px-6 py-10 mt-2">
+          <div className="flex justify-end mb-2">
+            {/* v2.27 F41：事件提醒历史导出 CSV（后端 /events/reminder-logs?format=csv） */}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="rounded-full min-h-11"
+              onClick={async () => {
+                const token = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken');
+                const res = await fetch('/api/events/reminder-logs?format=csv', {
+                  credentials: 'include',
+                  headers: token ? { Authorization: `Bearer ${token}` } : {},
+                });
+                if (!res.ok) return alert('导出失败');
+                const blob = await res.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `reminder-logs-${new Date().toISOString().slice(0, 10)}.csv`;
+                a.click();
+                window.URL.revokeObjectURL(url);
+              }}
+            >
+              导出 CSV
+            </Button>
+          </div>
+          <EventReminderLogs />
+        </main>
+      ) : (
       <main className="max-w-4xl mx-auto px-6 py-10 mt-2">
         {loading ? (
-          <div className="space-y-4">
-            {[1, 2, 3, 4].map((i) => (
-              <div key={i} className="glass-panel rounded-[2.5rem] p-6 animate-pulse">
-                <div className="flex gap-6">
-                  <div className="w-16 h-16 rounded-[1.5rem] bg-slate-200/60 dark:bg-slate-700/50"></div>
-                  <div className="flex-1">
-                    <div className="h-5 bg-slate-200/60 dark:bg-slate-700/50 rounded-full w-1/3 mb-3"></div>
-                    <div className="h-4 bg-slate-200/60 dark:bg-slate-700/50 rounded-full w-1/2"></div>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
+          <SkeletonCard count={4} />
         ) : logs.length === 0 ? (
-          <div className="text-center py-16 glass-panel rounded-[2.5rem] ring-1 ring-black/5 dark:ring-white/10">
-            <Bell size={48} className="mx-auto text-slate-300 dark:text-slate-600 mb-4" />
-            <h3 className="text-xl font-bold text-slate-900 dark:text-white mb-2">暂无提醒记录</h3>
-            <p className="text-slate-500 dark:text-slate-400">事件提醒触发后将在此处显示</p>
-          </div>
+          <EmptyState icon={Bell} title="暂无提醒记录" description="事件提醒触发后将在此处显示" />
         ) : (
           <motion.div variants={containerVariants} initial="hidden" animate="visible" className="relative">
             <div className="absolute left-[2.25rem] top-8 bottom-8 w-px bg-gradient-to-b from-primary-500/40 via-slate-200 dark:via-slate-700 to-transparent z-0"></div>
             <div className="space-y-6 relative z-10">
               {logs.map((log) => {
-                const StatusIcon = getStatusIcon(log.status);
                 const channels = parseChannels(log.channels);
                 const channelResults = parseChannelResults(log.channel_results);
-                const isSuccess = log.status === 'success';
+                // 部分失败落库就是 status='success'，只看 status 会把它画成绿色对勾，
+                // 而且重试按钮永远不出现 —— 后端放行的重试路径根本走不到。
+                const delivery = readDelivery({
+                  status: log.status,
+                  channelResults: log.channel_results,
+                  errorMessage: log.error_message,
+                });
+                const style = OUTCOME_STYLE[delivery.outcome];
+                const StatusIcon = style.Icon;
+                const isSuccess = delivery.outcome === 'delivered';
 
                 return (
                   <motion.div key={log.id} variants={itemVariants} className="flex gap-6 items-center">
-                    <div className={`w-16 h-16 rounded-[1.5rem] shrink-0 flex items-center justify-center shadow-md border backdrop-blur-md ${isSuccess ? 'bg-white/90 dark:bg-slate-800/90 text-emerald-500 border-white/60 dark:border-white/10' : 'bg-red-50/90 dark:bg-red-900/40 text-red-600 border-red-100 dark:border-red-800/50'}`}>
+                    <div className={`w-16 h-16 rounded-[1.5rem] shrink-0 flex items-center justify-center shadow-md border backdrop-blur-md ${style.box}`}>
                       <StatusIcon size={26} />
                     </div>
                     <div className="glass-panel rounded-[2.5rem] p-6 flex-1 hover:shadow-xl transition-all ring-1 ring-black/5 dark:ring-white/10">
@@ -198,8 +373,8 @@ export default function TriggerLogs() {
                             <h3 className="text-lg font-bold text-slate-900 dark:text-white tracking-tight">
                               {log.event_name || `事件 #${log.event_id}`}
                             </h3>
-                            <Badge variant={isSuccess ? 'success' : 'destructive'} className="scale-90">
-                              {isSuccess ? '成功' : '失败'}
+                            <Badge variant={style.badge} className="scale-90">
+                              {style.label}
                             </Badge>
                           </div>
                           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 mt-2 text-sm font-medium text-slate-500 dark:text-slate-400">
@@ -207,20 +382,28 @@ export default function TriggerLogs() {
                               <Calendar size={14} /> {log.trigger_date}
                             </span>
                             <span>{getEventTypeLabel(log.event_type)}</span>
-                            {channelResults ? (
+                            {delivery.delivered.length > 0 || delivery.failed.length > 0 ? (
                               <span className="flex items-center gap-1.5 flex-wrap">
                                 <Bell size={14} />
-                                {Object.entries(channelResults).map(([ch, result]) => (
+                                {/* 只列真实渠道：_quiet_hours / _skipped 是内部标记，
+                                    当成渠道显示会让人以为存在这样的通知渠道 */}
+                                {delivery.delivered.map((ch) => (
                                   <span
                                     key={ch}
-                                    className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold ${
-                                      result.success
-                                        ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300'
-                                        : 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300'
-                                    }`}
-                                    title={result.error || ''}
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
+                                    title={channelResults[ch]?.error || ''}
                                   >
-                                    {result.success ? '✓' : '✗'} {ch}
+                                    <ChannelIcon name={templateIcons[ch]} size={12} />
+                                    ✓ {ch}
+                                  </span>
+                                ))}
+                                {delivery.failed.map((ch) => (
+                                  <span
+                                    key={ch}
+                                    className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300"
+                                    title={channelResults[ch]?.error || ''}
+                                  >
+                                    ✗ {ch}
                                   </span>
                                 ))}
                               </span>
@@ -229,13 +412,48 @@ export default function TriggerLogs() {
                                 <Bell size={14} /> {channels.join(', ')}
                               </span>
                             ) : null}
-                            {!isSuccess && log.error_message && !channelResults && (
+                            {/* 没有 channel_results 的行（投递后异常、农历换算失败、测试发送抛异常）只有
+                                error_message 能说明原因；旧写法 `!channelResults` 里
+                                parseChannelResults(null) 返回 {}，恒为真，所以这句话从来没显示过。 */}
+                            {!isSuccess && log.error_message && !log.channel_results && (
                               <span className="text-red-500 text-xs">{log.error_message}</span>
+                            )}
+                            {log.error_details && delivery.outcome !== 'delivered' && (
+                              <details className="text-xs">
+                                <summary className="cursor-pointer select-none text-slate-400 hover:text-slate-600">
+                                  重试错误详情
+                                </summary>
+                                <pre className="mt-1 whitespace-pre-wrap break-words rounded-lg bg-slate-50 dark:bg-slate-800/60 px-2 py-1 max-h-32 overflow-y-auto overscroll-contain text-red-400">
+                                  {log.error_details}
+                                </pre>
+                              </details>
+                            )}
+                            {delivery.outcome === 'partial' && (
+                              <span className="text-xs text-amber-600 dark:text-amber-400">
+                                已送达 {delivery.delivered.length} 个，未送达 {delivery.failed.length} 个
+                              </span>
                             )}
                           </div>
                         </div>
+                        <div className="flex flex-col items-end gap-2">
                         <div className="text-sm font-bold text-slate-400 whitespace-nowrap bg-slate-100/50 dark:bg-slate-800/50 px-3 py-1 rounded-lg">
-                          {formatTime(log.created_at)}
+                          {formatRelativeTime(log.created_at)}
+                        </div>
+                        {/* 与后端同一个闸门（trigger-logs.ts 对 outcome==='delivered' 直接 400）。
+                            不能顺手加上 `failed.length > 0`：历史失败行没有 channel_results
+                            （异常路径与测试发送失败都只写 error_message），那种行 failed 是空数组，
+                            加了就等于把它们的重试按钮一起弄没了。 */}
+                        {delivery.outcome !== 'delivered' && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="rounded-full text-xs"
+                            disabled={retryingId === log.id}
+                            onClick={() => retryLog(log.id)}
+                          >
+                            {retryingId === log.id ? '重试中...' : '手动重试'}
+                          </Button>
+                        )}
                         </div>
                       </div>
                     </div>
@@ -243,9 +461,23 @@ export default function TriggerLogs() {
                 );
               })}
             </div>
+            {/* v2.28 C15：加载更多（服务器锚定 offset） */}
+            {logs.length < total && (
+              <div className="text-center mt-6">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="rounded-full min-h-11"
+                  onClick={() => fetchLogs(nextOffsetRef.current)}
+                >
+                  加载更多（已加载 {logs.length}/{total}）
+                </Button>
+              </div>
+            )}
           </motion.div>
         )}
       </main>
+      )}
     </motion.div>
   );
 }

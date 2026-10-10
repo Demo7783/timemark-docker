@@ -1,4 +1,4 @@
-import { getBlessing } from '../../../../shared/src/blessings.js';
+import { getBlessing } from '@timemark/shared/blessings';
 import QRCode from 'qrcode';
 import * as fs from 'fs';
 import * as path from 'path';

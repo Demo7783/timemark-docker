@@ -1,15 +1,23 @@
 import { motion } from 'framer-motion';
-import { Clock, Calendar, Edit2, Trash2, Send, CheckCircle2, Circle, Heart, GraduationCap, PartyPopper, Sparkles, CalendarDays } from 'lucide-react';
+import { Clock, Calendar, Edit2, Trash2, Send, CheckCircle2, Circle, Heart, GraduationCap, PartyPopper, Sparkles, CalendarDays, Moon, Copy } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { useEffect, useState } from 'react';
 import type { Event, EventType } from '@timemark/shared';
+import {
+  diffToCountdownParts,
+  getEventCountdownTarget,
+  isEventCountdownPast,
+  resolveNextOccurrenceDate,
+} from '@/lib/calendar-utils';
+import { resolveEventLunarLabel } from '@/lib/lunar';
+import { useTimezone } from '@/components/RealtimeClock';
 
 interface EventCardProps {
   event: Event;
   onEdit: (e: Event) => void;
   onDelete: (id: string) => void;
-  onTestSend: (id: string) => void;
+  onTestSend?: (id: string) => void;
   selectable?: boolean;
   selected?: boolean;
   onSelectToggle?: (id: string, c: boolean) => void;
@@ -18,8 +26,8 @@ interface EventCardProps {
 // Helper to safely parse dates (append T00:00:00 to ensure local timezone interpretation)
 const safeParseDate = (dateString: string | undefined): Date | null => {
   if (!dateString) return null;
-  // Append T00:00:00 to force local timezone instead of UTC
-  const date = new Date(dateString + 'T00:00:00');
+  const ymd = dateString.slice(0, 10);
+  const date = new Date(`${ymd}T00:00:00`);
   return isNaN(date.getTime()) ? null : date;
 };
 
@@ -53,98 +61,37 @@ const getEventTypeColor = (type: EventType): string => {
   }
 };
 
-const getEventTypeLabel = (type: EventType): string => {
-  const labels: Record<string, string> = {
-    birthday: '生日',
-    exam: '考试',
-    anniversary: '纪念日',
-    holiday: '节日',
-    meeting: '会议',
-    deadline: '截止日期',
-    travel: '旅行',
-    graduation: '毕业',
-    wedding: '婚礼',
-    medical: '医疗',
-    other: '其他',
-  };
-  return labels[type] || '其他';
-};
-
 export function EventCard({ event, onEdit, onDelete, onTestSend, selectable, selected, onSelectToggle }: EventCardProps) {
   const [timeLeft, setTimeLeft] = useState<{ days: number; hours: number; minutes: number; seconds: number } | null>(null);
   const [isPast, setIsPast] = useState(false);
-  const [nextReminder, setNextReminder] = useState<Date | null>(null);
+  const { timezone } = useTimezone();
 
-  const targetDate = safeParseDate(event.date);
-  const formattedDate = targetDate ? targetDate.toLocaleString('zh-CN') : '无效日期';
-
-  // 计算下一个提醒时间
-  const getNextReminderTime = (): Date | null => {
-    if (!event.reminderConfig?.enabled || !event.reminderConfig?.reminderTimes?.length) {
-      return null;
-    }
-
-    const now = new Date();
-    const reminderTimes = event.reminderConfig.reminderTimes;
-    
-    // 找到今天或未来7天的下一个提醒时间
-    for (let dayOffset = 0; dayOffset <= 7; dayOffset++) {
-      const targetDay = new Date(now);
-      targetDay.setDate(targetDay.getDate() + dayOffset);
-      
-      for (const time of reminderTimes) {
-        const [hours, minutes] = time.split(':').map(Number);
-        const reminderTime = new Date(targetDay);
-        reminderTime.setHours(hours, minutes, 0, 0);
-        
-        if (reminderTime > now) {
-          return reminderTime;
-        }
-      }
-    }
-    
-    return null;
-  };
-
-  // 格式化显示日期 - 始终显示事件的实际日期
+  const nextOccurrenceDate = resolveNextOccurrenceDate(event, new Date(), timezone);
+  const targetDate = safeParseDate(nextOccurrenceDate);
+  const formattedDate = targetDate ? targetDate.toLocaleDateString('zh-CN') : '无效日期';
   const displayDate = formattedDate;
+  // checkbox 169: 双历事件同时展示农历（原样读持久化的 lunarDate；缺失时受支持年份保护）。
+  const lunarInfo = resolveEventLunarLabel(event);
 
   useEffect(() => {
     const calculateTimeLeft = () => {
-      // 优先计算到下一个提醒时间的倒计时
-      const nextReminderTime = getNextReminderTime();
-      setNextReminder(nextReminderTime);
-      
-      if (nextReminderTime) {
-        const difference = nextReminderTime.getTime() - new Date().getTime();
-        if (difference > 0) {
-          setTimeLeft({
-            days: Math.floor(difference / (1000 * 60 * 60 * 24)),
-            hours: Math.floor((difference / (1000 * 60 * 60)) % 24),
-            minutes: Math.floor((difference / 1000 / 60) % 60),
-            seconds: Math.floor((difference / 1000) % 60),
-          });
-          setIsPast(false);
-          return;
-        }
-      }
-      
-      // 如果没有提醒时间或提醒时间已过，使用事件日期
-      const safeTarget = safeParseDate(event.date);
-      if (!safeTarget) {
+      const ref = new Date();
+      const target = getEventCountdownTarget(event, ref, timezone);
+      if (!target) {
         setTimeLeft(null);
-        setIsPast(false);
+        setIsPast(true);
         return;
       }
-      
-      const difference = safeTarget.getTime() - new Date().getTime();
-      if (difference > 0) {
-        setTimeLeft({
-          days: Math.floor(difference / (1000 * 60 * 60 * 24)),
-          hours: Math.floor((difference / (1000 * 60 * 60)) % 24),
-          minutes: Math.floor((difference / 1000 / 60) % 60),
-          seconds: Math.floor((difference / 1000) % 60),
-        });
+
+      if (isEventCountdownPast(event, ref, timezone)) {
+        setTimeLeft(null);
+        setIsPast(true);
+        return;
+      }
+
+      const parts = diffToCountdownParts(target, ref);
+      if (parts) {
+        setTimeLeft(parts);
         setIsPast(false);
       } else {
         setTimeLeft(null);
@@ -154,7 +101,7 @@ export function EventCard({ event, onEdit, onDelete, onTestSend, selectable, sel
     calculateTimeLeft();
     const timer = setInterval(calculateTimeLeft, 1000);
     return () => clearInterval(timer);
-  }, [event.date, event.reminderConfig]);
+  }, [event.date, event.nextOccurrence, event.type, event.recurringConfig, event.reminderConfig, timezone]);
 
   return (
     <div className={`relative group glass-panel rounded-[2.5rem] p-6 overflow-hidden h-full ${selected ? 'ring-2 ring-primary-500 shadow-xl shadow-primary-500/20' : 'ring-1 ring-black/5 dark:ring-white/10'}`} onClick={() => selectable && onSelectToggle && onSelectToggle(event.id, !selected)}>
@@ -179,6 +126,18 @@ export function EventCard({ event, onEdit, onDelete, onTestSend, selectable, sel
             <span>{displayDate}</span>
             <Badge variant="secondary" className="px-2 py-0.5 text-[10px]">{event.calendarType === 'lunar' ? '农历' : event.calendarType === 'both' ? '双历' : '公历'}</Badge>
           </div>
+          {lunarInfo.label && (
+            <div className="flex items-center gap-2 mt-1 text-xs text-slate-500 dark:text-slate-400 relative z-10" data-testid="event-lunar-date">
+              <Moon size={12} className="text-primary-500" />
+              <span>{lunarInfo.label}</span>
+            </div>
+          )}
+          {lunarInfo.error && !lunarInfo.label && (
+            <div className="flex items-center gap-2 mt-1 text-xs text-amber-600 dark:text-amber-300 relative z-10" data-testid="event-lunar-error">
+              <Moon size={12} />
+              <span>{lunarInfo.error}</span>
+            </div>
+          )}
         </div>
       </div>
       
@@ -198,7 +157,7 @@ export function EventCard({ event, onEdit, onDelete, onTestSend, selectable, sel
       {/* Countdown or past indicator */}
       <div className="mb-4 relative z-10">
         {isPast ? (
-          <div className="flex items-center justify-center py-4 bg-red-50/80 dark:bg-red-900/20 rounded-2xl border border-red-100 dark:border-red-500/20 backdrop-blur-sm">
+          <div className="flex items-center justify-center py-4 bg-red-50/80 dark:bg-red-900/20 rounded-2xl border border-red-100 dark:border-red-500/20 backdrop-blur-xs">
             <span className="text-lg font-bold text-red-600 dark:text-red-400 flex items-center gap-2"><Clock size={20} /> 目标时间已过</span>
           </div>
         ) : timeLeft ? (
@@ -234,7 +193,11 @@ export function EventCard({ event, onEdit, onDelete, onTestSend, selectable, sel
 
       {!selectable && (
         <div className="flex items-center justify-end gap-2 pt-4 border-t border-slate-200/60 dark:border-slate-700/50 relative z-10">
-          <Button variant="ghost" size="sm" className="h-9 px-3 hover:bg-primary-50 dark:hover:bg-primary-900/30 text-slate-600 hover:text-primary-600 dark:text-slate-300 rounded-xl" onClick={(e) => { e.stopPropagation(); onTestSend(event.id); }}><Send size={14} className="mr-1.5" /> 测试</Button>
+          {onTestSend && (
+            <Button variant="ghost" size="sm" className="h-9 px-3 hover:bg-primary-50 dark:hover:bg-primary-900/30 text-slate-600 hover:text-primary-600 dark:text-slate-300 rounded-xl" onClick={(e) => { e.stopPropagation(); onTestSend(event.id); }}><Send size={14} className="mr-1.5" /> 测试</Button>
+          )}
+          {/* v2.27 F38：一键复制事件日期（YYYY-MM-DD） */}
+          <Button variant="ghost" size="sm" className="h-9 px-3 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 hover:text-slate-800 dark:text-slate-300 rounded-xl" onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(event.date).catch(() => undefined); }}><Copy size={14} className="mr-1.5" /> 复制日期</Button>
           <Button variant="ghost" size="sm" className="h-9 px-3 hover:bg-blue-50 dark:hover:bg-blue-900/30 text-slate-600 hover:text-blue-600 dark:text-slate-300 rounded-xl" onClick={(e) => { e.stopPropagation(); onEdit(event); }}><Edit2 size={14} className="mr-1.5" /> 编辑</Button>
           <Button variant="ghost" size="sm" className="h-9 px-3 hover:bg-red-50 dark:hover:bg-red-900/30 text-slate-600 hover:text-red-600 dark:text-slate-300 rounded-xl" onClick={(e) => { e.stopPropagation(); onDelete(event.id); }}><Trash2 size={14} className="mr-1.5" /> 删除</Button>
         </div>

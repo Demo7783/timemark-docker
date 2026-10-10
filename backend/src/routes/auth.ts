@@ -1,12 +1,12 @@
-import { randomUUID } from 'crypto';
-import { Hono } from 'hono';
+﻿import { Hono } from 'hono';
+import { z } from 'zod';
 import { verifyUserForLogin, getUserByUsername, createLoginLog, trackLoginFailure, getAccountLockStatus, clearAccountLock, getIpBlockStatus, evaluateIpBlock, checkIpWhitelistFromUser, verifyTotpCode, verifyUserPassword } from '../services/auth.service.js';
 import { getClientIp, getClientIpInfo } from '../utils/client-ip.js';
-import { getTurnstileSiteKey, isTurnstileEnabled, verifyTurnstileToken } from '../utils/turnstile.js';
+import { verifyTurnstileToken, turnstileConfigPayload } from '../utils/turnstile.js';
 import { isSafePublicUrl } from '../utils/url-safety.js';
 import { lookupGeoLabel } from '../utils/geoip.js';
 import { logSecurityEvent } from '../services/security-event.service.js';
-import { createSession, deleteSession, deleteAllUserSessions, getSessionByToken, rotateSessionRefreshToken } from '../services/session.service.js';
+import { createSession, deleteSession, deleteAllUserSessions, getSessionByToken } from '../services/session.service.js';
 import { generateAccessToken, generateRefreshToken, verifyToken } from '../utils/jwt.js';
 import { loginSchema, changePasswordSchema } from '@timemark/shared';
 import { authMiddleware } from '../middleware/auth.middleware.js';
@@ -14,8 +14,18 @@ import { sendSecurityAlert } from '../services/alert.service.js';
 import { ensureLunarHolidayEvents } from '../services/lunar-holidays.js';
 import { hashPassword } from '../utils/password.js';
 import { query } from '../db/index.js';
-import { setAuthCookies, clearAuthCookies, getRefreshTokenFromCookie, getAccessTokenFromCookie, setAccessCookie, setRefreshCookie } from '../utils/auth-cookies.js';
+import {
+  setAuthCookies,
+  clearAuthCookies,
+  getRefreshTokenFromCookie,
+  getAccessTokenFromCookie,
+  setAccessCookie,
+  setRefreshCookie,
+  accessMaxAgeSeconds,
+  refreshMaxAgeSeconds,
+} from '../utils/auth-cookies.js';
 import { loginRateLimit, authMutationRateLimit } from '../middleware/rate-limit.js';
+import { logFireAndForget } from '../utils/logger.js';
 
 const auth = new Hono();
 
@@ -32,7 +42,7 @@ auth.post('/login', loginRateLimit, async (c) => {
         success: false,
         error: '请求参数无效',
         code: 'validation_failed',
-        details: parsed.error.flatten(),
+        details: z.flattenError(parsed.error),
       }, 400);
     }
 
@@ -97,6 +107,7 @@ auth.post('/login', loginRateLimit, async (c) => {
           userAgent,
           failureCount: tracking.failureCount,
           locked: true,
+          lockMinutes: tracking.lockMinutes,
           alertType: 'login_failure',
         });
 
@@ -127,19 +138,43 @@ auth.post('/login', loginRateLimit, async (c) => {
     if (user.totpEnabled && user.totpSecret) {
       const totpOk = verifyTotpCode(user.totpSecret, totpCode || '');
       if (!totpOk) {
-        void createLoginLog(user.id, ip, userAgent, deviceFingerprint || '', false, 'totp_invalid');
-        return c.json({
-          success: false,
-          error: '需要双因素验证码',
-          code: 'totp_required',
-          requiresTotp: true,
-        }, 401);
+        // No valid TOTP code — last resort: a one-time recovery code. This is the single
+        // escape hatch for a lost authenticator; without it the account is unrecoverable.
+        const { consumeRecoveryCode } = await import('../services/recovery-codes.service.js');
+        const recoveryUsed = totpCode
+          ? await consumeRecoveryCode(parseInt(user.id, 10), totpCode)
+          : false;
+        if (recoveryUsed) {
+          await logSecurityEvent({
+            userId: parseInt(user.id, 10),
+            username: user.username,
+            eventType: 'totp_recovery_code_used',
+            ip,
+            userAgent,
+            metadata: { reason: 'totp_invalid_recovery_code_accepted' },
+          });
+          logFireAndForget('auth.totp_recovery_code_used', 'Login succeeded via a one-time TOTP recovery code')(undefined);
+        } else {
+          void createLoginLog(user.id, ip, userAgent, deviceFingerprint || '', false, 'totp_invalid');
+          return c.json({
+            success: false,
+            error: '需要双因素验证码',
+            code: 'totp_required',
+            requiresTotp: true,
+          }, 401);
+        }
       }
     }
 
     const numericUserId = parseInt(user.id, 10);
     const { session, accessToken, refreshToken } = await createSession(user.id, deviceFingerprint || '', false, rememberMe);
-    setAuthCookies(c, accessToken, refreshToken, rememberMe);
+    setAuthCookies(
+    c,
+    accessToken,
+    refreshToken,
+    accessMaxAgeSeconds(rememberMe),
+    refreshMaxAgeSeconds(rememberMe, session.expiresAt),
+  );
 
     void Promise.all([
       createLoginLog(user.id, ip, userAgent, deviceFingerprint || '', true, undefined, {
@@ -158,11 +193,39 @@ auth.post('/login', loginRateLimit, async (c) => {
         ip,
         userAgent,
       }),
-    ]).catch((err) => console.error('[Login post-success]', err));
+      // v2.30：新设备登录提醒（fire-and-forget，不阻塞登录响应）。
+      // alertType 一直存在但从未接线——死代码转活；首登（无历史指纹）也提醒。
+      (async () => {
+        if (!deviceFingerprint) return;
+        const known = await query(
+          `SELECT 1 FROM login_logs
+           WHERE user_id = $1 AND success = TRUE AND device_fingerprint = $2
+           LIMIT 1`,
+          [numericUserId, deviceFingerprint],
+        );
+        if (known.rows.length > 0) return;
+        await sendSecurityAlert({
+          userId: numericUserId,
+          adminEmails: [],
+          username: user.username,
+          ip,
+          userAgent,
+          failureCount: 0,
+          locked: false,
+          alertType: 'new_device',
+        });
+      })().catch((err) => {
+        logFireAndForget('auth.new_device_alert_failed', 'New-device alert failed')(err);
+      }),
+    ]).catch(
+      logFireAndForget('auth.login_post_success_failed', 'Login post-success side effects failed'),
+    );
 
     const mustChangePassword = !user.passwordChangedAt;
 
-    ensureLunarHolidayEvents(numericUserId).catch(() => {});
+    ensureLunarHolidayEvents(numericUserId).catch(
+      logFireAndForget('auth.lunar_holiday_seed_failed', 'Failed to seed lunar holiday events'),
+    );
 
     return c.json({
       success: true,
@@ -196,7 +259,7 @@ auth.post('/verify-device', authMiddleware, async (c) => {
   const bearer = c.req.header('Authorization')?.replace('Bearer ', '');
   const accessToken = bearer || getAccessTokenFromCookie(c);
   const payload = accessToken ? await verifyToken(accessToken) : null;
-  if (payload?.tokenUse !== 'access' || !payload.sessionToken) {
+  if (!payload?.sessionToken) {
     return c.json({ success: true, data: { trusted: false } });
   }
 
@@ -220,20 +283,20 @@ auth.post('/logout', authMiddleware, async (c) => {
     const bearer = c.req.header('Authorization')?.replace('Bearer ', '');
     if (bearer) {
       const payload = await verifyToken(bearer);
-      if (payload?.tokenUse === 'access') sessionToken = payload.sessionToken;
+      sessionToken = payload?.sessionToken;
     }
     if (!sessionToken) {
       const accessToken = getAccessTokenFromCookie(c);
       if (accessToken) {
         const payload = await verifyToken(accessToken);
-        if (payload?.tokenUse === 'access') sessionToken = payload.sessionToken;
+        sessionToken = payload?.sessionToken;
       }
     }
     if (!sessionToken) {
       const refreshToken = getRefreshTokenFromCookie(c);
       if (refreshToken) {
         const payload = await verifyToken(refreshToken);
-        if (payload?.tokenUse === 'refresh') sessionToken = payload.sessionToken;
+        sessionToken = payload?.sessionToken;
       }
     }
     if (sessionToken) {
@@ -279,8 +342,7 @@ auth.post('/change-password', authMiddleware, authMutationRateLimit, async (c) =
 
     const bearer = c.req.header('Authorization')?.replace('Bearer ', '');
     const currentPayload = bearer ? await verifyToken(bearer) : null;
-    const currentSessionToken = currentPayload?.tokenUse === 'access' ? currentPayload.sessionToken : undefined;
-    await deleteAllUserSessions(user.id, currentSessionToken);
+    await deleteAllUserSessions(user.id, currentPayload?.sessionToken);
 
     await sendSecurityAlert({
       userId: Number(user.id),
@@ -306,47 +368,53 @@ auth.post('/refresh', async (c) => {
     const refreshToken = body.refreshToken || getRefreshTokenFromCookie(c);
 
     if (!refreshToken) {
-      return c.json({ success: false, error: 'Refresh token is required' }, 400);
+      return c.json({ success: false, error: 'Refresh token is required', code: 'refresh_missing' }, 400);
     }
 
     // Verify refresh token
-    const payload = await verifyToken(refreshToken);
-    if (!payload || payload.tokenUse !== 'refresh' || !payload.refreshTokenId) {
-      return c.json({ success: false, error: 'Invalid or expired refresh token' }, 401);
+    const payload = await verifyToken(refreshToken, undefined, 'refresh');
+    if (!payload) {
+      return c.json({ success: false, error: 'Invalid or expired refresh token', code: 'refresh_invalid' }, 401);
     }
 
     if (!payload.sessionToken) {
-      return c.json({ success: false, error: 'Invalid or expired refresh token' }, 401);
+      return c.json({ success: false, error: 'Invalid or expired refresh token', code: 'refresh_invalid' }, 401);
     }
 
     const session = await getSessionByToken(payload.sessionToken);
     if (!session) {
-      return c.json({ success: false, error: 'Session expired or revoked' }, 401);
+      return c.json({ success: false, error: 'Session expired or revoked', code: 'session_revoked' }, 401);
     }
 
     const { getUserById } = await import('../services/auth.service.js');
     const user = await getUserById(payload.userId);
     if (!user) {
-      return c.json({ success: false, error: 'User not found' }, 401);
+      return c.json({ success: false, error: 'User not found', code: 'user_missing' }, 401);
     }
 
-    const sessionMs = new Date(session.expiresAt).getTime() - Date.now();
-    const rememberMe = sessionMs > 24 * 60 * 60 * 1000;
+    // The mode chosen at login, read back off the signed refresh token. It used to be
+    // re-derived here as `remaining > 24h`, which silently downgraded a 30-day
+    // remembered session to a browser-session cookie once it had under 24h left —
+    // i.e. remember-me users were logged out on browser restart after six days.
+    // A pre-existing refresh token carries no claim; `rememberMe` is then false, the
+    // safe direction (degrade to a session cookie rather than silently extend).
+    const rememberMe = payload.rememberMe === true;
 
-    const nextRefreshTokenId = randomUUID();
+    // Sliding renewal: an actively used remembered session gets its absolute deadline
+    // pushed to now+30d on every refresh, so daily use never hard-expires mid-month.
+    let sessionExpiresAt: Date | string = session.expiresAt;
+    if (rememberMe) {
+      const { renewRememberedSession } = await import('../services/session.service.js');
+      sessionExpiresAt = (await renewRememberedSession(payload.sessionToken)) ?? session.expiresAt;
+    }
+
     const accessToken = await generateAccessToken(user.id, payload.sessionToken, rememberMe);
-    const newRefreshToken = await generateRefreshToken(user.id, payload.sessionToken, nextRefreshTokenId);
-    const rotated = await rotateSessionRefreshToken(
-      payload.sessionToken,
-      payload.refreshTokenId,
-      nextRefreshTokenId,
-    );
-    if (!rotated) {
-      return c.json({ success: false, error: 'Refresh token is invalid or already used' }, 401);
-    }
+    const newRefreshToken = await generateRefreshToken(user.id, payload.sessionToken, rememberMe);
 
-    setAccessCookie(c, accessToken, rememberMe);
-    setRefreshCookie(c, newRefreshToken, rememberMe);
+    // The cookie is capped at the session's own deadline so a browser never holds a
+    // credential the server has already expired.
+    setAccessCookie(c, accessToken, accessMaxAgeSeconds(rememberMe));
+    setRefreshCookie(c, newRefreshToken, refreshMaxAgeSeconds(rememberMe, sessionExpiresAt));
 
     return c.json({ success: true, data: { user, authMode: 'cookie' } });
   } catch (error: any) {
@@ -375,13 +443,7 @@ function toIsoLoginTime(value: unknown): string | null {
 }
 
 auth.get('/turnstile-config', async (c) => {
-  return c.json({
-    success: true,
-    data: {
-      siteKey: getTurnstileSiteKey() || null,
-      enabled: isTurnstileEnabled(),
-    },
-  });
+  return c.json({ success: true, data: turnstileConfigPayload() });
 });
 
 auth.get('/login-history', authMiddleware, async (c) => {

@@ -72,7 +72,24 @@ function writeEnvFile(config: Record<string, string>): void {
  * 后续启动时从 .env 文件读取已保存的密钥
  */
 export function initSecretKeys(): KeyConfig {
-  // 从环境变量或 .env 文件读取配置
+  // Vercel 环境：所有密钥来自环境变量，不访问文件系统
+  if (process.env.VERCEL) {
+    const jwtSecret = process.env.JWT_SECRET;
+    const masterKey = process.env.MASTER_KEY;
+
+    if (!jwtSecret || !masterKey) {
+      console.error('[secrets] Missing required secrets in Vercel environment');
+      console.error('[secrets] Set JWT_SECRET and MASTER_KEY in Vercel Environment Variables');
+      throw new Error('JWT_SECRET and MASTER_KEY must be set via Vercel environment variables');
+    }
+
+    process.env.JWT_SECRET = jwtSecret;
+    process.env.MASTER_KEY = masterKey;
+
+    return { JWT_SECRET: jwtSecret, MASTER_KEY: masterKey };
+  }
+
+  // 本地/Docker 环境：从 .env 文件读取，自动生成并保存
   let envConfig = readEnvFile();
 
   let jwtSecret = process.env.JWT_SECRET || envConfig.JWT_SECRET;
@@ -122,4 +139,19 @@ export function getSecretKeys(): KeyConfig {
     throw new Error('Secret keys not initialized. Call initSecretKeys() first.');
   }
   return { JWT_SECRET: jwtSecret, MASTER_KEY: masterKey };
+}
+
+/** Legacy key used only for decrypting data encrypted before key rotation. */
+export const LEGACY_MASTER_KEY = 'timemark-default-master-key-change-in-production-2026';
+
+/**
+ * Returns MASTER_KEY for encryption/decryption. Never falls back to a weak default in production.
+ */
+export function requireMasterKey(): string {
+  const key = process.env.MASTER_KEY;
+  if (key) return key;
+  if (process.env.VERCEL || process.env.NODE_ENV === 'production') {
+    throw new Error('MASTER_KEY must be set in production');
+  }
+  throw new Error('Secret keys not initialized. Call initSecretKeys() first.');
 }

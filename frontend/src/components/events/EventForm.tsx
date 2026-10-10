@@ -1,16 +1,31 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
-import { Select } from '@/components/ui/select';
 import { Textarea } from '@/components/ui/textarea';
 import { Switch } from '@/components/ui/switch';
 import { Badge } from '@/components/ui/badge';
-import { CalendarClock, Type, AlignLeft, Globe, Bell, Users, Plus, X, Heart, GraduationCap, PartyPopper, Calendar, Sparkles, ChevronDown, Clock, Eye, ExternalLink } from 'lucide-react';
+import { CalendarClock, Type, AlignLeft, Globe, Bell, Users, Plus, X, Heart, GraduationCap, PartyPopper, Calendar, Sparkles, Clock, Eye, ExternalLink } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Lunar, Solar } from 'lunar-javascript';
 import { useNavigate } from 'react-router-dom';
+import {
+  applyContactAsPerson,
+  applyContactsAsReminders,
+  mergeContactIntoReminderConfig,
+  resolveContactPersonName,
+  resolveContactGreetingName,
+  type FixedContactForEvent,
+} from '@/lib/contact-event-bridge';
+import { normalizeEmail, suggestTemplateForContact, isFamilyLikeContact } from '@timemark/shared';
+import { resolveNextGregorianOccurrence } from '@timemark/shared/event-schedule';
+import { contactHasAnyEmail, getContactEmailList } from '@/lib/contact-utils';
+import { accountTypesForChannel, isChannelSelected } from '@/lib/channel-account-type';
+import { fetchChannelTemplates, type ChannelTemplate } from '@/lib/channel-templates';
+import { ChannelIcon } from '@/components/channels/ChannelIcon';
 import { api, fetchAvailableChannels, type AvailableChannel } from '@/lib/api';
+import { VoiceInputButton } from './VoiceInputButton';
+import type { VoiceDraft } from './voice-input';
 import { PRESET_TEMPLATES, renderTemplate, EVENT_TYPE_TEMPLATES } from '@timemark/shared/templates';
 import { getBlessing } from '@timemark/shared/blessings';
 import type { Event, CreateEventRequest, EventType, CalendarType, ReminderConfig, LunarDate } from '@timemark/shared';
@@ -107,50 +122,23 @@ const convertToGregorian = (lunarDate: { year: number; month: number; day: numbe
   }
 };
 
-const notificationChannels = [
-  // Email channels
-  { value: 'email', label: '邮件', icon: '📧' },
-  { value: 'resend', label: 'Resend邮件', icon: '📧' },
-  { value: 'smtp', label: 'SMTP邮件', icon: '📧' },
-  // Webhook channels
-  { value: 'feishu', label: '飞书', icon: '📱' },
-  { value: 'dingtalk', label: '钉钉', icon: '🔔' },
-  { value: 'wecom', label: '企业微信', icon: '💬' },
-  { value: 'discord', label: 'Discord', icon: '🎮' },
-  { value: 'slack', label: 'Slack', icon: '💼' },
-  { value: 'googlechat', label: 'Google Chat', icon: '🔵' },
-  { value: 'irc', label: 'IRC', icon: '💻' },
-  { value: 'synologychat', label: '群晖 Chat', icon: '🖥️' },
-  { value: 'twitch', label: 'Twitch', icon: '📺' },
-  // Token-based channels
-  { value: 'telegram', label: 'Telegram', icon: '✈️' },
-  { value: 'line', label: 'LINE', icon: '🟢' },
-  { value: 'matrix', label: 'Matrix', icon: '⚡' },
-  { value: 'mattermost', label: 'Mattermost', icon: '🧱' },
-  { value: 'msteams', label: 'MS Teams', icon: '📊' },
-  { value: 'nextcloud_talk', label: 'Nextcloud Talk', icon: '☁️' },
-  { value: 'nostr', label: 'Nostr', icon: '🕸️' },
-  { value: 'wxpusher', label: 'WxPusher', icon: '💚' },
-  { value: 'qmsg', label: 'Qmsg', icon: '🐧' },
-  // New token-based channels (batch 2)
-  { value: 'clawbot', label: '微信龙虾', icon: '🦞' },
-  { value: 'serverchan', label: 'Server酱', icon: '📡' },
-  { value: 'pushplus', label: 'PushPlus', icon: '➕' },
-  { value: 'bark', label: 'Bark', icon: '🐕' },
-  { value: 'gotify', label: 'Gotify', icon: '📨' },
-  { value: 'meow', label: '喵推送', icon: '🐱' },
-  { value: 'pushme', label: 'PushMe', icon: '📲' },
-  { value: 'wecomapp', label: '企微应用', icon: '🏢' },
-  // Plugin-based channels
-  { value: 'wechat_official', label: '微信公众号', icon: '📣' },
-  { value: 'wechat_personal', label: '微信个人号', icon: '💬' },
-  { value: 'whatsapp', label: 'WhatsApp', icon: '📲' },
-  { value: 'qqbot', label: 'QQ Bot', icon: '🐧' },
-  { value: 'signal', label: 'Signal', icon: '🔒' },
-  { value: 'zalo', label: 'Zalo', icon: '💌' },
-  { value: 'imessage', label: 'iMessage', icon: '🍎' },
-];
+const formatLunarInput = (lunar: LunarDate) =>
+  `${lunar.year}-${String(lunar.month).padStart(2, '0')}-${String(lunar.day).padStart(2, '0')}`;
 
+const parseLunarInput = (input: string): LunarDate | null => {
+  const lunarMatch = input.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (!lunarMatch) return null;
+  const [, year, month, day] = lunarMatch;
+  return {
+    year: parseInt(year, 10),
+    month: parseInt(month, 10),
+    day: parseInt(day, 10),
+    isLeap: false,
+  };
+};
+
+// 渠道选项不再在前端抄一份：以前那份漏了 generic_webhook / pushdeer / twilio，
+// 用户配好账号也选不到。统一走后端目录 GET /channels/templates。
 const defaultReminderConfig: ReminderConfig = {
   enabled: true,
   daysBeforeList: [1, 3],
@@ -163,6 +151,8 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
   const [availableChannels, setAvailableChannels] = useState<AvailableChannel[]>([]);
+  const [channelOptions, setChannelOptions] = useState<ChannelTemplate[]>([]);
+  const [channelListFailed, setChannelListFailed] = useState(false);
   const [formData, setFormData] = useState<CreateEventRequest>({
     name: '',
     type: 'birthday',
@@ -172,7 +162,60 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
     reminderConfig: defaultReminderConfig,
   });
 
+  const reminderTimeline = useMemo(() => {
+    if (!formData.date) return [];
+    const days = formData.reminderConfig?.daysBeforeList?.length
+      ? formData.reminderConfig.daysBeforeList
+      : [1, 3];
+    const allDays = days.includes(0) ? days : [0, ...days];
+    const times = formData.reminderConfig?.reminderTimes?.length
+      ? formData.reminderConfig.reminderTimes
+      : ['09:00'];
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const nextOccurrence = resolveNextGregorianOccurrence(formData.date, todayStr, {
+      eventType: formData.type,
+      recurringConfig: formData.recurringConfig ?? null,
+    });
+    const entries: { date: string; daysBefore: number; time: string }[] = [];
+
+    for (const d of [...new Set(allDays)].sort((a, b) => b - a)) {
+      const remind = new Date(nextOccurrence + 'T00:00:00');
+      remind.setDate(remind.getDate() - d);
+      const dateStr = `${remind.getFullYear()}-${String(remind.getMonth() + 1).padStart(2, '0')}-${String(remind.getDate()).padStart(2, '0')}`;
+      if (dateStr >= todayStr) {
+        for (const time of times) {
+          entries.push({ date: dateStr, daysBefore: d, time });
+        }
+      }
+    }
+    return entries.slice(0, 16);
+  }, [formData.date, formData.type, formData.recurringConfig, formData.reminderConfig]);
+
   const [lunarInputValue, setLunarInputValue] = useState('');
+
+  // 语音输入（checkbox 145）：浏览器本地识别，规则解析后填入可编辑草稿，绝不自动保存。
+  const [voiceDraftNotice, setVoiceDraftNotice] = useState<string | null>(null);
+
+  const handleVoiceDraft = (draft: VoiceDraft) => {
+    setFormData((prev) => ({
+      ...prev,
+      name: draft.name,
+      // 解析结果是公历 YYYY-MM-DD（本地日历日，绝不是 UTC ISO 切片）。
+      ...(draft.date ? { date: draft.date, calendarType: 'gregorian' as const } : {}),
+      ...(draft.recurrence
+        ? {
+            recurringConfig: {
+              enabled: true,
+              frequency: draft.recurrence.frequency,
+              interval: draft.recurrence.interval,
+              endType: 'never' as const,
+            },
+          }
+        : {}),
+    }));
+    if (draft.date) setLunarInputValue('');
+    setVoiceDraftNotice('已根据语音填入草稿，请核对后再点击「确认保存」');
+  };
 
   const [customTime, setCustomTime] = useState('');
   const [customEmail, setCustomEmail] = useState('');
@@ -188,8 +231,123 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
 
   // 通知预览状态
   const [previewOpen, setPreviewOpen] = useState(false);
+  const [fixedContacts, setFixedContacts] = useState<FixedContactForEvent[]>([]);
+  const [selectedReminderContactIds, setSelectedReminderContactIds] = useState<number[]>([]);
+
+  const toggleReminderContactSelect = (id: number) => {
+    setSelectedReminderContactIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+    );
+  };
+
+  const applySelectedReminderContacts = () => {
+    const selected = fixedContacts.filter((c) => selectedReminderContactIds.includes(c.id));
+    if (selected.length === 0) return;
+    setFormData((prev) => {
+      const applied = applyContactsAsReminders(
+        selected,
+        accounts,
+        prev.reminderConfig || defaultReminderConfig,
+        prev,
+      );
+      return {
+        ...prev,
+        reminderRecipientName: applied.reminderRecipientName,
+        reminderRecipientEmail: applied.reminderRecipientEmail,
+        reminderConfig: applied.reminderConfig,
+      };
+    });
+  };
+
+  const addEmailRecipient = (raw: string) => {
+    const email = normalizeEmail(raw);
+    if (!email) return;
+    setFormData((prev) => {
+      const current = prev.reminderConfig?.emailRecipients || [];
+      if (current.includes(email)) return prev;
+      return {
+        ...prev,
+        reminderConfig: {
+          ...prev.reminderConfig!,
+          emailRecipients: [...current, email],
+        },
+      };
+    });
+  };
+
+  useEffect(() => {
+    if (!open || !formData.type || event) return;
+    api.get<{ daysBefore: number[]; source: string }>(`/features/smart-days/${formData.type}`)
+      .then((res) => {
+        if (res?.daysBefore?.length) {
+          setFormData((prev) => ({
+            ...prev,
+            reminderConfig: {
+              ...prev.reminderConfig!,
+              daysBeforeList: res.daysBefore,
+            },
+          }));
+        }
+      })
+      .catch(() => {});
+  }, [open, formData.type]);
+
+  useEffect(() => {
+    if (!open) return;
+    api.get<FixedContactForEvent[]>('/contacts')
+      .then((data) => setFixedContacts(Array.isArray(data) ? data : []))
+      .catch(() => setFixedContacts([]));
+  }, [open]);
+
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>('birthday');
   const [userTemplates, setUserTemplates] = useState<Array<{id: string; name: string; content: string}>>([]);
+
+  useEffect(() => {
+    if (!open) return;
+    const templates = EVENT_TYPE_TEMPLATES[formData.type] || EVENT_TYPE_TEMPLATES.other;
+    const recipient = formData.reminderRecipientName?.trim() || formData.personName?.trim();
+    if (!recipient) {
+      setSelectedTemplateId(templates[0] || 'generic');
+      return;
+    }
+    const matchedContact = fixedContacts.find(
+      (c) =>
+        resolveContactGreetingName(c) === recipient
+        || resolveContactPersonName(c) === recipient
+        || c.name === recipient,
+    );
+    if (matchedContact) {
+      const suggested = suggestTemplateForContact(matchedContact, formData.type);
+      if (suggested && templates.includes(suggested)) {
+        setSelectedTemplateId(suggested);
+        return;
+      }
+    }
+    if (isFamilyLikeContact({ name: recipient, relationship: recipient })) {
+      if (formData.type === 'holiday') setSelectedTemplateId('holiday_family');
+      else if (formData.type === 'birthday') setSelectedTemplateId('birthday_detailed');
+      return;
+    }
+    api.get<Array<{ from_relation: string; to_relation: string; recipient_type?: string }>>('/config/relationships')
+      .then((mappings) => {
+        const list = Array.isArray(mappings) ? mappings : [];
+        const hit = list.find((m) =>
+          m.from_relation === recipient
+          || m.to_relation === recipient
+          || m.recipient_type === recipient,
+        );
+        if (hit?.recipient_type === 'family' && formData.type === 'holiday') {
+          setSelectedTemplateId('holiday_family');
+        } else if (hit?.recipient_type === 'family' && formData.type === 'birthday') {
+          setSelectedTemplateId('birthday_detailed');
+        } else if (hit?.recipient_type === 'colleague' && formData.type === 'meeting') {
+          setSelectedTemplateId('meeting');
+        } else {
+          setSelectedTemplateId(templates[0] || 'generic');
+        }
+      })
+      .catch(() => setSelectedTemplateId(templates[0] || 'generic'));
+  }, [open, formData.type, formData.reminderRecipientName, formData.personName, fixedContacts]);
 
   // 加载自定义模板
   useEffect(() => {
@@ -231,7 +389,7 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
     const template = allTemplates.find(t => t.id === selectedTemplateId);
     if (!template) return '请选择模板';
     
-    const blessing = getBlessing(formData.type, undefined, formData.personName, formData.reminderRecipientName);
+    const blessing = getBlessing(formData.type, undefined, formData.personName ?? undefined, formData.reminderRecipientName ?? undefined);
     const data: Record<string, string> = {
       event_name: formData.name || '示例事件',
       event_date: formData.date || '2026-05-04',
@@ -276,10 +434,12 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
         reminderRecipientEmail: event.reminderRecipientEmail,
       });
       
-      // Set lunar input value for "both" calendar type
-      if (event.calendarType === 'both' && event.lunarDate) {
-        const lunar = event.lunarDate as any;
-        setLunarInputValue(`${lunar.year}-${String(lunar.month).padStart(2, '0')}-${String(lunar.day).padStart(2, '0')}`);
+      // Set lunar input value for lunar/both calendar types
+      if ((event.calendarType === 'both' || event.calendarType === 'lunar') && event.lunarDate) {
+        setLunarInputValue(formatLunarInput(event.lunarDate));
+      } else if (event.calendarType === 'lunar' && safeDate) {
+        const lunar = convertToLunar(safeDate);
+        setLunarInputValue(lunar ? formatLunarInput(lunar) : '');
       } else {
         setLunarInputValue('');
       }
@@ -307,6 +467,14 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
       fetchAvailableChannels()
         .then(data => setAvailableChannels(data))
         .catch(err => console.error('Failed to load available channels:', err));
+
+      setChannelListFailed(false);
+      fetchChannelTemplates()
+        .then(setChannelOptions)
+        .catch(err => {
+          console.error('Failed to load channel templates:', err);
+          setChannelListFailed(true);
+        });
     }
   }, [open]);
 
@@ -319,21 +487,33 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
       return;
     }
     
-    if (!formData.date) {
+    if (!formData.date && formData.calendarType !== 'lunar') {
       alert('请选择日期');
+      return;
+    }
+
+    if (formData.calendarType === 'lunar' && !lunarInputValue.trim()) {
+      alert('请填写农历日期');
       return;
     }
     
     // Validate date - handle both YYYY-MM-DD and YYYY-MM-DDTHH:mm formats
-    let dateToValidate = formData.date;
-    if (formData.date.includes('T')) {
-      dateToValidate = formData.date.split('T')[0];
-    }
-    // Append T00:00:00 to force local timezone instead of UTC
-    const targetDate = new Date(dateToValidate + 'T00:00:00');
-    if (isNaN(targetDate.getTime())) {
-      alert('无效的日期格式');
-      return;
+    if (formData.date) {
+      let dateToValidate = formData.date;
+      if (formData.date.includes('T')) {
+        dateToValidate = formData.date.split('T')[0];
+      }
+      const targetDate = new Date(dateToValidate + 'T00:00:00');
+      if (isNaN(targetDate.getTime())) {
+        alert('无效的日期格式');
+        return;
+      }
+    } else if (formData.calendarType === 'lunar') {
+      const lunarDate = parseLunarInput(lunarInputValue);
+      if (!lunarDate || !convertToGregorian(lunarDate)) {
+        alert('请填写有效的农历日期');
+        return;
+      }
     }
 
     setLoading(true);
@@ -341,7 +521,11 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
       // Convert date to YYYY-MM-DD string for PostgreSQL (use local time, not UTC)
       // Handle both YYYY-MM-DD and YYYY-MM-DDTHH:mm formats
       let dateStr = formData.date;
-      if (formData.date.includes('T')) {
+      if (!dateStr && formData.calendarType === 'lunar') {
+        const lunarDate = parseLunarInput(lunarInputValue);
+        dateStr = lunarDate ? (convertToGregorian(lunarDate) ?? '') : '';
+      }
+      if (dateStr.includes('T')) {
         const datePart = formData.date.split('T')[0];
         dateStr = datePart;
       }
@@ -362,10 +546,41 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
         dateStr = `${year}-${month}-${day}`;
       }
       
+      const emailRecipients = [
+        ...new Set(
+          (formData.reminderConfig?.emailRecipients || [])
+            .map((e) => normalizeEmail(e))
+            .filter((e): e is string => !!e),
+        ),
+      ];
+
       const submissionData: CreateEventRequest = {
         ...formData,
         date: dateStr,
+        reminderConfig: {
+          ...formData.reminderConfig!,
+          emailRecipients,
+        },
+        reminderRecipientEmail: emailRecipients[0] || null,
       };
+
+      if (submissionData.calendarType === 'lunar' || submissionData.calendarType === 'both') {
+        const lunarFromInput = parseLunarInput(lunarInputValue);
+        const lunarFromDate = convertToLunar(dateStr);
+        submissionData.lunarDate = lunarFromInput ?? formData.lunarDate ?? lunarFromDate ?? undefined;
+        if (!submissionData.lunarDate) {
+          alert('请填写有效的农历日期');
+          return;
+        }
+        if (!submissionData.date) {
+          const gregorian = convertToGregorian(submissionData.lunarDate);
+          if (!gregorian) {
+            alert('农历日期无效，无法转换为公历');
+            return;
+          }
+          submissionData.date = gregorian;
+        }
+      }
       
       await onSubmit(submissionData);
       onClose();
@@ -395,19 +610,22 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
   const toggleChannel = async (channel: string) => {
     const currentChannels = formData.reminderConfig.channels || [];
     const currentAccountIds = formData.reminderConfig.accountIds || [];
-    const isSelected = currentChannels.includes(channel);
+    // 必须走别名判定：老事件存的是 `wechat`，勾选框也是按 isChannelSelected 显示已勾选，
+    // 这里若用精确匹配，点一个「已勾选」的框会变成再追加一个 `wxpusher`（重复而不是取消）。
+    const isSelected = isChannelSelected(currentChannels, channel);
 
     if (isSelected) {
       // 取消选择该渠道，并移除相关 accountIds
-      const accountType = channelToAccountType[channel];
-      const newAccountIds = accountType
-        ? currentAccountIds.filter(id => !accounts.some(a => String(a.id) === id && a.type === accountType))
-        : currentAccountIds;
+      const accountTypes = accountTypesForChannel(channel);
+      const newAccountIds = currentAccountIds.filter(
+        id => !accounts.some(a => String(a.id) === id && accountTypes.includes(a.type))
+      );
       setFormData({
         ...formData,
         reminderConfig: {
           ...formData.reminderConfig,
-          channels: currentChannels.filter(c => c !== channel),
+          // 所有历史拼写一起删干净，否则取消后仍被判定为已勾选
+          channels: currentChannels.filter(c => !accountTypes.includes(c)),
           accountIds: newAccountIds,
         },
       });
@@ -428,55 +646,28 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
   };
 
   const handleCalendarTypeChange = (calendarType: CalendarType) => {
-    setFormData({ ...formData, calendarType });
-  };
-
-  const channelToAccountType: Record<string, string> = {
-    email: 'email',
-    resend: 'resend',
-    smtp: 'smtp',
-    feishu: 'feishu',
-    wecom: 'wecom',
-    dingtalk: 'dingtalk',
-    telegram: 'telegram',
-    discord: 'discord',
-    slack: 'slack',
-    googlechat: 'googlechat',
-    irc: 'irc',
-    synologychat: 'synologychat',
-    twitch: 'twitch',
-    line: 'line',
-    matrix: 'matrix',
-    mattermost: 'mattermost',
-    msteams: 'msteams',
-    nextcloud_talk: 'nextcloudtalk',
-    nostr: 'nostr',
-    whatsapp: 'whatsapp',
-    signal: 'signal',
-    zalo: 'zalo',
-    wechat_official: 'wxpusher',
-    wechat_personal: 'wechat_personal',
-    qqbot: 'qqbot',
-    qmsg: 'qmsg',
-    wxpusher: 'wxpusher',
-    clawbot: 'clawbot',
-    serverchan: 'serverchan',
-    pushplus: 'pushplus',
-    bark: 'bark',
-    gotify: 'gotify',
-    meow: 'meow',
-    pushme: 'pushme',
-    wecomapp: 'wecomapp',
+    setFormData((prev) => {
+      const next = { ...prev, calendarType };
+      if ((calendarType === 'both' || calendarType === 'lunar') && prev.date) {
+        const lunar = convertToLunar(prev.date);
+        if (lunar) {
+          next.lunarDate = lunar;
+          setLunarInputValue(formatLunarInput(lunar));
+        }
+      }
+      if (calendarType === 'gregorian') {
+        setLunarInputValue('');
+      }
+      return next;
+    });
   };
 
   const openAccountPicker = async (channel: string, currentAccountIds: string[]) => {
-    const accountType = channelToAccountType[channel];
-    if (!accountType) return;
-
+    const accountTypes = accountTypesForChannel(channel);
     setAccountsLoading(true);
     try {
       const data = await api.get<NotificationAccountResponse[]>('/config/accounts');
-      const filtered = data.filter(a => a.type === accountType && a.is_active);
+      const filtered = data.filter(a => accountTypes.includes(a.type) && a.is_active);
       setPickerAccounts(filtered);
       setPickerSelectedIds(currentAccountIds.filter(id => filtered.some(a => String(a.id) === id)));
       setAccountPickerChannel(channel);
@@ -567,12 +758,12 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
 
   const itemVariants = {
     hidden: { opacity: 0, y: 15 },
-    visible: { opacity: 1, y: 0, transition: { type: 'spring', stiffness: 300, damping: 24 } }
+    visible: { opacity: 1, y: 0, transition: { type: 'spring', stiffness: 300, damping: 24 } as const }
   };
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
-      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto glass-panel rounded-[2.5rem]">
+      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto overscroll-contain glass-panel rounded-[2.5rem]">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-3 text-2xl font-bold text-slate-900 dark:text-white">
             <div className="p-2.5 bg-primary-50 dark:bg-primary-900/30 rounded-xl text-primary-600 dark:text-primary-400 border border-primary-100 dark:border-primary-800/50">
@@ -646,13 +837,22 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
               <Calendar size={16} className="text-primary-500" />
               事件名称
             </label>
-            <Input
-              required
-              placeholder="例如：妈妈生日 / 结婚纪念日"
-              value={formData.name}
-              onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-              className="h-12"
-            />
+            <div className="flex items-start gap-2">
+              <Input
+                required
+                placeholder="例如：妈妈生日 / 结婚纪念日"
+                value={formData.name}
+                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                className="h-12 flex-1"
+                aria-label="事件名称"
+              />
+              <VoiceInputButton onDraft={handleVoiceDraft} />
+            </div>
+            {voiceDraftNotice && (
+              <p role="status" className="text-xs font-medium text-primary-600 dark:text-primary-400">
+                {voiceDraftNotice}
+              </p>
+            )}
           </motion.div>
 
           {/* 日历类型和日期选择 */}
@@ -695,26 +895,50 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
               {formData.calendarType === 'both' && '公历日期'}
               {formData.calendarType === 'both' && <span className="text-xs text-slate-400 ml-2">(农历将在下方自动计算)</span>}
             </label>
-            <Input
-              required
-              type="date"
-              value={formData.date}
-              onChange={(e) => {
-                const newDate = e.target.value;
-                setFormData({ ...formData, date: newDate });
-                // Auto-convert to lunar if needed
-                if (formData.calendarType === 'both') {
-                  const lunar = convertToLunar(newDate);
-                  if (lunar) {
-                    setFormData(prev => ({ ...prev, lunarDate: lunar }));
-                    // 更新农历输入框显示
-                    const lunarStr = `${lunar.year}-${String(lunar.month).padStart(2, '0')}-${String(lunar.day).padStart(2, '0')}`;
-                    setLunarInputValue(lunarStr);
-                  }
-                }
-              }}
-              className="h-12"
-            />
+            {formData.calendarType !== 'lunar' ? (
+              <Input
+                required
+                type="date"
+                value={formData.date}
+                aria-label="事件日期"
+                onChange={(e) => {
+                  const newDate = e.target.value;
+                  setFormData((prev) => {
+                    const next = { ...prev, date: newDate };
+                    if (prev.calendarType === 'both') {
+                      const lunar = convertToLunar(newDate);
+                      if (lunar) {
+                        next.lunarDate = lunar;
+                        setLunarInputValue(formatLunarInput(lunar));
+                      }
+                    }
+                    return next;
+                  });
+                }}
+                className="h-12"
+              />
+            ) : (
+              <Input
+                required
+                type="text"
+                value={lunarInputValue}
+                placeholder="农历日期，格式：YYYY-MM-DD 例如 2007-06-15"
+                aria-label="农历日期"
+                onChange={(e) => {
+                  const input = e.target.value;
+                  setLunarInputValue(input);
+                  const lunarDate = parseLunarInput(input);
+                  if (!lunarDate) return;
+                  const gregorian = convertToGregorian(lunarDate);
+                  setFormData((prev) => ({
+                    ...prev,
+                    lunarDate,
+                    ...(gregorian ? { date: gregorian } : {}),
+                  }));
+                }}
+                className="h-12"
+              />
+            )}
           </motion.div>
 
           {/* Second date for "both" calendar type */}
@@ -732,21 +956,14 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
                 onChange={(e) => {
                   const input = e.target.value;
                   setLunarInputValue(input);
-                  // 尝试解析为农历日期并转换为公历
-                  const lunarMatch = input.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
-                  if (lunarMatch) {
-                    const [, year, month, day] = lunarMatch;
-                    const lunarDate = {
-                      year: parseInt(year),
-                      month: parseInt(month),
-                      day: parseInt(day),
-                      isLeap: false
-                    };
-                    const gregorian = convertToGregorian(lunarDate);
-                    if (gregorian) {
-                      setFormData(prev => ({ ...prev, date: gregorian }));
-                    }
-                  }
+                  const lunarDate = parseLunarInput(input);
+                  if (!lunarDate) return;
+                  const gregorian = convertToGregorian(lunarDate);
+                  setFormData((prev) => ({
+                    ...prev,
+                    lunarDate,
+                    ...(gregorian ? { date: gregorian } : {}),
+                  }));
                 }}
                 className="h-12"
               />
@@ -767,6 +984,59 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
               <p className="text-xs text-slate-500 dark:text-slate-400">
                 💡 设置关联人员后，系统会根据接收人自动转换称呼（如"我爸"→"父亲"）
               </p>
+
+              {fixedContacts.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  <span className="text-[10px] text-slate-400 w-full flex items-center justify-between">
+                    <span>从固定联系人快捷填入（自动适配渠道与邮箱）：</span>
+                    <button type="button" className="text-indigo-500 hover:underline" onClick={() => { onClose(); navigate('/contacts', { state: { backTo: '/dashboard' } }); }}>管理联系人</button>
+                  </span>
+                  {fixedContacts.map((c) => (
+                    <button
+                      key={c.id}
+                      type="button"
+                      className="text-xs px-2 py-1 rounded-lg bg-white dark:bg-slate-700 border border-slate-200 dark:border-slate-600 hover:border-primary-400"
+                      onClick={() => {
+                        setFormData((prev) => ({
+                          ...prev,
+                          ...applyContactAsPerson(c, prev),
+                        }));
+                        const suggested = suggestTemplateForContact(c, formData.type);
+                        if (suggested) setSelectedTemplateId(suggested);
+                      }}
+                      title={`填入被提醒人（${resolveContactPersonName(c)}）`}
+                    >
+                      {c.name}{c.relationship ? ` · ${resolveContactPersonName(c)}` : ''}
+                    </button>
+                  ))}
+                  {fixedContacts.map((c) => (
+                    <button
+                      key={`r-${c.id}`}
+                      type="button"
+                      className={`text-xs px-2 py-1 rounded-lg border ${
+                        selectedReminderContactIds.includes(c.id)
+                          ? 'bg-indigo-500 text-white border-indigo-500'
+                          : 'bg-indigo-50 dark:bg-indigo-900/30 border-indigo-200 dark:border-indigo-700 hover:border-indigo-400'
+                      }`}
+                      onClick={() => toggleReminderContactSelect(c.id)}
+                      title={getContactEmailList(c).length ? `选择为提醒人（${getContactEmailList(c).join('、')}）` : '选择为提醒人'}
+                    >
+                      提醒→{c.name}{contactHasAnyEmail(c) ? ' 📧' : ''}{(c.channel_account_ids?.length ?? 0) > 0 ? ' ✓' : ''}
+                    </button>
+                  ))}
+                  {selectedReminderContactIds.length > 0 && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      className="text-xs h-7"
+                      onClick={applySelectedReminderContacts}
+                    >
+                      应用 {selectedReminderContactIds.length} 位提醒人
+                    </Button>
+                  )}
+                </div>
+              )}
               
               {/* 被提醒人 - 生日/事件所有者 */}
               <div className="space-y-1.5">
@@ -811,19 +1081,8 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') {
                         e.preventDefault();
-                        if (customEmail && customEmail.includes('@')) {
-                          const currentEmails = formData.reminderConfig.emailRecipients || [];
-                          if (!currentEmails.includes(customEmail)) {
-                            setFormData({
-                              ...formData,
-                              reminderConfig: {
-                                ...formData.reminderConfig,
-                                emailRecipients: [...currentEmails, customEmail]
-                              }
-                            });
-                          }
-                          setCustomEmail('');
-                        }
+                        addEmailRecipient(customEmail);
+                        setCustomEmail('');
                       }
                     }}
                   />
@@ -833,19 +1092,8 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
                     size="sm"
                     className="h-10 px-3"
                     onClick={() => {
-                      if (customEmail && customEmail.includes('@')) {
-                        const currentEmails = formData.reminderConfig.emailRecipients || [];
-                        if (!currentEmails.includes(customEmail)) {
-                          setFormData({
-                            ...formData,
-                            reminderConfig: {
-                              ...formData.reminderConfig,
-                              emailRecipients: [...currentEmails, customEmail]
-                            }
-                          });
-                        }
-                        setCustomEmail('');
-                      }
+                      addEmailRecipient(customEmail);
+                      setCustomEmail('');
                     }}
                   >
                     <Plus size={14} />
@@ -879,7 +1127,29 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
                   </div>
                 )}
                 
-                <p className="text-[10px] text-slate-400">不填则使用通知渠道的默认邮箱，支持添加多个收件人</p>
+                <p className="text-[10px] text-slate-400">不填则使用「设置 → 默认测试/收件邮箱」；从联系人添加的邮箱会显示为小写</p>
+                {fixedContacts.filter((c) => contactHasAnyEmail(c)).length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 mt-1">
+                    <span className="text-[10px] text-slate-400 w-full">从联系人添加邮箱：</span>
+                    {fixedContacts.filter((c) => contactHasAnyEmail(c)).map((c) => (
+                      <button
+                        key={`email-${c.id}`}
+                        type="button"
+                        className="text-[10px] px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-primary-400"
+                        onClick={() => setFormData((prev) => ({
+                          ...prev,
+                          reminderConfig: mergeContactIntoReminderConfig(
+                            c,
+                            accounts,
+                            prev.reminderConfig || defaultReminderConfig,
+                          ),
+                        }))}
+                      >
+                        {c.name} ({resolveContactGreetingName(c)} · {getContactEmailList(c).join('、')})
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           </motion.div>
@@ -1010,29 +1280,57 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
                     </div>
                   </div>
 
+                  {reminderTimeline.length > 0 && (
+                    <div className="space-y-2" aria-label="下次提醒时间线">
+                      <label className="text-xs font-semibold text-slate-500 dark:text-slate-400 flex items-center gap-1">
+                        <CalendarClock size={14} /> 提醒时间线预览
+                      </label>
+                      <ul className="text-xs space-y-1 max-h-32 overflow-y-auto overscroll-contain rounded-xl bg-slate-50 dark:bg-slate-900/50 p-3">
+                        {reminderTimeline.map((item, i) => (
+                          <li key={`${item.date}-${item.time}-${i}`} className="flex justify-between gap-2 text-slate-600 dark:text-slate-300">
+                            <span>{item.date} {item.time}</span>
+                            <span className="text-slate-400 shrink-0">
+                              {item.daysBefore === 0 ? '当天' : `提前 ${item.daysBefore} 天`}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
                   {/* 通知渠道选择 */}
                   <div className="space-y-2">
                     <label className="text-xs font-semibold text-slate-500 dark:text-slate-400">通知渠道</label>
                     <div className="grid grid-cols-4 gap-2">
-                      {notificationChannels.map((channel) => {
-                        const accountType = channelToAccountType[channel.value];
-                        const configuredAccounts = availableChannels.filter(a => a.type === accountType);
+                      {channelListFailed && (
+                        <p className="col-span-4 text-xs text-amber-600 dark:text-amber-400">
+                          渠道列表加载失败，请检查网络后重试。
+                        </p>
+                      )}
+                      {!channelListFailed && channelOptions.length === 0 && (
+                        <p className="col-span-4 text-xs text-slate-400 dark:text-slate-500">
+                          正在加载渠道…
+                        </p>
+                      )}
+                      {channelOptions.map((channel) => {
+                        const accountTypes = accountTypesForChannel(channel.id);
+                        const configuredAccounts = availableChannels.filter(a => accountTypes.includes(a.type));
                         const hasActive = configuredAccounts.some(a => a.is_active && a.last_test_result !== 'failed');
                         const hasWarning = configuredAccounts.some(a => a.is_active && a.last_test_result === 'failed');
                         const isConfigured = configuredAccounts.length > 0;
-                        const isSelected = formData.reminderConfig.channels?.includes(channel.value);
+                        const isSelected = isChannelSelected(formData.reminderConfig.channels, channel.id);
                         const isDisabled = !isConfigured;
 
                         return (
                           <button
-                            key={channel.value}
+                            key={channel.id}
                             type="button"
                             onClick={() => {
                               if (isDisabled) {
                                 navigate('/channels');
                                 onClose();
                               } else {
-                                toggleChannel(channel.value);
+                                toggleChannel(channel.id);
                               }
                             }}
                             className={`relative h-full min-h-[48px] w-full rounded-xl text-xs font-medium transition-all duration-300 flex flex-col items-center justify-center gap-1 p-1.5 ${
@@ -1054,8 +1352,8 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
                                   ? 'bg-yellow-500'
                                   : 'bg-green-500'
                             }`} />
-                            <span className={`text-base leading-none ${isDisabled ? 'opacity-40' : ''}`}>{channel.icon}</span>
-                            <span className="text-center leading-tight line-clamp-2">{channel.label}</span>
+                            <span className={`text-base leading-none ${isDisabled ? 'opacity-40' : ''}`}><ChannelIcon name={channel.icon} fallback="Bell" /></span>
+                            <span className="text-center leading-tight line-clamp-2">{channel.name}</span>
                             {isDisabled && (
                               <span className="flex items-center gap-0.5 text-[9px] text-slate-400 dark:text-slate-500">
                                 <ExternalLink size={8} />
@@ -1073,18 +1371,18 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
                     <div className="space-y-3 p-3 rounded-lg bg-slate-50 dark:bg-slate-800/50">
                       <label className="text-xs font-semibold text-slate-500 dark:text-slate-400">通知账户</label>
                       <div className="space-y-2">
-                        {notificationChannels
-                          .filter(ch => formData.reminderConfig.channels?.includes(ch.value))
+{channelOptions
+                          .filter(ch => isChannelSelected(formData.reminderConfig.channels, ch.id))
                           .map(channel => {
-                            const accountType = channelToAccountType[channel.value];
+                            const accountTypes = accountTypesForChannel(channel.id);
                             const selectedIds = formData.reminderConfig.accountIds || [];
-                            const channelAccounts = accounts.filter(a => a.type === accountType && selectedIds.includes(String(a.id)));
+                            const channelAccounts = accounts.filter(a => accountTypes.includes(a.type) && selectedIds.includes(String(a.id)));
 
                             return (
-                              <div key={channel.value} className="flex items-center justify-between text-sm">
+                              <div key={channel.id} className="flex items-center justify-between text-sm">
                                 <div className="flex items-center gap-2">
-                                  <span className="text-base">{channel.icon}</span>
-                                  <span className="font-medium text-slate-700 dark:text-slate-300">{channel.label}</span>
+                                  <span className="text-base"><ChannelIcon name={channel.icon} fallback="Bell" /></span>
+                                  <span className="font-medium text-slate-700 dark:text-slate-300">{channel.name}</span>
                                 </div>
                                 <div className="text-xs text-slate-500 dark:text-slate-400 max-w-[55%] truncate text-right">
                                   {channelAccounts.length > 0
@@ -1281,23 +1579,25 @@ export function EventForm({ open, onClose, onSubmit, event }: EventFormProps) {
             <DialogHeader>
               <DialogTitle className="flex items-center gap-2 text-xl font-bold text-slate-900 dark:text-white">
                 <span className="text-2xl">
-                  {notificationChannels.find(c => c.value === accountPickerChannel)?.icon}
+                  {channelOptions.find(c => c.id === accountPickerChannel)?.icon && (
+                    <ChannelIcon name={channelOptions.find(c => c.id === accountPickerChannel)?.icon} fallback="Bell" />
+                  )}
                 </span>
-                选择 {notificationChannels.find(c => c.value === accountPickerChannel)?.label} 账号
+                选择 {channelOptions.find(c => c.id === accountPickerChannel)?.name} 账号
               </DialogTitle>
             </DialogHeader>
             {accountsLoading ? (
-              <div className="flex items-center justify-center py-8 gap-2 text-slate-500">
+              <div className="flex items-center justify-center py-8 gap-2 text-slate-500 dark:text-slate-400">
                 <div className="w-5 h-5 border-2 border-slate-300 border-t-primary-500 rounded-full animate-spin" />
                 加载中...
               </div>
             ) : pickerAccounts.length === 0 ? (
-              <div className="py-8 text-center text-slate-500">
+              <div className="py-8 text-center text-slate-500 dark:text-slate-400">
                 <p>暂无可用账号</p>
                 <p className="text-xs text-slate-400 mt-1">请在设置中添加账户后重试</p>
               </div>
             ) : (
-              <div className="space-y-2 py-2 max-h-[300px] overflow-y-auto">
+              <div className="space-y-2 py-2 max-h-[300px] overflow-y-auto overscroll-contain">
                 {pickerAccounts.map(account => (
                   <button
                     key={account.id}

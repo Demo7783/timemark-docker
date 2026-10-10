@@ -1,5 +1,4 @@
 import type { Context, Next } from 'hono';
-import { isRequestHttps } from '../utils/client-ip.js';
 
 const ROBOTS_TAG = 'noindex, nofollow, noarchive, nosnippet, noimageai, noai';
 
@@ -12,31 +11,19 @@ export async function securityHeaders(c: Context, next: Next) {
   c.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
   c.header('X-Robots-Tag', ROBOTS_TAG);
   c.header('Cross-Origin-Opener-Policy', 'same-origin');
-
-  const https = isRequestHttps(c);
-  // HSTS 只在真实 HTTPS 响应上发送；HTTP LAN/NAS 部署发送 HSTS 反而有害。
-  if (https && (process.env.NODE_ENV === 'production' || process.env.VERCEL)) {
+  if (process.env.NODE_ENV === 'production' || process.env.VERCEL) {
     c.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
   }
-
-  // CSP:
-  // - upgrade-insecure-requests 仅在 HTTPS 请求下附加，否则纯 HTTP 部署的浏览器会把子资源
-  //   强制升级到 https://ip:3000 导致连接失败、页面白屏。
-  // - report-uri 默认不启用（内置默认指向的 /api/csp-report 并未挂载）；需要时设置 CSP_REPORT_URI。
-  const cspDirectives =
-    "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; script-src-attr 'none'; " +
-    "style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https:; " +
-    'frame-src https://challenges.cloudflare.com; object-src \'none\'; base-uri \'self\'; form-action \'self\'';
-  const cspReportUri = process.env.CSP_REPORT_URI;
-  if (process.env.NODE_ENV === 'production' || process.env.VERCEL || https) {
-    let csp = cspDirectives;
-    if (https) csp += '; upgrade-insecure-requests';
-    if (cspReportUri) csp += `; report-uri ${cspReportUri}`;
-    c.header('Content-Security-Policy', csp);
-  } else {
-    c.header('Content-Security-Policy-Report-Only', `default-src 'self'; report-uri ${cspReportUri ?? '/csp-reports'}`);
+  const cspReportUri = process.env.CSP_REPORT_URI || '/api/csp-report';
+  if (process.env.NODE_ENV === 'production' || process.env.VERCEL) {
+    c.header(
+      'Content-Security-Policy',
+      "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://challenges.cloudflare.com; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https:; frame-src https://challenges.cloudflare.com; object-src 'none'; base-uri 'self'; form-action 'self'; worker-src 'self' blob:; upgrade-insecure-requests; report-uri " +
+        cspReportUri,
+    );
+  } else if (cspReportUri) {
+    c.header('Content-Security-Policy-Report-Only', `default-src 'self'; report-uri ${cspReportUri}`);
   }
-
   c.res.headers.delete('X-Powered-By');
   c.res.headers.delete('Server');
 }

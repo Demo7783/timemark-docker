@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { getBlessing } from '../../../../shared/src/blessings.js';
+import { getBlessing } from '@timemark/shared/blessings';
 
 /**
  * Zalo Official Account API 通知服务

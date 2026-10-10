@@ -1,0 +1,486 @@
+﻿import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { api } from '@/lib/api';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { ThemeToggle } from '@/components/ThemeToggle';
+import { MobileBottomNav } from '@/components/MobileBottomNav';
+import { AuditTrailCard } from '@/components/settings/AuditTrailCard';
+
+/**
+ * `/api/security/deploy-info`. Typed rather than `any` because this page renders the
+ * schema state, and the schema state is the one thing here that can be actively wrong:
+ * an untyped field is how "expected v31, actual v75, ✓" survived for months.
+ */
+type SchemaStatus = 'up_to_date' | 'behind' | 'ahead' | 'failed_gap';
+
+interface DeployInfo {
+  version: string;
+  platform: string;
+  vercelUrl: string | null;
+  commitSha: string | null;
+  buildTime: string | null;
+  schemaVersion: number;
+  expectedSchemaVersion: number;
+  schemaStatus: SchemaStatus;
+  schemaHint: string;
+  schemaMissingVersions: number[];
+  schemaFutureVersions: number[];
+  passwordChangedAt: string | null;
+  turnstileConfigured: boolean;
+  /** v2.30：SiteKey 单独体检——只有 Secret 时登录页验证消失且登录被拒 */
+  turnstileSiteKeyConfigured: boolean;
+  cronSecretConfigured: boolean;
+  /** v2.29：环境变量体检（必填 + 可选功能），只含布尔与提示，绝无变量值 */
+  envChecks?: Array<{ id: string; label: string; ok: boolean; hint: string; severity?: string }>;
+}
+
+function formatDeployTime(iso: string): string {
+  const parsed = new Date(iso);
+  return Number.isNaN(parsed.getTime()) ? iso : parsed.toLocaleString();
+}
+import { Monitor, Globe, Ban, Key, Clock, Trash2, Fingerprint, Plus } from 'lucide-react';
+import { PageHeader } from '@/components/layout/PageHeader';
+import {
+  isPasskeySupported,
+  listPasskeys,
+  registerPasskey,
+  removePasskey,
+  type PasskeyCredential,
+} from '@/lib/webauthn';
+
+interface SessionRow {
+  id: number;
+  deviceFingerprint?: string;
+  isTrusted: boolean;
+  expiresAt: string;
+  createdAt: string;
+  isCurrent: boolean;
+}
+
+export default function Security() {
+  const navigate = useNavigate();
+  const [sessions, setSessions] = useState<SessionRow[]>([]);
+  const [events, setEvents] = useState<any[]>([]);
+  const [ipBans, setIpBans] = useState<any[]>([]);
+  const [whitelistEnabled, setWhitelistEnabled] = useState(false);
+  const [whitelistIps, setWhitelistIps] = useState('');
+  const [totpEnabled, setTotpEnabled] = useState(false);
+  const [qrDataUrl, setQrDataUrl] = useState('');
+  const [totpCode, setTotpCode] = useState('');
+  const [recoveryPassword, setRecoveryPassword] = useState('');
+  const [recoveryCodesRemaining, setRecoveryCodesRemaining] = useState<number | null>(null);
+  const [issuedRecoveryCodes, setIssuedRecoveryCodes] = useState<string[] | null>(null);
+  const [recoveryBusy, setRecoveryBusy] = useState(false);
+  const [deployInfo, setDeployInfo] = useState<DeployInfo | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [passkeys, setPasskeys] = useState<PasskeyCredential[]>([]);
+  const [passkeyName, setPasskeyName] = useState('');
+  const [passkeyBusy, setPasskeyBusy] = useState(false);
+  const passkeySupported = isPasskeySupported();
+
+  const [loadError, setLoadError] = useState('');
+
+  const load = async () => {
+    setLoading(true);
+    setLoadError('');
+    try {
+      const [sess, ev, bans, wl, totp, deploy, keys] = await Promise.all([
+        api.get<SessionRow[]>('/security/sessions'),
+        api.get<any[]>('/security/events'),
+        api.get<any[]>('/security/ip-bans'),
+        api.get<{ enabled: boolean; ips: string[] }>('/security/ip-whitelist'),
+        api.get<{ enabled: boolean; recoveryCodesRemaining?: number }>('/security/totp/status'),
+        api.get<any>('/security/deploy-info'),
+        listPasskeys().catch(() => []),
+      ]);
+      setSessions(Array.isArray(sess) ? sess : []);
+      setEvents(Array.isArray(ev) ? ev : []);
+      setIpBans(Array.isArray(bans) ? bans : []);
+      setWhitelistEnabled(!!wl?.enabled);
+      setWhitelistIps((wl?.ips || []).join('\n'));
+      setTotpEnabled(!!totp?.enabled);
+      setRecoveryCodesRemaining(typeof totp?.recoveryCodesRemaining === 'number' ? totp.recoveryCodesRemaining : null);
+      setDeployInfo(deploy ?? null);
+      setPasskeys(Array.isArray(keys) ? keys : []);
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : '加载失败');
+      setSessions([]);
+      setEvents([]);
+      setIpBans([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const revokeSession = async (id: number) => {
+    if (!confirm('确定踢出该设备？')) return;
+    await api.delete(`/security/sessions/${id}`);
+    load();
+  };
+
+  const saveWhitelist = async () => {
+    const ips = whitelistIps.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
+    await api.put('/security/ip-whitelist', { enabled: whitelistEnabled, ips });
+    alert('IP 白名单已保存');
+  };
+
+  const setupTotp = async () => {
+    const data = await api.post<{ qrDataUrl: string }>('/security/totp/setup', {});
+    setQrDataUrl(data.qrDataUrl);
+  };
+
+  const enableTotp = async () => {
+    await api.post('/security/totp/enable', { code: totpCode });
+    setTotpEnabled(true);
+    setQrDataUrl('');
+    alert('双因素认证已启用');
+  };
+
+  const issueRecoveryCodes = async () => {
+    setRecoveryBusy(true);
+    try {
+      const data = await api.post<{ codes: string[] }>('/security/totp/recovery-codes', {
+        password: recoveryPassword,
+        code: totpCode,
+      });
+      setIssuedRecoveryCodes(data.codes);
+      setRecoveryPassword('');
+      setRecoveryCodesRemaining(data.codes.length);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '恢复码签发失败');
+    } finally {
+      setRecoveryBusy(false);
+    }
+  };
+
+  const copyRecoveryCodes = async () => {
+    if (!issuedRecoveryCodes?.length) return;
+    try {
+      await navigator.clipboard.writeText(issuedRecoveryCodes.join('\n'));
+      alert('已复制全部恢复码');
+    } catch {
+      // Clipboard API can be unavailable (non-HTTPS / permission denied) — select-free fallback.
+      alert('复制失败，请手动抄写');
+    }
+  };
+
+  const disableTotp = async () => {
+    if (!confirm('确定关闭双因素认证？关闭后登录只需用户名和密码，账号安全性会降低。')) return;
+    setRecoveryBusy(true);
+    try {
+      await api.post('/security/totp/disable', { password: recoveryPassword, code: totpCode });
+      setTotpEnabled(false);
+      setRecoveryCodesRemaining(null);
+      setIssuedRecoveryCodes(null);
+      alert('双因素认证已关闭');
+      load();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '关闭失败');
+    } finally {
+      setRecoveryBusy(false);
+    }
+  };
+
+  const unbanIp = async (ip: string) => {
+    await api.delete(`/security/ip-bans/${encodeURIComponent(ip)}`);
+    load();
+  };
+
+  const handleRegisterPasskey = async () => {
+    if (!passkeySupported) {
+      alert('当前浏览器不支持 Passkey');
+      return;
+    }
+    setPasskeyBusy(true);
+    try {
+      await registerPasskey(passkeyName.trim() || '我的设备');
+      setPasskeyName('');
+      alert('Passkey 注册成功');
+      load();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Passkey 注册失败');
+    } finally {
+      setPasskeyBusy(false);
+    }
+  };
+
+  const handleRemovePasskey = async (id: string) => {
+    if (!confirm('确定删除此 Passkey？')) return;
+    try {
+      await removePasskey(id);
+      load();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '删除失败');
+    }
+  };
+
+  if (loading) {
+    return <div className="min-h-screen flex items-center justify-center"><div className="animate-spin h-8 w-8 border-b-2 border-blue-500 rounded-full" /></div>;
+  }
+
+  return (
+    <div className="min-h-screen pb-20 md:pb-8">
+      <PageHeader
+        title="安全中心"
+        actions={
+          <>
+            <ThemeToggle />
+            <Button variant="outline" size="sm" onClick={() => navigate('/settings')}>设置</Button>
+          </>
+        }
+      />
+
+      <main className="max-w-4xl mx-auto p-4 space-y-4">
+        {loadError && (
+          <div className="rounded-xl bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 px-4 py-3 text-sm text-red-700 dark:text-red-300">
+            {loadError}
+            <Button variant="link" size="sm" className="ml-2 h-auto p-0" onClick={load}>重试</Button>
+          </div>
+        )}
+        {deployInfo && (
+          <Card>
+            <CardHeader><CardTitle className="text-base">部署状态</CardTitle></CardHeader>
+            <CardContent className="text-sm space-y-1 text-slate-600 dark:text-slate-300">
+              <p data-testid="deploy-version">版本: {deployInfo.version} · 平台: {deployInfo.platform}</p>
+              <p data-testid="deploy-commit">
+                部署: {deployInfo.commitSha ? `\`${deployInfo.commitSha.slice(0, 7)}\`` : '未知'}
+                {deployInfo.buildTime ? ` · ${formatDeployTime(deployInfo.buildTime)}` : ''}
+              </p>
+              <p data-testid="deploy-schema">
+                数据库结构: v{deployInfo.schemaVersion ?? '?'} / v{deployInfo.expectedSchemaVersion ?? '?'}
+                {deployInfo.schemaStatus === 'up_to_date' ? ' ✓' : ''}
+              </p>
+              {deployInfo.schemaStatus && deployInfo.schemaStatus !== 'up_to_date' && (
+                <p
+                  role="alert"
+                  data-testid="deploy-schema-alert"
+                  className={`text-xs ${deployInfo.schemaStatus === 'failed_gap' ? 'text-destructive font-medium' : 'text-amber-600 dark:text-amber-400'}`}
+                >
+                  {deployInfo.schemaHint}
+                </p>
+              )}
+              <p>初始密码: {deployInfo.passwordChangedAt ? '已修改' : '尚未修改（建议尽快改）'}</p>
+              <p>
+                Turnstile:{' '}
+                {deployInfo.turnstileConfigured
+                  ? deployInfo.turnstileSiteKeyConfigured
+                    ? '已配置（SiteKey + Secret）'
+                    : '缺 Site Key（登录页验证不可用！）'
+                  : '未配置（可选）'}
+              </p>
+              <p>Cron Secret: {deployInfo.cronSecretConfigured ? '已配置' : '未配置'}</p>
+              <p className="text-xs text-slate-500 dark:text-slate-400 pt-1">
+                登录会话令牌由系统自动轮换（约 15 分钟续期 access、30 天 refresh），无需手动操作。
+                Vercel 环境变量（JWT_SECRET、MASTER_KEY、CRON_SECRET）配置一次即可，无需定期更换。
+              </p>
+              {/* v2.29：环境变量体检 —— 哪些已配置、哪些可选功能还差变量，一目了然 */}
+              {deployInfo.envChecks && deployInfo.envChecks.length > 0 && (
+                <div className="pt-2 border-t border-slate-200/60 dark:border-slate-700/50">
+                  <p className="font-medium text-slate-700 dark:text-slate-200 pb-1.5">环境变量体检</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                    {deployInfo.envChecks.map((check) => (
+                      <div
+                        key={check.id}
+                        title={check.hint}
+                        className="flex items-start gap-2 text-xs p-1.5 rounded-lg bg-slate-50 dark:bg-slate-800/50"
+                      >
+                        <span className={`mt-0.5 shrink-0 ${check.ok ? 'text-green-600 dark:text-green-400' : check.severity === 'error' ? 'text-red-500 font-bold' : 'text-slate-400 dark:text-slate-500'}`}>
+                          {check.ok ? '✓' : check.severity === 'error' ? '✗' : '○'}
+                        </span>
+                        <span>
+                          <span className={check.ok ? 'text-slate-700 dark:text-slate-200' : 'text-slate-500 dark:text-slate-400'}>{check.label}</span>
+                          {!check.ok && <span className="block text-slate-400 dark:text-slate-500">{check.hint}</span>}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        )}
+
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between">
+            <CardTitle className="text-base flex items-center gap-2"><Monitor className="w-4 h-4" />活跃会话</CardTitle>
+            <Button size="sm" variant="outline" onClick={() => navigate('/login-history')}>登录历史</Button>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {sessions.map((s) => (
+              <div key={s.id} className="flex items-center justify-between p-2 rounded-lg bg-slate-50 dark:bg-slate-800/50 text-sm">
+                <div>
+                  <p>{s.deviceFingerprint?.slice(0, 20) || '未知设备'} {s.isCurrent && <span className="text-green-600">(当前)</span>}</p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">{new Date(s.createdAt).toLocaleString()}</p>
+                </div>
+                {!s.isCurrent && <Button size="sm" variant="ghost" onClick={() => revokeSession(s.id)}><Trash2 className="w-4 h-4" /></Button>}
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader><CardTitle className="text-base flex items-center gap-2"><Fingerprint className="w-4 h-4" />Passkey（设备绑定）</CardTitle></CardHeader>
+          <CardContent className="space-y-3">
+            <p className="text-sm text-slate-600 dark:text-slate-300">
+              状态: {passkeys.length > 0 ? `已注册 ${passkeys.length} 个` : '未注册'}
+              {!passkeySupported && ' · 当前浏览器不支持'}
+            </p>
+            {passkeySupported && (
+              <div className="flex flex-col sm:flex-row gap-2">
+                <Input
+                  placeholder="设备名称（如：iPhone / MacBook）"
+                  value={passkeyName}
+                  onChange={(e) => setPasskeyName(e.target.value)}
+                  disabled={passkeyBusy}
+                />
+                <Button size="sm" onClick={handleRegisterPasskey} disabled={passkeyBusy}>
+                  <Plus className="w-4 h-4 mr-1" />
+                  {passkeyBusy ? '注册中...' : '注册 Passkey'}
+                </Button>
+              </div>
+            )}
+            {passkeys.length > 0 && (
+              <div className="space-y-2">
+                {passkeys.map((pk) => (
+                  <div key={pk.id} className="flex items-center justify-between p-2 rounded-lg bg-slate-50 dark:bg-slate-800/50 text-sm">
+                    <div>
+                      <p className="font-medium">{pk.deviceName || 'Passkey'}</p>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
+                        注册于 {new Date(pk.createdAt).toLocaleString()}
+                        {pk.lastUsedAt ? ` · 最近使用 ${new Date(pk.lastUsedAt).toLocaleString()}` : ''}
+                      </p>
+                    </div>
+                    <Button size="sm" variant="ghost" onClick={() => handleRemovePasskey(pk.id)}>
+                      <Trash2 className="w-4 h-4" />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              可在安全中心注册 Passkey 备用，当前登录默认仅需用户名和密码。若在安全中心启用了 TOTP，登录时需额外输入验证码。需 HTTPS（生产域名已支持）。
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader><CardTitle className="text-base flex items-center gap-2"><Key className="w-4 h-4" />双因素认证 (TOTP)</CardTitle></CardHeader>
+          <CardContent className="space-y-3">
+            <p className="text-sm text-slate-600 dark:text-slate-300">状态: {totpEnabled ? '已启用' : '未启用'}</p>
+            {!totpEnabled && (
+              <>
+                <Button size="sm" onClick={setupTotp}>生成二维码</Button>
+                {qrDataUrl && <img src={qrDataUrl} alt="TOTP QR" className="w-40 h-40" />}
+                <div className="flex gap-2">
+                  <Input placeholder="6位验证码" value={totpCode} onChange={(e) => setTotpCode(e.target.value)} />
+                  <Button onClick={enableTotp}>启用</Button>
+                </div>
+              </>
+            )}
+            {totpEnabled && (
+              <div className="space-y-3 rounded-lg border border-amber-200 dark:border-amber-800/50 bg-amber-50/60 dark:bg-amber-900/10 p-3">
+                <p className="text-sm font-medium text-amber-800 dark:text-amber-300">恢复码</p>
+                <p className="text-sm text-slate-600 dark:text-slate-300">
+                  剩余 {recoveryCodesRemaining ?? '—'} 个。验证器丢失时，可用其中一个恢复码登录。
+                  每个只能用一次；重新签发会作废所有旧码。
+                </p>
+                {issuedRecoveryCodes ? (
+                  <div className="space-y-2">
+                    <p className="text-sm text-red-600 dark:text-red-400 font-medium">
+                      请立即保存这些恢复码（只显示这一次）：
+                    </p>
+                    <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 font-mono text-sm" data-testid="recovery-codes-list">
+                      {issuedRecoveryCodes.map((code) => (
+                        <span key={code} className="p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-center">{code}</span>
+                      ))}
+                    </div>
+                    <div className="flex gap-2">
+                      <Button size="sm" onClick={copyRecoveryCodes}>复制全部</Button>
+                      <Button size="sm" variant="outline" onClick={() => setIssuedRecoveryCodes(null)}>我已保存</Button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <p className="text-xs text-slate-500 dark:text-slate-400">签发需要验证账号密码和当前验证器上的 6 位验证码。</p>
+                    <Input
+                      type="password"
+                      placeholder="账号密码"
+                      value={recoveryPassword}
+                      onChange={(e) => setRecoveryPassword(e.target.value)}
+                      autoComplete="current-password"
+                    />
+                    <div className="flex gap-2">
+                      <Input placeholder="6位验证码" value={totpCode} onChange={(e) => setTotpCode(e.target.value)} inputMode="numeric" />
+                      <Button onClick={issueRecoveryCodes} disabled={recoveryBusy || !recoveryPassword || !totpCode}>
+                        {recoveryBusy ? '签发中...' : '签发恢复码'}
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+            {totpEnabled && (
+              <div className="space-y-2">
+                <p className="text-xs text-slate-500 dark:text-slate-400">关闭需要账号密码和当前验证码。关闭后已签发的恢复码会一并作废。</p>
+                <Button size="sm" variant="destructive" onClick={disableTotp} disabled={recoveryBusy}>关闭双因素认证</Button>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader><CardTitle className="text-base flex items-center gap-2"><Globe className="w-4 h-4" />IP 白名单</CardTitle></CardHeader>
+          <CardContent className="space-y-2">
+            <label className="flex items-center gap-2 text-sm">
+              <input type="checkbox" checked={whitelistEnabled} onChange={(e) => setWhitelistEnabled(e.target.checked)} />
+              启用白名单（仅列出的 IP 可登录）
+            </label>
+            <textarea className="w-full min-h-[80px] p-2 rounded border text-sm dark:bg-slate-900" value={whitelistIps} onChange={(e) => setWhitelistIps(e.target.value)} placeholder="每行一个 IP" />
+            <Button size="sm" onClick={saveWhitelist}>保存</Button>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader><CardTitle className="text-base flex items-center gap-2"><Ban className="w-4 h-4" />IP 封禁列表</CardTitle></CardHeader>
+          <CardContent className="space-y-2">
+            {ipBans.length === 0 ? <p className="text-sm text-slate-500 dark:text-slate-400">当前无封禁 IP</p> : ipBans.map((b) => (
+              <div key={b.ip} className="flex justify-between items-center text-sm p-2 bg-red-50 dark:bg-red-900/20 rounded">
+                <span>{b.ip} · {b.geo} · 至 {new Date(b.lockedUntil).toLocaleString()}</span>
+                <Button size="sm" variant="outline" onClick={() => unbanIp(b.ip)}>解封</Button>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader><CardTitle className="text-base flex items-center gap-2"><Key className="w-4 h-4" />密钥与令牌说明</CardTitle></CardHeader>
+          <CardContent className="space-y-2 text-sm text-slate-600 dark:text-slate-300">
+            <p>本系统为<strong>个人单账户</strong>应用，不支持多用户注册或切换账户。</p>
+            <p>登录后 access / refresh 令牌由后台自动续期与轮换，你<strong>不需要</strong>去 Vercel 改 JWT_SECRET 或 CRON_SECRET。</p>
+            <p>环境变量中的 JWT_SECRET、MASTER_KEY、CRON_SECRET 在首次部署时配置好即可，除非密钥泄露，否则无需更换。</p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader><CardTitle className="text-base flex items-center gap-2"><Clock className="w-4 h-4" />安全事件时间线</CardTitle></CardHeader>
+          <CardContent className="space-y-2 max-h-64 overflow-y-auto overscroll-contain">
+            {events.map((e) => (
+              <div key={e.id} className="text-sm border-l-2 border-blue-400 pl-3 py-1">
+                <p className="font-medium">{e.event_type}</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">{e.ip_address} · {new Date(e.created_at).toLocaleString()}</p>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+
+        {/* v2.27 F45：操作审计卡（/api/audit 此前没有任何 UI 入口） */}
+        <AuditTrailCard />
+      </main>
+      <MobileBottomNav />
+    </div>
+  );
+}

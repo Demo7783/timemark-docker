@@ -1,0 +1,573 @@
+﻿import { Hono } from 'hono';
+import { authenticator } from 'otplib';
+import QRCode from 'qrcode';
+import { authMiddleware } from '../middleware/auth.middleware.js';
+import { query } from '../db/index.js';
+import { getClientIp } from '../utils/client-ip.js';
+import { logSecurityEvent } from '../services/security-event.service.js';
+import { deleteSessionById, deleteAllUserSessions } from '../services/session.service.js';
+import { lookupGeoLabel } from '../utils/geoip.js';
+import type { User } from '@timemark/shared';
+import { isTurnstileEnabled, getTurnstileSiteKey } from '../utils/turnstile.js';
+import { getCronSecret } from '../utils/heartbeat.js';
+import { getAccessTokenFromCookie } from '../utils/auth-cookies.js';
+import { readBuildInfo } from '../utils/build-info.js';
+import { computeSchemaHealth, describeSchemaHealth, isSchemaHealthy } from '../services/schema-health.js';
+
+const security = new Hono<{ Variables: { user: User } }>();
+security.use('*', authMiddleware);
+
+// ============ Sessions ============
+
+security.get('/sessions', async (c) => {
+  const user = c.get('user');
+  const bearer = c.req.header('Authorization')?.replace('Bearer ', '');
+  const accessToken = bearer || getAccessTokenFromCookie(c);
+  const { verifyToken } = await import('../utils/jwt.js');
+  const current = accessToken ? await verifyToken(accessToken) : null;
+
+  const result = await query(
+    `SELECT id, device_fingerprint, is_trusted, expires_at, created_at
+     FROM sessions WHERE user_id = $1 AND expires_at > NOW()
+     ORDER BY created_at DESC`,
+    [parseInt(user.id, 10)],
+  );
+
+  const sessions = await Promise.all(
+    result.rows.map(async (row: Record<string, unknown>) => {
+      const sessionRow = await query('SELECT token FROM sessions WHERE id = $1', [row.id]);
+      const token = sessionRow.rows[0]?.token as string | undefined;
+      return {
+        id: row.id,
+        deviceFingerprint: row.device_fingerprint,
+        isTrusted: row.is_trusted,
+        expiresAt: row.expires_at,
+        createdAt: row.created_at,
+        isCurrent: !!current?.sessionToken && token === current.sessionToken,
+      };
+    }),
+  );
+
+  return c.json({ success: true, data: sessions });
+});
+
+security.delete('/sessions/:id', async (c) => {
+  const user = c.get('user');
+  const sessionId = c.req.param('id');
+  const owned = await query(
+    'SELECT id FROM sessions WHERE id = $1 AND user_id = $2',
+    [sessionId, parseInt(user.id, 10)],
+  );
+  if (!owned.rows.length) {
+    return c.json({ success: false, error: 'Session not found' }, 404);
+  }
+  await deleteSessionById(sessionId);
+  await logSecurityEvent({
+    userId: parseInt(user.id, 10),
+    username: user.username,
+    eventType: 'session_revoked',
+    ip: getClientIp(c),
+    userAgent: c.req.header('user-agent'),
+    metadata: { sessionId },
+  });
+  return c.json({ success: true });
+});
+
+security.delete('/sessions', async (c) => {
+  const user = c.get('user');
+  const bearer = c.req.header('Authorization')?.replace('Bearer ', '');
+  const { verifyToken } = await import('../utils/jwt.js');
+  const current = bearer ? await verifyToken(bearer) : null;
+  await deleteAllUserSessions(user.id, current?.sessionToken);
+  return c.json({ success: true });
+});
+
+// ============ Security events timeline ============
+
+security.get('/events', async (c) => {
+  const user = c.get('user');
+  const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 200);
+  const result = await query(
+    `SELECT id, event_type, ip_address, user_agent, metadata, created_at
+     FROM security_events
+     WHERE user_id = $1 OR username = $2
+     ORDER BY created_at DESC LIMIT $3`,
+    [parseInt(user.id, 10), user.username, limit],
+  );
+  return c.json({ success: true, data: result.rows });
+});
+
+// ============ IP whitelist ============
+
+security.get('/ip-whitelist', async (c) => {
+  const user = c.get('user');
+  const result = await query(
+    'SELECT ip_whitelist, ip_whitelist_enabled FROM user_configs WHERE user_id = $1',
+    [parseInt(user.id, 10)],
+  );
+  const row = result.rows[0] as { ip_whitelist?: string[]; ip_whitelist_enabled?: boolean } | undefined;
+  return c.json({
+    success: true,
+    data: {
+      enabled: !!row?.ip_whitelist_enabled,
+      ips: Array.isArray(row?.ip_whitelist) ? row.ip_whitelist : [],
+    },
+  });
+});
+
+security.put('/ip-whitelist', async (c) => {
+  const user = c.get('user');
+  const body = await c.req.json().catch(() => ({}));
+  const enabled = !!body.enabled;
+  const ips = Array.isArray(body.ips)
+    ? body.ips.map((ip: string) => String(ip).trim()).filter(Boolean).slice(0, 50)
+    : [];
+
+  await query(
+    `INSERT INTO user_configs (user_id, ip_whitelist, ip_whitelist_enabled)
+     VALUES ($1, $2::jsonb, $3)
+     ON CONFLICT (user_id) DO UPDATE SET
+       ip_whitelist = $2::jsonb,
+       ip_whitelist_enabled = $3`,
+    [parseInt(user.id, 10), JSON.stringify(ips), enabled],
+  );
+  return c.json({ success: true, data: { enabled, ips } });
+});
+
+// ============ IP ban management ============
+
+security.get('/ip-bans', async (c) => {
+  const result = await query(
+    `SELECT identifier, failed_count, locked_until, last_attempt
+     FROM login_attempts WHERE type = 'ip' AND locked_until > NOW()
+     ORDER BY locked_until DESC LIMIT 100`,
+  );
+  const bans = await Promise.all(
+    result.rows.map(async (row: Record<string, unknown>) => ({
+      ip: row.identifier,
+      failedCount: row.failed_count,
+      lockedUntil: row.locked_until,
+      lastAttempt: row.last_attempt,
+      geo: await lookupGeoLabel(String(row.identifier || '')),
+    })),
+  );
+  return c.json({ success: true, data: bans });
+});
+
+security.delete('/ip-bans/:ip', async (c) => {
+  const ip = decodeURIComponent(c.req.param('ip'));
+  await query(`DELETE FROM login_attempts WHERE identifier = $1 AND type = 'ip'`, [ip]);
+  return c.json({ success: true });
+});
+
+// ============ TOTP 2FA ============
+
+security.get('/totp/status', async (c) => {
+  const user = c.get('user');
+  const result = await query(
+    'SELECT totp_secret, totp_enabled FROM users WHERE id = $1',
+    [parseInt(user.id, 10)],
+  );
+  const row = result.rows[0] as { totp_secret?: string; totp_enabled?: boolean } | undefined;
+  const { countRemainingRecoveryCodes } = await import('../services/recovery-codes.service.js');
+  const recoveryCodesRemaining = await countRemainingRecoveryCodes(parseInt(user.id, 10));
+  return c.json({
+    success: true,
+    data: {
+      enabled: !!(row?.totp_enabled && row?.totp_secret),
+      recoveryCodesRemaining,
+    },
+  });
+});
+
+security.post('/totp/setup', async (c) => {
+  const user = c.get('user');
+  const secret = authenticator.generateSecret();
+  const otpauth = authenticator.keyuri(user.username, 'TimeMark', secret);
+  const qrDataUrl = await QRCode.toDataURL(otpauth);
+  await query(
+    'UPDATE users SET totp_secret = $1, totp_enabled = FALSE WHERE id = $2',
+    [secret, parseInt(user.id, 10)],
+  );
+  return c.json({ success: true, data: { secret, qrDataUrl, otpauth } });
+});
+
+security.post('/totp/enable', async (c) => {
+  const user = c.get('user');
+  const { code } = await c.req.json().catch(() => ({}));
+  const result = await query('SELECT totp_secret FROM users WHERE id = $1', [parseInt(user.id, 10)]);
+  const secret = result.rows[0]?.totp_secret as string | undefined;
+  if (!secret) return c.json({ success: false, error: '请先初始化 2FA' }, 400);
+  if (!authenticator.verify({ token: String(code || ''), secret })) {
+    return c.json({ success: false, error: '验证码错误' }, 401);
+  }
+  await query('UPDATE users SET totp_enabled = TRUE WHERE id = $1', [parseInt(user.id, 10)]);
+  await logSecurityEvent({
+    userId: parseInt(user.id, 10),
+    username: user.username,
+    eventType: 'totp_enabled',
+    ip: getClientIp(c),
+  });
+  return c.json({ success: true });
+});
+
+/**
+ * Shared guard for the TOTP-sensitive operations (disable, issue recovery codes).
+ * Both require the account password plus a current TOTP code — keeping them in one
+ * place so the two checks cannot drift apart.
+ */
+async function verifyPasswordAndTotp(
+  user: User,
+  password: unknown,
+  code: unknown,
+): Promise<{ ok: true } | { ok: false; status: 401; error: string }> {
+  const { verifyUserPassword } = await import('../services/auth.service.js');
+  const verified = await verifyUserPassword(user.username, String(password || ''));
+  if (!verified) return { ok: false, status: 401, error: '密码错误' };
+
+  const result = await query('SELECT totp_secret FROM users WHERE id = $1', [parseInt(user.id, 10)]);
+  const secret = result.rows[0]?.totp_secret as string | undefined;
+  if (secret && !authenticator.verify({ token: String(code || ''), secret })) {
+    return { ok: false, status: 401, error: '验证码错误' };
+  }
+  return { ok: true };
+}
+
+security.post('/totp/disable', async (c) => {
+  const user = c.get('user');
+  const { code, password } = await c.req.json().catch(() => ({}));
+  const guard = await verifyPasswordAndTotp(user, password, code);
+  if (!guard.ok) return c.json({ success: false, error: guard.error }, guard.status);
+
+  // Clearing the recovery codes too: they authenticate the same secret this action removes,
+  // and a stale unconsumed code would keep working after 2FA is re-enabled later.
+  await query(
+    `UPDATE users SET totp_secret = NULL, totp_enabled = FALSE, totp_recovery_codes = '[]'::jsonb WHERE id = $1`,
+    [parseInt(user.id, 10)],
+  );
+  await logSecurityEvent({
+    userId: parseInt(user.id, 10),
+    username: user.username,
+    eventType: 'totp_disabled',
+    ip: getClientIp(c),
+  });
+  return c.json({ success: true });
+});
+
+security.post('/totp/recovery-codes', async (c) => {
+  const user = c.get('user');
+  const userId = parseInt(user.id, 10);
+  const { password, code, count } = await c.req.json().catch(() => ({}));
+
+  const statusResult = await query('SELECT totp_secret, totp_enabled FROM users WHERE id = $1', [userId]);
+  const status = statusResult.rows[0] as { totp_secret?: string; totp_enabled?: boolean } | undefined;
+  if (!(status?.totp_enabled && status?.totp_secret)) {
+    return c.json({ success: false, error: '请先启用双因素认证' }, 400);
+  }
+
+  const guard = await verifyPasswordAndTotp(user, password, code);
+  if (!guard.ok) return c.json({ success: false, error: guard.error }, guard.status);
+
+  const { generateRecoveryCodes, replaceRecoveryCodes } = await import('../services/recovery-codes.service.js');
+  const requested = Number(count);
+  const codes = generateRecoveryCodes(Number.isFinite(requested) ? requested : undefined);
+  await replaceRecoveryCodes(userId, codes);
+
+  await logSecurityEvent({
+    userId,
+    username: user.username,
+    eventType: 'totp_recovery_codes_issued',
+    ip: getClientIp(c),
+    metadata: { count: codes.length },
+  });
+
+  // Plaintext is returned exactly once — only hashes stay in the database.
+  return c.json({ success: true, data: { codes } });
+});
+
+// ============ Deploy / system info ============
+
+security.get('/deploy-info', async (c) => {
+  const jwtAge = process.env.JWT_SECRET_ROTATED_AT || null;
+  // v2.29：可选功能体检（optionalEnvChecks）只对会话用户 / admin scope 的 API key 开放，
+  // 避免「实例启用了哪些能力」这一部署指纹泄露给受限 token。
+  const apiScopes = c.get('apiScopes' as unknown as 'user') as unknown as string[] | undefined;
+  const fullTrust = !Array.isArray(apiScopes) || apiScopes.includes('admin');
+
+  let schemaVersion = 0;
+  let databaseOk = false;
+  // Derived from backend/src/db/migration-versions.ts, which is generated from migrate.ts.
+  // This used to be a hand-maintained `EXPECTED_SCHEMA_VERSION = 31` compared with `>=`,
+  // so a database on v75 satisfied it and the page showed a green check for any version
+  // at or above 31. Read every recorded version, not just MAX(): a migration that errored
+  // leaves a hole *underneath* a healthy-looking max.
+  let recordedSchemaVersions: number[] = [];
+  try {
+    await query('SELECT 1');
+    databaseOk = true;
+    const schemaResult = await query('SELECT version FROM schema_version ORDER BY version ASC');
+    recordedSchemaVersions = (schemaResult.rows as Array<{ version: unknown }>)
+      .map((row) => Number(row.version))
+      .filter((version) => Number.isFinite(version));
+    schemaVersion = recordedSchemaVersions.length > 0 ? Math.max(...recordedSchemaVersions) : 0;
+  } catch {
+    databaseOk = false;
+  }
+  const schemaHealth = computeSchemaHealth(recordedSchemaVersions);
+
+  const turnstileConfigured = isTurnstileEnabled();
+  // v2.30：SiteKey 与 Secret 分开体检——只有 Secret 时登录页验证消失且登录被拒
+  const turnstileSiteKeyConfigured = !!getTurnstileSiteKey();
+  const cronSecretConfigured = !!getCronSecret();
+  const jwtConfigured = !!process.env.JWT_SECRET?.trim();
+  const masterKeyConfigured = !!process.env.MASTER_KEY?.trim();
+  const databaseUrlConfigured = !!process.env.DATABASE_URL?.trim();
+  const dbUrl = process.env.DATABASE_URL || '';
+  const poolerRecommended = dbUrl.includes('neon.tech') || dbUrl.includes('supabase');
+  const poolerDetected = dbUrl.includes('-pooler') || dbUrl.includes('pooler.');
+
+  // v2.29：可选功能的环境变量体检（只报配置与否，绝不回显值）。
+  const env = (name: string) => !!process.env[name]?.trim();
+  const optionalEnvChecks = [
+    {
+      id: 'telegramBot',
+      label: 'Telegram Bot',
+      ok: env('TELEGRAM_BOT_TOKEN'),
+      hint: '可选：配置 TELEGRAM_BOT_TOKEN 后可用 Telegram Bot 查询/提醒',
+    },
+    {
+      id: 'webPush',
+      label: 'Web Push（浏览器推送）',
+      ok: env('PUSH_VAPID_PUBLIC_KEY') && env('PUSH_VAPID_PRIVATE_KEY'),
+      hint: '可选：配置 PUSH_VAPID_PUBLIC_KEY / PRIVATE_KEY 后支持浏览器订阅推送',
+    },
+    {
+      id: 'googleOauth',
+      label: 'Google 日历 OAuth',
+      ok: env('GOOGLE_OAUTH_CLIENT_ID') && env('GOOGLE_OAUTH_CLIENT_SECRET'),
+      hint: '可选：配置 CLIENT_ID / CLIENT_SECRET 后可自动导入 Google 日历',
+    },
+    {
+      id: 'blobStorage',
+      label: 'Vercel Blob 附件存储',
+      ok: env('BLOB_READ_WRITE_TOKEN'),
+      hint: '可选：配置后证件附件可上传；未配置则附件功能降级',
+    },
+    {
+      id: 'embeddings',
+      label: 'AI 语义搜索（pgvector）',
+      ok: process.env.EMBEDDINGS_ENABLED === 'true' && env('EMBEDDINGS_BASE_URL') && env('EMBEDDINGS_API_KEY'),
+      hint: '可选：EMBEDDINGS_ENABLED=true 且配置 BASE_URL / API_KEY / MODEL 后启用语义搜索',
+    },
+    {
+      id: 'webauthn',
+      label: 'WebAuthn 无密码登录',
+      ok: env('WEBAUTHN_RP_ID') && env('WEBAUTHN_ORIGIN'),
+      hint: '可选：配置 WEBAUTHN_RP_ID / WEBAUTHN_ORIGIN 后支持 Passkey 登录',
+    },
+    {
+      id: 'appBaseUrl',
+      label: 'APP_BASE_URL（深链基址）',
+      ok: env('APP_BASE_URL'),
+      hint: '可选：Telegram 深链与 Webhook 回调的对外基址；未配置时按请求头推断',
+    },
+    {
+      id: 'deployToken',
+      label: 'DEPLOY_TOKEN（密钥轮换门）',
+      ok: env('DEPLOY_TOKEN'),
+      hint: '可选：配置后可用 /api/security/rotate-master-key 轮换 MASTER_KEY',
+    },
+    {
+      id: 'healthDetail',
+      label: 'HEALTH_DETAIL_TOKEN',
+      ok: env('HEALTH_DETAIL_TOKEN'),
+      hint: '可选：配置后 /api/health?detailed=1 返回组件级明细',
+    },
+  ];
+
+  // Whether the bootstrap password has ever been changed. `null` means the admin is
+  // still on the initial `DEFAULT_ADMIN_PASSWORD` and must change it on first login.
+  //
+  // The real column is `user_configs.password_changed_at` — the same one the login
+  // response reads (`mustChangePassword = !user.passwordChangedAt`) and the
+  // change-password endpoint writes. NOTE: `user_configs.must_change_password`
+  // (added in db/migrate.ts) is written by nothing in this codebase and is dead —
+  // deliberately not wired up and not dropped, since dropping it is a migration.
+  let passwordChangedAt: string | null = null;
+  try {
+    const adminRow = await query(
+      'SELECT c.password_changed_at FROM users u LEFT JOIN user_configs c ON c.user_id = u.id LIMIT 1',
+    );
+    const raw = adminRow.rows[0]?.password_changed_at as Date | string | null | undefined;
+    passwordChangedAt = raw ? new Date(String(raw)).toISOString() : null;
+  } catch {
+    passwordChangedAt = null;
+  }
+
+  const build = readBuildInfo();
+
+  return c.json({
+    success: true,
+    data: {
+      version: build.version,
+      platform: build.platform,
+      vercelUrl: build.vercelUrl,
+      turnstileConfigured,
+      turnstileSiteKeyConfigured,
+      cronSecretConfigured,
+      jwtConfigured,
+      masterKeyConfigured,
+      databaseUrlConfigured,
+      databaseOk,
+      schemaVersion,
+      expectedSchemaVersion: schemaHealth.expected,
+      /** One of up_to_date | behind | ahead | failed_gap. Prefer this over schemaUpToDate. */
+      schemaStatus: schemaHealth.status,
+      schemaMissingVersions: schemaHealth.missingVersions,
+      schemaFutureVersions: schemaHealth.futureVersions,
+      schemaHint: describeSchemaHealth(schemaHealth),
+      schemaUpToDate: isSchemaHealthy(schemaHealth),
+      jwtSecretRotatedAt: jwtAge,
+      passwordChangedAt,
+      personalSingleAccount: true,
+      sessionTokensAutoRotate: true,
+      envSecretsRequireManualRotation: false,
+      // Both are frozen into the bundle by scripts/build-vercel-api.mjs; the host env is
+      // only a fallback for a local run. This field was named buildTime for years while
+      // carrying the commit SHA.
+      commitSha: build.commitSha,
+      buildTime: build.buildTime,
+      envChecks: [
+        {
+          id: 'database',
+          label: '数据库连接',
+          ok: databaseOk,
+          severity: databaseOk ? undefined : 'error',
+          hint: databaseOk ? 'PostgreSQL 连接正常' : '检查 Vercel 中的 DATABASE_URL',
+        },
+        ...(poolerRecommended ? [{
+          id: 'pooler',
+          label: '连接池 (pooler)',
+          ok: poolerDetected,
+          hint: poolerDetected
+            ? 'DATABASE_URL 已使用 pooler 端点，适合 Serverless'
+            : 'Serverless 建议将 DATABASE_URL 换为带 -pooler 的连接串',
+        }] : []),
+        {
+          id: 'schema',
+          label: '数据库结构版本',
+          // A failed gap is an error, not a warning: something the running code needs
+          // is absent, and re-running the migration will not fill it because the runner
+          // gates on the frozen pre-loop max.
+          severity: schemaHealth.status === 'failed_gap' ? 'error' : 'warning',
+          ok: isSchemaHealthy(schemaHealth),
+          hint: describeSchemaHealth(schemaHealth),
+        },
+        {
+          id: 'jwtSecret',
+          label: 'JWT_SECRET',
+          ok: jwtConfigured,
+          severity: jwtConfigured ? undefined : 'error',
+          hint: '登录会话签名密钥，须在 Vercel 环境变量中配置',
+        },
+        {
+          id: 'masterKey',
+          label: 'MASTER_KEY',
+          ok: masterKeyConfigured,
+          severity: masterKeyConfigured ? undefined : 'error',
+          hint: '加密渠道 Token 等敏感数据的密钥',
+        },
+        {
+          id: 'cronSecret',
+          label: 'CRON_SECRET / CRONSECRET',
+          ok: cronSecretConfigured,
+          severity: cronSecretConfigured ? undefined : 'error',
+          hint: '外部 Cron 调用 /api/cron/* 时的 Bearer 令牌（Vercel 可用 CRONSECRET）',
+        },
+        {
+          id: 'turnstileSecret',
+          label: 'Turnstile Secret Key（人机验证）',
+          ok: turnstileConfigured,
+          hint: turnstileConfigured
+            ? 'SecretKey / TURNSTILE_SECRET_KEY 已配置'
+            : '可选：在 Vercel 配置 SecretKey 与 SiteKey；未配置则登录不启用人机验证',
+        },
+        {
+          id: 'turnstileSiteKey',
+          label: 'Turnstile Site Key（与 Secret 配套）',
+          ok: !turnstileConfigured || turnstileSiteKeyConfigured,
+          severity: turnstileConfigured && !turnstileSiteKeyConfigured ? 'error' : undefined,
+          hint: turnstileSiteKeyConfigured
+            ? 'TURNSTILE_SITE_KEY 已配置'
+            : turnstileConfigured
+              ? '必需：已配置 Secret 但缺 SiteKey，登录页验证组件不会出现且无法登录（生产事故复盘 v2.28）'
+              : '与 SecretKey 成对配置后登录页才启用人机验证',
+        },
+        ...optionalEnvChecks.filter(() => fullTrust),
+      ],
+      channelNote:
+        'Resend / Telegram 等通知渠道的 API Key 在「通知渠道」页面按账户填写，不属于此处环境变量检查。',
+    },
+  });
+});
+
+// B13: MASTER_KEY 轮换（仅重加密当前用户账户，需 DEPLOY_TOKEN）
+security.post('/rotate-master-key', async (c) => {
+  const deployToken = c.req.header('x-deploy-token');
+  if (!deployToken || deployToken !== process.env.DEPLOY_TOKEN) {
+    return c.json({ success: false, error: '需要有效的 DEPLOY_TOKEN' }, 403);
+  }
+  const user = c.get('user');
+  const { newMasterKey } = await c.req.json().catch(() => ({}));
+  if (!newMasterKey || String(newMasterKey).length < 32) {
+    return c.json({ success: false, error: '新 MASTER_KEY 至少 32 字符' }, 400);
+  }
+  const oldKey = process.env.MASTER_KEY;
+  if (!oldKey) return c.json({ success: false, error: 'MASTER_KEY 未配置' }, 500);
+
+  const { encrypt, decrypt } = await import('@timemark/shared/crypto');
+  const fields = ['webhook', 'token', 'secret', 'chat_id', 'session_data'];
+  const userId = parseInt(user.id, 10);
+  const accounts = await query(
+    'SELECT id, webhook, token, secret, chat_id, session_data FROM notification_accounts WHERE user_id = $1',
+    [userId],
+  );
+  let migrated = 0;
+  for (const row of accounts.rows as Array<Record<string, unknown>>) {
+    const updates: string[] = [];
+    const values: unknown[] = [];
+    let i = 0;
+    for (const field of fields) {
+      const val = row[field] as string | null;
+      if (!val) continue;
+      try {
+        const plain = decrypt(val, oldKey);
+        i++;
+        updates.push(`${field} = $${i}`);
+        values.push(encrypt(plain, String(newMasterKey)));
+      } catch { /* skip */ }
+    }
+    if (updates.length) {
+      i++;
+      values.push(row.id);
+      await query(`UPDATE notification_accounts SET ${updates.join(', ')} WHERE id = $${i}`, values);
+      migrated++;
+    }
+  }
+  await logSecurityEvent({
+    userId: parseInt(user.id, 10),
+    username: user.username,
+    eventType: 'master_key_rotation',
+    ip: getClientIp(c),
+    metadata: { accountsMigrated: migrated },
+  });
+  return c.json({
+    success: true,
+    data: {
+      accountsMigrated: migrated,
+      note: '请在 Vercel 环境变量中更新 MASTER_KEY 后重新部署',
+    },
+  });
+});
+
+export default security;

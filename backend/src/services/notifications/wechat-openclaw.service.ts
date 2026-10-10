@@ -1,7 +1,7 @@
 import axios, { AxiosInstance } from 'axios';
 import { spawn, execSync, ChildProcess } from 'child_process';
 import QRCode from 'qrcode';
-import { getBlessing } from '../../../../shared/src/blessings.js';
+import { getBlessing } from '@timemark/shared/blessings';
 import { query } from '../../db/index.js';
 import { encrypt, decrypt } from '@timemark/shared/crypto';
 

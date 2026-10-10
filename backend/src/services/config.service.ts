@@ -1,10 +1,36 @@
 import { randomBytes, createHash } from 'crypto';
 import { query } from '../db/index.js';
 import { encrypt, decrypt } from '@timemark/shared/crypto';
+import { normalizeNotificationChatId } from '@timemark/shared';
+import { normalizeDigestSections, sanitizeDigestRecipients, type DigestSectionKey } from './digest-sections.js';
 
 // The old hardcoded default key used before auto-generation was implemented.
 // Existing Docker users who never set MASTER_KEY have data encrypted with this.
 const LEGACY_MASTER_KEY = 'timemark-default-master-key-change-in-production-2026';
+
+/** node-pg returns JSON/JSONB columns as parsed values; legacy rows may still be strings. */
+function parseJsonColumn<T>(raw: unknown, fallback: T): T {
+  if (raw == null || raw === '') return fallback;
+  if (typeof raw === 'string') {
+    try {
+      return JSON.parse(raw) as T;
+    } catch {
+      return fallback;
+    }
+  }
+  return raw as T;
+}
+
+function parseStringArrayColumn(raw: unknown): string[] {
+  const parsed = parseJsonColumn<unknown>(raw, []);
+  return Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+}
+
+function parseNumberArrayColumn(raw: unknown): number[] {
+  const parsed = parseJsonColumn<unknown>(raw, []);
+  if (!Array.isArray(parsed)) return [];
+  return parsed.map(Number).filter((n) => !Number.isNaN(n) && n > 0);
+}
 
 function getMasterKey(): string {
   const key = process.env.MASTER_KEY;
@@ -59,77 +85,69 @@ function decryptWithFallback(
   return '';
 }
 
-export async function saveUserConfig(userId: number, config: any): Promise<void> {
-  const e = (v: string | undefined) => v ? encrypt(v, MASTER_KEY()) : null;
+export async function saveUserConfig(userId: number, config: Record<string, unknown>): Promise<void> {
+  const e = (v: unknown) => (typeof v === 'string' && v.trim() ? encrypt(v.trim(), MASTER_KEY()) : null);
+
+  type FieldSpec = { column: string; encrypt?: boolean; json?: boolean };
+  const fields: Record<string, FieldSpec> = {
+    resend_api_key: { column: 'encrypted_resend_key', encrypt: true },
+    github_token: { column: 'encrypted_github_token', encrypt: true },
+    feishu_webhook: { column: 'encrypted_feishu_webhook', encrypt: true },
+    wecom_webhook: { column: 'encrypted_wecom_webhook', encrypt: true },
+    dingtalk_webhook: { column: 'encrypted_dingtalk_webhook', encrypt: true },
+    dingtalk_secret: { column: 'encrypted_dingtalk_secret', encrypt: true },
+    telegram_bot_token: { column: 'encrypted_telegram_bot_token', encrypt: true },
+    discord_webhook: { column: 'encrypted_discord_webhook', encrypt: true },
+    slack_webhook: { column: 'encrypted_slack_webhook', encrypt: true },
+    wxpusher_app_token: { column: 'encrypted_wxpusher_app_token', encrypt: true },
+    wxpusher_uid: { column: 'encrypted_wxpusher_uid', encrypt: true },
+    qmsg_key: { column: 'encrypted_qmsg_key', encrypt: true },
+    qmsg_qq: { column: 'encrypted_qmsg_qq', encrypt: true },
+    channel_webhooks: { column: 'encrypted_channel_webhooks', encrypt: true, json: true },
+    telegram_chat_id: { column: 'telegram_chat_id' },
+    reminder_emails: { column: 'reminder_emails', json: true },
+    alert_channels: { column: 'alert_channels', json: true },
+    timezone: { column: 'timezone' },
+    quiet_hours_start: { column: 'quiet_hours_start' },
+    quiet_hours_end: { column: 'quiet_hours_end' },
+    default_test_email: { column: 'default_test_email' },
+    // checkbox 78: 节假日感知模式 + 节气提醒列表（v45 新增列）
+    holiday_reminder_mode: { column: 'holiday_reminder_mode' },
+    jieqi_reminder_list: { column: 'jieqi_reminder_list', json: true },
+  };
+
+  const updates: string[] = [];
+  const values: unknown[] = [];
+  let idx = 1;
+
+  for (const [key, spec] of Object.entries(fields)) {
+    if (!(key in config)) continue;
+    const raw = config[key];
+    let value: unknown;
+    if (raw === null || raw === '') {
+      value = null;
+    } else if (spec.encrypt) {
+      value = spec.json ? e(JSON.stringify(raw)) : e(raw);
+    } else if (spec.json) {
+      value = JSON.stringify(raw);
+    } else {
+      value = raw;
+    }
+    updates.push(`${spec.column} = $${idx++}`);
+    values.push(value);
+  }
+
+  if (updates.length === 0) return;
+
+  const existing = await query('SELECT user_id FROM user_configs WHERE user_id = $1', [userId]);
+  if (existing.rows.length === 0) {
+    await query('INSERT INTO user_configs (user_id, timezone) VALUES ($1, $2)', [userId, 'Asia/Shanghai']);
+  }
+
+  values.push(userId);
   await query(
-    `INSERT INTO user_configs (
-      user_id,
-      encrypted_resend_key,
-      encrypted_github_token,
-      encrypted_feishu_webhook,
-      encrypted_wecom_webhook,
-      encrypted_dingtalk_webhook,
-      encrypted_dingtalk_secret,
-      encrypted_telegram_bot_token,
-      encrypted_discord_webhook,
-      encrypted_slack_webhook,
-      encrypted_wxpusher_app_token,
-      encrypted_wxpusher_uid,
-      encrypted_qmsg_key,
-      encrypted_qmsg_qq,
-      encrypted_channel_webhooks,
-      telegram_chat_id,
-      reminder_emails,
-      alert_channels,
-      timezone,
-      quiet_hours_start,
-      quiet_hours_end
-    )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
-     ON CONFLICT (user_id) DO UPDATE SET
-       encrypted_resend_key = EXCLUDED.encrypted_resend_key,
-       encrypted_github_token = EXCLUDED.encrypted_github_token,
-       encrypted_feishu_webhook = EXCLUDED.encrypted_feishu_webhook,
-       encrypted_wecom_webhook = EXCLUDED.encrypted_wecom_webhook,
-       encrypted_dingtalk_webhook = EXCLUDED.encrypted_dingtalk_webhook,
-       encrypted_dingtalk_secret = EXCLUDED.encrypted_dingtalk_secret,
-       encrypted_telegram_bot_token = EXCLUDED.encrypted_telegram_bot_token,
-       encrypted_discord_webhook = EXCLUDED.encrypted_discord_webhook,
-       encrypted_slack_webhook = EXCLUDED.encrypted_slack_webhook,
-       encrypted_wxpusher_app_token = EXCLUDED.encrypted_wxpusher_app_token,
-       encrypted_wxpusher_uid = EXCLUDED.encrypted_wxpusher_uid,
-       encrypted_qmsg_key = EXCLUDED.encrypted_qmsg_key,
-       encrypted_qmsg_qq = EXCLUDED.encrypted_qmsg_qq,
-       encrypted_channel_webhooks = EXCLUDED.encrypted_channel_webhooks,
-       telegram_chat_id = EXCLUDED.telegram_chat_id,
-       reminder_emails = EXCLUDED.reminder_emails,
-       alert_channels = EXCLUDED.alert_channels,
-       timezone = EXCLUDED.timezone,
-       quiet_hours_start = EXCLUDED.quiet_hours_start,
-       quiet_hours_end = EXCLUDED.quiet_hours_end`,
-    [
-      userId,
-      e(config.resend_api_key),
-      e(config.github_token),
-      e(config.feishu_webhook),
-      e(config.wecom_webhook),
-      e(config.dingtalk_webhook),
-      e(config.dingtalk_secret),
-      e(config.telegram_bot_token),
-      e(config.discord_webhook),
-      e(config.slack_webhook),
-      e(config.wxpusher_app_token),
-      e(config.wxpusher_uid),
-      e(config.qmsg_key),
-      e(config.qmsg_qq),
-      e(config.channel_webhooks ? JSON.stringify(config.channel_webhooks) : undefined),
-      config.telegram_chat_id || null,
-      config.reminder_emails ? JSON.stringify(config.reminder_emails) : null,
-      config.alert_channels ? JSON.stringify(config.alert_channels) : null,
-      config.timezone || 'Asia/Shanghai',
-      config.quiet_hours_start || null,
-      config.quiet_hours_end || null,
-    ]
+    `UPDATE user_configs SET ${updates.join(', ')} WHERE user_id = $${idx}`,
+    values,
   );
 }
 
@@ -167,19 +185,29 @@ export async function getUserConfig(userId: number): Promise<any> {
       try { return JSON.parse(raw); } catch { return {}; }
     })(),
     telegram_chat_id: r.telegram_chat_id,
-    reminder_emails: (() => {
-      const raw = r.reminder_emails;
-      if (!raw) return [];
-      try { return JSON.parse(raw); } catch { return []; }
-    })(),
-    alert_channels: (() => {
-      const raw = r.alert_channels;
-      if (!raw) return ['email'];
-      try { return JSON.parse(raw); } catch { return ['email']; }
-    })(),
+    reminder_emails: parseStringArrayColumn(r.reminder_emails),
+    alert_channels: parseStringArrayColumn(r.alert_channels),
+    alert_emails: parseStringArrayColumn(r.alert_emails),
+    alert_account_ids: parseNumberArrayColumn(r.alert_account_ids),
     timezone: r.timezone || 'Asia/Shanghai',
     quiet_hours_start: r.quiet_hours_start || null,
     quiet_hours_end: r.quiet_hours_end || null,
+    default_test_email: r.default_test_email || null,
+    markdown_email_template: r.markdown_email_template || null,
+    email_template_style: r.email_template_style || 'classic',
+    reminder_catchup_minutes: r.reminder_catchup_minutes == null ? null : Number(r.reminder_catchup_minutes),
+    fallback_enabled: r.fallback_enabled !== false,
+    notification_preset: r.notification_preset || null,
+    api_scopes: r.api_scopes || 'read,write',
+    // checkbox 78 (v45 columns)
+    holiday_reminder_mode: r.holiday_reminder_mode || 'keep',
+    jieqi_reminder_list: parseStringArrayColumn(r.jieqi_reminder_list),
+    // checkbox 80 (v46 columns): digest preferences
+    digest_enabled: r.digest_enabled !== false,
+    digest_period: r.digest_period === 'yearly' ? 'yearly' : 'monthly',
+    digest_recipients: sanitizeDigestRecipients(r.digest_recipients),
+    digest_sections: normalizeDigestSections(r.digest_sections),
+    digest_channel_account_id: r.digest_channel_account_id == null ? null : Number(r.digest_channel_account_id),
   };
 
   // Persist re-encrypted values if any fields were migrated
@@ -209,6 +237,8 @@ export interface NotificationAccount {
   secret: string | null;
   chat_id: string | null;
   is_active: boolean;
+  /** 24h 失败暂停的截止时间（v78）；缺失/NULL/过期 = 未暂停。 */
+  suspended_until?: string | null;
   config_method: 'webhook' | 'token' | 'plugin';
   session_data: any | null;
   plugin_package: string | null;
@@ -217,12 +247,28 @@ export interface NotificationAccount {
   updated_at: string;
 }
 
+const SMTP_SESSION_KEYS = new Set(['smtpProvider', 'smtpEncryption']);
+
+function sanitizeSmtpSessionData(sessionData: unknown): Record<string, string> | null {
+  if (!sessionData || typeof sessionData !== 'object' || Array.isArray(sessionData)) return null;
+  const input = sessionData as Record<string, unknown>;
+  const safe: Record<string, string> = {};
+  if (typeof input.smtpProvider === 'string' && input.smtpProvider.length <= 32) {
+    safe.smtpProvider = input.smtpProvider;
+  }
+  if (input.smtpEncryption === 'ssl' || input.smtpEncryption === 'starttls') {
+    safe.smtpEncryption = input.smtpEncryption;
+  }
+  return Object.keys(safe).length > 0 ? safe : null;
+}
+
 function decryptNotificationField(
-  value: string | null,
+  value: unknown,
   pendingUpdates?: Record<string, string>,
   column?: string
 ): string | null {
-  if (!value) return null;
+  if (value == null || value === '') return null;
+  if (typeof value !== 'string') return null;
   // Try current key
   try {
     return decrypt(value, MASTER_KEY());
@@ -244,6 +290,47 @@ function decryptNotificationField(
   }
 }
 
+/** Encrypt session metadata for TEXT column (same as token/webhook fields). */
+function serializeSessionDataForDb(type: string, sessionData: unknown): string | null {
+  if (!sessionData) return null;
+  const payload =
+    type === 'smtp'
+      ? sanitizeSmtpSessionData(sessionData)
+      : sessionData;
+  if (!payload) return null;
+  return encrypt(JSON.stringify(payload), MASTER_KEY());
+}
+
+function parseSessionDataFromDb(raw: unknown, pendingUpdates?: Record<string, string>): unknown {
+  if (raw == null || raw === '') return null;
+
+  // Migrate legacy plain JSONB objects (brief insecure window) back to encrypted storage
+  if (typeof raw === 'object') {
+    const sanitized = sanitizeSmtpSessionData(raw) ?? raw;
+    if (pendingUpdates) {
+      pendingUpdates.session_data = encrypt(JSON.stringify(sanitized), MASTER_KEY());
+    }
+    return sanitized;
+  }
+
+  if (typeof raw !== 'string') return null;
+
+  const decrypted = decryptNotificationField(raw, pendingUpdates, 'session_data');
+  if (!decrypted) return null;
+  try {
+    const parsed = JSON.parse(decrypted) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const obj = parsed as Record<string, unknown>;
+      if (Object.keys(obj).every((k) => SMTP_SESSION_KEYS.has(k))) {
+        return sanitizeSmtpSessionData(parsed) ?? parsed;
+      }
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 function mapNotificationAccountRow(row: any, pendingUpdates?: Record<string, string>): NotificationAccount {
   return {
     ...row,
@@ -251,16 +338,139 @@ function mapNotificationAccountRow(row: any, pendingUpdates?: Record<string, str
     token: decryptNotificationField(row.token, pendingUpdates, 'token'),
     secret: decryptNotificationField(row.secret, pendingUpdates, 'secret'),
     chat_id: decryptNotificationField(row.chat_id, pendingUpdates, 'chat_id'),
-    session_data: (() => {
-      const raw = decryptNotificationField(row.session_data, pendingUpdates, 'session_data');
-      if (!raw) return null;
-      try {
-        return JSON.parse(raw);
-      } catch {
-        return raw;
-      }
-    })(),
+    session_data: parseSessionDataFromDb(row.session_data, pendingUpdates),
   };
+}
+
+export async function saveNotificationDefaults(
+  userId: number,
+  data: { default_test_email?: string | null; reminder_emails?: string[] },
+): Promise<void> {
+  await query(
+    `INSERT INTO user_configs (user_id, default_test_email, reminder_emails)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (user_id) DO UPDATE SET
+       default_test_email = EXCLUDED.default_test_email,
+       reminder_emails = EXCLUDED.reminder_emails`,
+    [
+      userId,
+      data.default_test_email ?? null,
+      data.reminder_emails !== undefined ? JSON.stringify(data.reminder_emails) : null,
+    ],
+  );
+}
+
+// ============ 周期摘要偏好（checkbox 80，v46 列）============
+
+export interface DigestPreferences {
+  enabled: boolean;
+  period: 'monthly' | 'yearly';
+  /** 收件人覆盖；空数组 = 回退到 resolveRecipientEmails。 */
+  recipients: string[];
+  /** null = 全部区块；空选择会被归一化为 null。 */
+  sections: DigestSectionKey[] | null;
+  /** null = 自动选择第一个可用邮件渠道。 */
+  channelAccountId: number | null;
+  /** v2.30 方向 A：日报/周报独立开关与投递时刻（v81 列，类型同 digest-schedule.service）。 */
+  dailyEnabled: boolean;
+  dailyTime: string;
+  weeklyEnabled: boolean;
+  weeklyDay: number;
+  weeklyTime: string;
+}
+
+export async function getDigestPreferences(userId: number): Promise<DigestPreferences> {
+  const [result, schedule] = await Promise.all([
+    query(
+      `SELECT digest_enabled, digest_period, digest_recipients, digest_sections, digest_channel_account_id
+       FROM user_configs WHERE user_id = $1`,
+      [userId],
+    ),
+    // v2.30 方向 A：日报/周报排程在独立 service（v81 列），见 digest-schedule.service.ts
+    import('./digest-schedule.service.js').then((m) => m.getDigestSchedule(userId)),
+  ]);
+  const row = result.rows[0];
+  return {
+    enabled: row?.digest_enabled !== false,
+    period: row?.digest_period === 'yearly' ? 'yearly' : 'monthly',
+    recipients: sanitizeDigestRecipients(row?.digest_recipients),
+    sections: normalizeDigestSections(row?.digest_sections),
+    channelAccountId:
+      row?.digest_channel_account_id == null ? null : Number(row.digest_channel_account_id),
+    dailyEnabled: schedule.dailyEnabled,
+    dailyTime: schedule.dailyTime,
+    weeklyEnabled: schedule.weeklyEnabled,
+    weeklyDay: schedule.weeklyDay,
+    weeklyTime: schedule.weeklyTime,
+  };
+}
+
+export async function saveDigestPreferences(
+  userId: number,
+  prefs: {
+    enabled: boolean;
+    period: 'monthly' | 'yearly';
+    recipients?: unknown;
+    sections?: unknown;
+    channelAccountId?: number | null;
+    dailyEnabled?: boolean;
+    dailyTime?: string;
+    weeklyEnabled?: boolean;
+    weeklyDay?: number;
+    weeklyTime?: string;
+  },
+): Promise<DigestPreferences> {
+  const hhmmOr = (value: unknown, fallback: string): string =>
+    typeof value === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(value) ? value : fallback;
+  const normalized: DigestPreferences = {
+    enabled: prefs.enabled !== false,
+    period: prefs.period === 'yearly' ? 'yearly' : 'monthly',
+    recipients: sanitizeDigestRecipients(prefs.recipients),
+    sections: normalizeDigestSections(prefs.sections),
+    channelAccountId:
+      typeof prefs.channelAccountId === 'number' && Number.isInteger(prefs.channelAccountId) && prefs.channelAccountId > 0
+        ? prefs.channelAccountId
+        : null,
+    dailyEnabled: prefs.dailyEnabled === true,
+    dailyTime: hhmmOr(prefs.dailyTime, '21:00'),
+    weeklyEnabled: prefs.weeklyEnabled === true,
+    weeklyDay:
+      typeof prefs.weeklyDay === 'number' && Number.isInteger(prefs.weeklyDay) && prefs.weeklyDay >= 0 && prefs.weeklyDay <= 6
+        ? prefs.weeklyDay
+        : 1,
+    weeklyTime: hhmmOr(prefs.weeklyTime, '09:00'),
+  };
+
+  await query(
+    `INSERT INTO user_configs (user_id, digest_enabled, digest_period, digest_recipients, digest_sections, digest_channel_account_id)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (user_id) DO UPDATE SET
+       digest_enabled = EXCLUDED.digest_enabled,
+       digest_period = EXCLUDED.digest_period,
+       digest_recipients = EXCLUDED.digest_recipients,
+       digest_sections = EXCLUDED.digest_sections,
+       digest_channel_account_id = EXCLUDED.digest_channel_account_id`,
+    [
+      userId,
+      normalized.enabled,
+      normalized.period,
+      JSON.stringify(normalized.recipients),
+      normalized.sections ? JSON.stringify(normalized.sections) : null,
+      normalized.channelAccountId,
+    ],
+  );
+
+  // v2.30 方向 A：排程 5 列由独立 service 落库（静态 SQL），返回值合并
+  const { saveDigestSchedule } = await import('./digest-schedule.service.js');
+  const schedule = await saveDigestSchedule(userId, {
+    dailyEnabled: normalized.dailyEnabled,
+    dailyTime: normalized.dailyTime,
+    weeklyEnabled: normalized.weeklyEnabled,
+    weeklyDay: normalized.weeklyDay,
+    weeklyTime: normalized.weeklyTime,
+  });
+
+  return { ...normalized, ...schedule };
 }
 
 export async function getNotificationAccounts(userId: number): Promise<NotificationAccount[]> {
@@ -317,9 +527,12 @@ export async function createNotificationAccount(
       e(data.webhook), 
       e(data.token), 
       e(data.secret), 
-      data.chat_id ? encrypt(data.chat_id, MASTER_KEY()) : null,
+      (() => {
+        const chatId = normalizeNotificationChatId(data.type, data.chat_id);
+        return chatId ? encrypt(chatId, MASTER_KEY()) : null;
+      })(),
       data.config_method || 'webhook',
-      data.session_data ? encrypt(JSON.stringify(data.session_data), MASTER_KEY()) : null,
+      serializeSessionDataForDb(data.type, data.session_data),
       data.plugin_package || null
     ]
   );
@@ -341,7 +554,7 @@ export async function updateNotificationAccount(
     plugin_package: string;
   }>
 ): Promise<NotificationAccount | null> {
-  const updates: string[] = ["updated_at = datetime('now')"];
+  const updates: string[] = ["updated_at = CURRENT_TIMESTAMP"];
   const values: any[] = [];
   let paramIndex = 1;
 
@@ -363,7 +576,13 @@ export async function updateNotificationAccount(
   }
   if (data.chat_id !== undefined) {
     updates.push(`chat_id = $${paramIndex++}`);
-    values.push(data.chat_id ? encrypt(data.chat_id, MASTER_KEY()) : null);
+    if (!data.chat_id?.trim()) {
+      values.push(null);
+    } else {
+      const row = await query('SELECT type FROM notification_accounts WHERE id = $1 AND user_id = $2', [id, userId]);
+      const chatId = normalizeNotificationChatId(String(row.rows[0]?.type ?? ''), data.chat_id);
+      values.push(chatId ? encrypt(chatId, MASTER_KEY()) : null);
+    }
   }
   if (data.is_active !== undefined) {
     updates.push(`is_active = $${paramIndex++}`);
@@ -375,7 +594,9 @@ export async function updateNotificationAccount(
   }
   if (data.session_data !== undefined) {
     updates.push(`session_data = $${paramIndex++}`);
-    values.push(data.session_data ? encrypt(JSON.stringify(data.session_data), MASTER_KEY()) : null);
+    const typeRow = await query('SELECT type FROM notification_accounts WHERE id = $1 AND user_id = $2', [id, userId]);
+    const accountType = String(typeRow.rows[0]?.type ?? '');
+    values.push(serializeSessionDataForDb(accountType, data.session_data));
   }
   if (data.plugin_package !== undefined) {
     updates.push(`plugin_package = $${paramIndex++}`);
@@ -453,7 +674,7 @@ export async function updateRelationshipMapping(
   userId: number,
   data: Partial<{ from_relation: string; to_relation: string; recipient_email: string; recipient_type: string }>
 ): Promise<RelationshipMapping | null> {
-  const updates: string[] = ["updated_at = datetime('now')"];
+  const updates: string[] = ["updated_at = CURRENT_TIMESTAMP"];
   const values: any[] = [];
   let paramIndex = 1;
 
@@ -523,11 +744,7 @@ export async function getReminderSettings(userId: number): Promise<ReminderSetti
     enabled: r.reminders_enabled !== false,
     dailyTime: r.daily_check_time || '08:00:00',
     daysBeforeList: r.days_before_list || [1, 3, 7],
-    emailAddresses: (() => {
-      const raw = r.reminder_emails;
-      if (!raw) return [];
-      try { return JSON.parse(raw); } catch { return []; }
-    })(),
+    emailAddresses: parseStringArrayColumn(r.reminder_emails),
   };
 }
 
@@ -587,7 +804,7 @@ export async function saveEventTemplate(
      VALUES ($1, $2, $3)
      ON CONFLICT (user_id, event_type) DO UPDATE SET
        template_content = EXCLUDED.template_content,
-       updated_at = datetime('now')
+       updated_at = CURRENT_TIMESTAMP
      RETURNING *`,
     [userId, eventType, templateContent]
   );
@@ -604,8 +821,27 @@ export async function deleteEventTemplate(userId: number, eventType: string): Pr
 
 // ============ API Key 管理 ============
 
+export async function saveAlertSettings(
+  userId: number,
+  settings: { alert_emails?: string[]; alert_account_ids?: number[]; alert_channels?: string[] },
+): Promise<void> {
+  await query(
+    `INSERT INTO user_configs (user_id, alert_emails, alert_account_ids, alert_channels)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (user_id) DO UPDATE SET
+       alert_emails = COALESCE(EXCLUDED.alert_emails, user_configs.alert_emails),
+       alert_account_ids = COALESCE(EXCLUDED.alert_account_ids, user_configs.alert_account_ids),
+       alert_channels = COALESCE(EXCLUDED.alert_channels, user_configs.alert_channels)`,
+    [
+      userId,
+      settings.alert_emails !== undefined ? JSON.stringify(settings.alert_emails) : null,
+      settings.alert_account_ids !== undefined ? JSON.stringify(settings.alert_account_ids) : null,
+      settings.alert_channels !== undefined ? JSON.stringify(settings.alert_channels) : null,
+    ],
+  );
+}
+
 /**
- * Generate a new API key for a user.
  * Stores SHA-256 hash in DB, returns plaintext once for user to save.
  */
 export async function generateApiKey(userId: number): Promise<string> {

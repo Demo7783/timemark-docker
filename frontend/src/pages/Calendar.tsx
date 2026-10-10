@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { ArrowLeft, ChevronLeft, ChevronRight } from 'lucide-react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { ChevronLeft, ChevronRight, CalendarDays } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { MobileBottomNav } from '@/components/MobileBottomNav';
+import { PageHeader } from '@/components/layout/PageHeader';
+import { EmptyState } from '@/components/ui/empty-state';
 import { useEventStore } from '@/stores/event.store';
 import type { Event } from '@timemark/shared';
 import {
@@ -14,31 +16,78 @@ import {
 } from '@/lib/calendar-utils';
 import { getTodayDateKey } from '@/lib/timezone-utils';
 import { useTimezone } from '@/components/RealtimeClock';
+import { getHolidayCoverage, getHolidayMarker, isYearCovered } from '@/lib/chinese-holidays';
+import { resolveEventLunarLabel } from '@/lib/lunar';
+import { HolidayBadge } from '@/components/calendar/HolidayBadge';
+import { StaticSearchBox } from '@/components/StaticSearchBox';
+import { AlmanacCard } from '@/components/almanac/AlmanacCard';
 
 type ViewMode = 'year' | 'month' | 'day';
 type ListScope = 'month' | 'year';
 
+const COVERAGE_LABEL = getHolidayCoverage().label;
+
 export default function Calendar() {
   const navigate = useNavigate();
-  const { events, fetchEvents } = useEventStore();
+  const { events, fetchEvents, error } = useEventStore();
   const { timezone } = useTimezone();
-  const [viewMode, setViewMode] = useState<ViewMode>('month');
+  // v2.27：视图/日期进 URL（?view=month&date=2026-10-05），刷新/分享不丢状态
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [viewMode, setViewModeState] = useState<ViewMode>(() => {
+    const v = searchParams.get('view');
+    return v === 'year' || v === 'day' ? (v as ViewMode) : 'month';
+  });
   const [listScope, setListScope] = useState<ListScope>('month');
   const [cursor, setCursor] = useState(() => {
+    const raw = searchParams.get('date');
+    if (raw && /^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+      const [y, m, d] = raw.split('-').map(Number);
+      const parsed = new Date(y, m - 1, d);
+      if (!Number.isNaN(parsed.getTime())) return parsed;
+    }
     const now = new Date();
     return new Date(now.getFullYear(), now.getMonth(), now.getDate());
   });
-  const [selectedKey, setSelectedKey] = useState<string>(() => dateKey(new Date()));
+  const [selectedKey, setSelectedKey] = useState<string>(() => {
+    const raw = searchParams.get('date');
+    return raw && /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : dateKey(new Date());
+  });
+  const setViewMode = (v: ViewMode) => {
+    setViewModeState(v);
+  };
 
   useEffect(() => {
     if (events.length === 0) fetchEvents();
   }, [events.length, fetchEvents]);
+
+  // v2.27 F36：命令面板 ?focus=<eventId> —— 定位到该事件所在日期并选中
+  useEffect(() => {
+    const focusId = searchParams.get('focus');
+    if (!focusId || events.length === 0) return;
+    const hit = events.find((e) => String(e.id) === focusId);
+    if (hit?.date) {
+      const d = new Date(`${hit.date}T00:00:00`);
+      if (!Number.isNaN(d.getTime())) {
+        setSelectedKey(dateKey(d));
+        setCursor(new Date(d.getFullYear(), d.getMonth(), d.getDate()));
+      }
+    }
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete('focus');
+      return next;
+    }, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [events, searchParams]);
+
 
   const eventsByDate = useMemo(() => groupEventsByDate(events), [events]);
   const todayKey = getTodayDateKey(timezone);
 
   const year = cursor.getFullYear();
   const month = cursor.getMonth();
+  const coverage = getHolidayCoverage();
+  const yearCovered = isYearCovered(year);
 
   const selectDate = (d: Date) => {
     const key = dateKey(d);
@@ -46,16 +95,66 @@ export default function Calendar() {
     setCursor(new Date(d.getFullYear(), d.getMonth(), d.getDate()));
   };
 
+  const goToday = () => {
+    const d = new Date();
+    setSelectedKey(dateKey(d));
+    setCursor(new Date(d.getFullYear(), d.getMonth(), d.getDate()));
+  };
+
+  // v2.27 F3：URL 与 UI 单向同步（replace）——selectDate/导航不再各自写 URL，
+  // 刷新/分享始终还原当前视图与日期。
+  useEffect(() => {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    // 月/年视图以 cursor 的月份锚点写 URL（翻月后刷新仍停在那一月）；日视图用选中日
+    const urlDate =
+      viewMode === 'day'
+        ? selectedKey
+        : `${cursor.getFullYear()}-${pad(cursor.getMonth() + 1)}-01`;
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.set('view', viewMode);
+        next.set('date', urlDate);
+        return next;
+      },
+      { replace: true },
+    );
+  }, [viewMode, selectedKey, cursor, setSearchParams]);
+
+  // v2.27 F1：键盘快捷键放在函数定义之后，依赖补全避免过期闭包；带修饰键忽略
+  //（否则 Alt+Left 等浏览器快捷键会被吞）。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.altKey || e.ctrlKey || e.metaKey) return;
+      const target = e.target as HTMLElement | null;
+      if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return;
+      if (e.key === 'ArrowLeft') goPrev();
+      else if (e.key === 'ArrowRight') goNext();
+      else if (e.key === 't' || e.key === 'T') goToday();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
   const goPrev = () => {
     if (viewMode === 'year') setCursor(new Date(year - 1, 0, 1));
     else if (viewMode === 'month') setCursor(new Date(year, month - 1, 1));
-    else setCursor(new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate() - 1));
+    else {
+      // v2.27：日视图移动的是 selectedKey（DayPanel/标题都读它），改 cursor 无效
+      const d = parseSelectedDate(selectedKey);
+      d.setDate(d.getDate() - 1);
+      selectDate(d);
+    }
   };
 
   const goNext = () => {
     if (viewMode === 'year') setCursor(new Date(year + 1, 0, 1));
     else if (viewMode === 'month') setCursor(new Date(year, month + 1, 1));
-    else setCursor(new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate() + 1));
+    else {
+      const d = parseSelectedDate(selectedKey);
+      d.setDate(d.getDate() + 1);
+      selectDate(d);
+    }
   };
 
   const headerLabel = () => {
@@ -67,29 +166,23 @@ export default function Calendar() {
     return `${year}年${month + 1}月`;
   };
 
+  // v2.27：列表类型筛选 chips（'' = 全部类型）
+  const [listType, setListType] = useState<'' | 'birthday' | 'anniversary' | 'exam' | 'holiday' | 'other'>('');
   const listEvents = useMemo(() => {
-    if (listScope === 'year') {
-      return events
-        .filter((e) => e.date.startsWith(`${year}-`))
-        .sort((a, b) => a.date.localeCompare(b.date));
-    }
+    const prefix = listScope === 'year' ? `${year}-` : `${year}-${pad(month + 1)}`;
     return events
-      .filter((e) => e.date.startsWith(`${year}-${pad(month + 1)}`))
+      .filter((e) => e.date.startsWith(prefix))
+      .filter((e) => (listType ? e.type === listType : true))
       .sort((a, b) => a.date.localeCompare(b.date));
-  }, [events, listScope, year, month]);
+  }, [events, listScope, year, month, listType]);
 
   const selectedEvents = eventsByDate.get(selectedKey) || [];
 
   return (
     <div className="min-h-screen pb-24">
-      <header className="sticky top-4 z-40 px-4 max-w-4xl mx-auto space-y-2">
-        <div className="glass-panel rounded-full px-4 py-3 flex items-center justify-between ring-1 ring-black/5 dark:ring-white/10 gap-2">
-          <div className="flex items-center gap-2 min-w-0">
-            <Button variant="ghost" size="icon" className="rounded-full shrink-0" onClick={() => navigate(-1)}>
-              <ArrowLeft size={20} />
-            </Button>
-            <h1 className="text-lg font-bold truncate">日历</h1>
-          </div>
+      <PageHeader
+        title="日历"
+        actions={
           <div className="flex rounded-full bg-slate-100 dark:bg-slate-800 p-0.5 shrink-0">
             {(['year', 'month', 'day'] as const).map((v) => (
               <button
@@ -109,14 +202,17 @@ export default function Calendar() {
               </button>
             ))}
           </div>
-        </div>
+        }
+      />
+      <div className="max-w-4xl mx-auto px-4 mt-2">
         <div className="glass-panel rounded-full px-3 py-2 flex items-center justify-between ring-1 ring-black/5 dark:ring-white/10">
-          <Button variant="ghost" size="icon" onClick={goPrev}>
+          <Button variant="ghost" size="icon" onClick={goPrev} aria-label="上一月">
             <ChevronLeft size={18} />
           </Button>
           <button
             type="button"
             className="text-sm font-semibold hover:text-primary-600"
+            aria-label="回到今天"
             onClick={() => {
               const now = new Date();
               selectDate(now);
@@ -126,13 +222,32 @@ export default function Calendar() {
           >
             {headerLabel()}
           </button>
-          <Button variant="ghost" size="icon" onClick={goNext}>
+          <Button variant="ghost" size="icon" onClick={goNext} aria-label="下一月">
             <ChevronRight size={18} />
           </Button>
         </div>
-      </header>
+      </div>
 
       <main className="max-w-4xl mx-auto px-4 py-4 space-y-4">
+        {/* v2.27：加载失败不再是假空态 —— 显示错误 + 重试 */}
+        {error && (
+          <div className="rounded-2xl border border-red-200 dark:border-red-900/50 bg-red-50/60 dark:bg-red-900/10 px-4 py-3 text-sm text-red-600 dark:text-red-300 flex items-center justify-between gap-3">
+            <span>事件加载失败：{error}</span>
+            <Button variant="outline" size="sm" className="rounded-full" onClick={() => fetchEvents()}>重试</Button>
+          </div>
+        )}
+        {!yearCovered && (
+          <section
+            data-testid="coverage-warning"
+            className="glass-panel rounded-2xl p-4 text-sm text-amber-600 dark:text-amber-300 ring-1 ring-amber-300/50 dark:ring-amber-700/40"
+          >
+            数据未覆盖：已收录 {coverage.label} 年法定节假日与调休（chinese-days@{coverage.version}），
+            本年不显示 休/班 标记。
+          </section>
+        )}
+
+        <StaticSearchBox />
+
         {viewMode === 'year' && (
           <YearGrid
             year={year}
@@ -181,30 +296,46 @@ export default function Calendar() {
 
         <section className="space-y-2">
           <div className="flex items-center justify-between px-1">
-            <h2 className="text-sm font-bold text-slate-500 uppercase tracking-wider">
+            <h2 className="text-sm font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
               {listScope === 'month' ? '本月事件' : '本年事件'}
             </h2>
             <div className="flex rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden text-xs">
               <button
                 type="button"
-                className={`px-3 py-1 ${listScope === 'month' ? 'bg-primary-500 text-white' : 'bg-transparent text-slate-500'}`}
+                className={`px-3 py-1 ${listScope === 'month' ? 'bg-primary-500 text-white' : 'bg-transparent text-slate-500 dark:text-slate-400'}`}
                 onClick={() => setListScope('month')}
               >
                 本月
               </button>
               <button
                 type="button"
-                className={`px-3 py-1 ${listScope === 'year' ? 'bg-primary-500 text-white' : 'bg-transparent text-slate-500'}`}
+                className={`px-3 py-1 ${listScope === 'year' ? 'bg-primary-500 text-white' : 'bg-transparent text-slate-500 dark:text-slate-400'}`}
                 onClick={() => setListScope('year')}
               >
                 本年
               </button>
             </div>
           </div>
+          {/* v2.27：类型筛选 chips */}
+          <div className="flex flex-wrap gap-1.5 mb-2">
+            {([['', '全部'], ['birthday', '生日'], ['anniversary', '纪念日'], ['exam', '考试'], ['holiday', '节日'], ['other', '其他']] as const).map(([v, label]) => (
+              <button
+                key={v || 'all'}
+                type="button"
+                aria-pressed={listType === v}
+                onClick={() => setListType(v as typeof listType)}
+                className={`text-xs px-2.5 py-1 rounded-full border transition ${
+                  listType === v
+                    ? 'bg-primary-500 text-white border-primary-500'
+                    : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           {listEvents.length === 0 ? (
-            <p className="text-sm text-slate-500 px-1">
-              {listScope === 'month' ? '本月暂无事件' : '本年暂无事件'}
-            </p>
+            <EmptyState icon={CalendarDays} title={listScope === 'month' ? '本月暂无事件' : '本年暂无事件'} />
           ) : (
             <EventListCompact events={listEvents} showDate />
           )}
@@ -222,8 +353,14 @@ export default function Calendar() {
 }
 
 function parseSelectedDate(key: string) {
-  const [y, m, d] = key.split('-').map(Number);
-  return new Date(y, m - 1, d);
+  // v2.27 C-7：脏 key 守卫——此前 'x' 之类会渲染成 Invalid Date NaN年NaN月
+  const parts = key.split('-').map(Number);
+  const [y, m, d] = parts;
+  if (parts.length === 3 && [y, m, d].every((n) => Number.isFinite(n))) {
+    const date = new Date(y, m - 1, d);
+    if (!Number.isNaN(date.getTime())) return date;
+  }
+  return new Date();
 }
 
 function YearGrid({
@@ -256,7 +393,7 @@ function YearGrid({
             }`}
           >
             <p className="font-bold text-sm">{m + 1}月</p>
-            <p className="text-xs text-slate-500 mt-1">{count > 0 ? `${count} 个事件` : '无事件'}</p>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">{count > 0 ? `${count} 个事件` : '无事件'}</p>
             {count > 0 && (
               <div className="flex gap-0.5 mt-2 flex-wrap">
                 {Array.from({ length: Math.min(count, 5) }).map((_, i) => (
@@ -296,7 +433,7 @@ function MonthGrid({
 
   return (
     <div className="glass-panel rounded-3xl p-4 ring-1 ring-black/5 dark:ring-white/10">
-      <div className="grid grid-cols-7 gap-1 mb-2 text-center text-xs font-semibold text-slate-500">
+      <div className="grid grid-cols-7 gap-1 mb-2 text-center text-xs font-semibold text-slate-500 dark:text-slate-400">
         {['日', '一', '二', '三', '四', '五', '六'].map((w) => (
           <div key={w}>{w}</div>
         ))}
@@ -308,10 +445,12 @@ function MonthGrid({
           const dayEvents = eventsByDate.get(key) || [];
           const isToday = key === todayKey;
           const isSelected = key === selectedKey;
+          const marker = getHolidayMarker(key);
           return (
             <button
               key={key}
               type="button"
+              data-date={key}
               onClick={() => onSelectDate(day)}
               onDoubleClick={() => onDayOpen(day)}
               className={`min-h-[4.5rem] rounded-xl p-1.5 border text-xs text-left transition hover:ring-2 hover:ring-primary-300/60 ${
@@ -322,7 +461,10 @@ function MonthGrid({
                     : 'border-transparent bg-slate-50/50 dark:bg-slate-800/30'
               }`}
             >
-              <div className={`font-bold mb-0.5 ${isToday ? 'text-primary-600' : ''}`}>{day.getDate()}</div>
+              <div className="flex items-start justify-between gap-0.5">
+                <span className={`font-bold mb-0.5 ${isToday ? 'text-primary-600' : ''}`}>{day.getDate()}</span>
+                {marker && <HolidayBadge marker={marker} className="flex-col items-end leading-none" />}
+              </div>
               {dayEvents.slice(0, 2).map((e) => (
                 <div
                   key={e.id}
@@ -339,6 +481,19 @@ function MonthGrid({
         })}
       </div>
       <p className="text-[10px] text-slate-400 mt-2 text-center">单击选日期 · 双击进入日视图</p>
+      {isYearCovered(year) && (
+        <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1 mt-2 text-[10px] text-slate-500 dark:text-slate-400" data-testid="holiday-legend">
+          <span className="inline-flex items-center gap-1">
+            <span className="rounded px-1 font-bold bg-red-100 text-red-600 dark:bg-red-900/40 dark:text-red-300">休</span>
+            法定节假日
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <span className="rounded px-1 font-bold bg-blue-100 text-blue-600 dark:bg-blue-900/40 dark:text-blue-300">班</span>
+            调休上班
+          </span>
+          <span>数据覆盖 {COVERAGE_LABEL}</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -358,19 +513,28 @@ function DayPanel({
   const weekdays = ['日', '一', '二', '三', '四', '五', '六'];
   const isToday = key === todayKey;
   const diff = daysUntilEvent(key, new Date(), timeZone);
+  const marker = getHolidayMarker(key);
 
   return (
     <div className="glass-panel rounded-3xl p-6 ring-1 ring-black/5 dark:ring-white/10 text-center">
-      <p className="text-sm text-slate-500">星期{weekdays[d.getDay()]}</p>
+      <p className="text-sm text-slate-500 dark:text-slate-400">星期{weekdays[d.getDay()]}</p>
       <p className={`text-5xl font-bold mt-1 ${isToday ? 'text-primary-600' : ''}`}>{d.getDate()}</p>
       <p className="text-lg text-slate-600 dark:text-slate-300 mt-1">
         {d.getFullYear()}年{d.getMonth() + 1}月
       </p>
+      {marker && (
+        <p className="mt-2 flex items-center justify-center" data-testid="day-holiday-marker">
+          <HolidayBadge marker={marker} />
+        </p>
+      )}
       {diff === 0 && <p className="text-sm text-primary-600 font-medium mt-2">今天</p>}
-      {diff > 0 && <p className="text-sm text-slate-500 mt-2">{diff} 天后</p>}
+      {diff > 0 && <p className="text-sm text-slate-500 dark:text-slate-400 mt-2">{diff} 天后</p>}
+      <div className="mt-4 text-left">
+        <AlmanacCard dateKey={key} variant="detail" />
+      </div>
       <div className="mt-6 text-left space-y-2">
         {events.length === 0 ? (
-          <p className="text-sm text-slate-500 text-center py-4">当天暂无事件</p>
+          <EmptyState icon={CalendarDays} title="当天暂无事件" />
         ) : (
           <EventListCompact events={events} />
         )}
@@ -382,20 +546,29 @@ function DayPanel({
 function EventListCompact({ events, showDate }: { events: Event[]; showDate?: boolean }) {
   return (
     <div className="space-y-2">
-      {events.map((e) => (
-        <div key={e.id} className="glass-panel rounded-2xl px-4 py-3 flex justify-between items-center gap-2">
-          <div className="min-w-0">
-            <p className="font-semibold truncate">{e.name}</p>
-            <p className="text-xs text-slate-500">
-              {showDate ? `${e.date.slice(0, 10)} · ` : ''}
-              {eventTypeLabel(e.type)}
-            </p>
+      {events.map((e) => {
+        const lunar = resolveEventLunarLabel(e);
+        return (
+          <div key={e.id} className="glass-panel rounded-2xl px-4 py-3 flex justify-between items-center gap-2">
+            <div className="min-w-0">
+              <p className="font-semibold truncate">{e.name}</p>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                {showDate ? `${e.date.slice(0, 10)} · ` : ''}
+                {eventTypeLabel(e.type)}
+                {lunar.label ? ` · ${lunar.label}` : ''}
+              </p>
+              {lunar.error && !lunar.label && (
+                <p className="text-xs text-amber-600 dark:text-amber-300" data-testid="event-lunar-error">
+                  {lunar.error}
+                </p>
+              )}
+            </div>
+            <span className="text-xs text-slate-400 shrink-0">
+              {e.calendarType === 'lunar' ? '农历' : e.calendarType === 'both' ? '双历' : '公历'}
+            </span>
           </div>
-          <span className="text-xs text-slate-400 shrink-0">
-            {e.calendarType === 'lunar' ? '农历' : e.calendarType === 'both' ? '双历' : '公历'}
-          </span>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

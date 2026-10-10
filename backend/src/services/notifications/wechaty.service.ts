@@ -1,5 +1,5 @@
 import QRCode from 'qrcode';
-import { getBlessing } from '../../../../shared/src/blessings.js';
+import { getBlessing } from '@timemark/shared/blessings';
 
 // Lazy-loaded wechaty module
 let _wechaty: typeof import('wechaty') | null = null;

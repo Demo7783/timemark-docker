@@ -1,22 +1,28 @@
 import { useEffect, useMemo, useState } from 'react';
 
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 
-import { ArrowLeft, CalendarClock, CheckCircle2, Circle, History } from 'lucide-react';
+import { CalendarClock, CheckCircle2, Circle, History } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 
 import { Badge } from '@/components/ui/badge';
 
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 
 import { MobileBottomNav } from '@/components/MobileBottomNav';
+
+import { PageHeader } from '@/components/layout/PageHeader';
+
+import { EmptyState } from '@/components/ui/empty-state';
 
 import { useEventStore } from '@/stores/event.store';
 
 import { useTodoCompletions } from '@/hooks/useTodoCompletions';
 
 import {
+
+  dateKey,
 
   daysUntilEvent,
 
@@ -56,7 +62,15 @@ export default function Todos() {
 
   const navigate = useNavigate();
 
-  const [tab, setTab] = useState<'active' | 'history'>('active');
+  // v2.27：tab 进 URL（?tab=history），刷新/分享不丢状态
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [tab, setTabState] = useState<'active' | 'history'>(() =>
+    searchParams.get('tab') === 'history' ? 'history' : 'active',
+  );
+  const setTab = (v: 'active' | 'history') => {
+    setTabState(v);
+    setSearchParams(v === 'history' ? { tab: 'history' } : {}, { replace: true });
+  };
 
   const { events, fetchEvents } = useEventStore();
   const { timezone } = useTimezone();
@@ -142,7 +156,19 @@ export default function Todos() {
 
 
 
-  const today = useMemo(() => new Date(), []);
+  // v2.27：dayKey 跨零点自动刷新 —— 此前标签页挂到次日，「今天/已过期」全部错判
+  const [today, setToday] = useState(() => new Date());
+  useEffect(() => {
+    const tick = () => {
+      if (dateKey(new Date()) !== dateKey(today)) setToday(new Date());
+    };
+    const iv = window.setInterval(tick, 60_000);
+    document.addEventListener('visibilitychange', tick);
+    return () => {
+      window.clearInterval(iv);
+      document.removeEventListener('visibilitychange', tick);
+    };
+  }, [today]);
 
 
 
@@ -166,31 +192,10 @@ export default function Todos() {
 
     <div className="min-h-screen pb-24">
 
-      <header className="sticky top-4 z-40 px-4 max-w-4xl mx-auto">
-
-        <div className="glass-panel rounded-full px-4 py-3 flex items-center gap-3 ring-1 ring-black/5 dark:ring-white/10">
-
-          <Button variant="ghost" size="icon" className="rounded-full" onClick={() => navigate(-1)}>
-
-            <ArrowLeft size={20} />
-
-          </Button>
-
-          <div className="flex-1">
-
-            <h1 className="text-lg font-bold">近期待办</h1>
-
-            <p className="text-xs text-slate-500">
-
-              待办 {pending.length} · 已完成 {completed.length} · 历史 {historyItems.length}
-
-            </p>
-
-          </div>
-
-        </div>
-
-      </header>
+      <PageHeader
+        title="近期待办"
+        subtitle={`待办 ${pending.length} · 已完成 ${completed.length} · 历史 ${historyItems.length}`}
+      />
 
 
 
@@ -206,11 +211,9 @@ export default function Todos() {
 
           </TabsList>
 
-        </Tabs>
+          <TabsContent value="active" forceMount className="mt-0">
 
-
-
-        {tab === 'active' ? (
+            {tab === 'active' ? (
 
           <>
 
@@ -236,21 +239,18 @@ export default function Todos() {
 
             {pending.length === 0 && completed.length === 0 ? (
 
-              <div className="text-center py-16 glass-panel rounded-3xl">
+              <EmptyState
+                icon={CheckCircle2}
+                title="暂无待办"
+                description="事件进入提醒窗口后会自动显示在这里"
+                action={
+                  <Button className="rounded-full" variant="outline" onClick={() => navigate('/calendar')}>
 
-                <CheckCircle2 className="w-12 h-12 mx-auto text-slate-300 mb-3" />
+                    打开日历
 
-                <p className="font-semibold text-slate-700 dark:text-slate-200">暂无待办</p>
-
-                <p className="text-sm text-slate-500 mt-1">事件进入提醒窗口后会自动显示在这里</p>
-
-                <Button className="mt-4 rounded-full" variant="outline" onClick={() => navigate('/calendar')}>
-
-                  打开日历
-
-                </Button>
-
-              </div>
+                  </Button>
+                }
+              />
 
             ) : (
 
@@ -260,7 +260,7 @@ export default function Todos() {
 
                   <section className="space-y-2">
 
-                    <h2 className="text-sm font-bold text-slate-500 px-1">待处理 · {pending.length}</h2>
+                    <h2 className="text-sm font-bold text-slate-500 dark:text-slate-400 px-1">待处理 · {pending.length}</h2>
 
                     {pending.map((e) => (
 
@@ -324,7 +324,13 @@ export default function Todos() {
 
           </>
 
-        ) : (
+            ) : null}
+
+          </TabsContent>
+
+          <TabsContent value="history" forceMount className="mt-0">
+
+            {tab === 'history' ? (
 
           <>
 
@@ -344,15 +350,11 @@ export default function Todos() {
 
             {historyItems.length === 0 ? (
 
-              <div className="text-center py-16 glass-panel rounded-3xl">
-
-                <History className="w-12 h-12 mx-auto text-slate-300 mb-3" />
-
-                <p className="font-semibold text-slate-700 dark:text-slate-200">暂无历史记录</p>
-
-                <p className="text-sm text-slate-500 mt-1">完成待办且事件过期后会自动归档到这里</p>
-
-              </div>
+              <EmptyState
+                icon={History}
+                title="暂无历史记录"
+                description="完成待办且事件过期后会自动归档到这里"
+              />
 
             ) : (
 
@@ -372,13 +374,13 @@ export default function Todos() {
 
                     <div className="flex-1 min-w-0">
 
-                      <p className="font-semibold truncate text-slate-600">
+                      <p className="font-semibold truncate text-slate-600 dark:text-slate-400">
 
                         {item.event?.name ?? `事件 #${item.eventId}`}
 
                       </p>
 
-                      <p className="text-xs text-slate-500 mt-0.5">
+                      <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
 
                         {item.occurrenceDate}
 
@@ -402,7 +404,11 @@ export default function Todos() {
 
           </>
 
-        )}
+            ) : null}
+
+          </TabsContent>
+
+        </Tabs>
 
       </main>
 
@@ -492,13 +498,13 @@ function TodoRow({
 
         <div className="min-w-0">
 
-          <p className={`font-semibold truncate ${completed ? 'line-through text-slate-500' : ''}`}>
+          <p className={`font-semibold truncate ${completed ? 'line-through text-slate-500 dark:text-slate-400' : ''}`}>
 
             {event.name}
 
           </p>
 
-          <p className="text-xs text-slate-500 mt-0.5">
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
 
             {dateStr} · {eventTypeLabel(event.type)}
 

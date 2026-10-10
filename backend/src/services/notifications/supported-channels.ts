@@ -1,8 +1,14 @@
+/**
+ * Channels supported on Vercel / cloud serverless (HTTP API only).
+ * Plugin channels (WeChat/WhatsApp/QQ QR login, Signal CLI, etc.) are excluded.
+ */
+
 import { checkChannelSuitability } from '../../utils/serverless-suitability.js';
 
 export { SERVERLESS_NOTES, checkChannelSuitability } from '../../utils/serverless-suitability.js';
 
 export const UNSUPPORTED_CHANNEL_IDS = new Set([
+  // Plugin / QR / local process — not available on serverless
   'wechat_personal',
   'whatsapp',
   'qq_bot',
@@ -10,6 +16,7 @@ export const UNSUPPORTED_CHANNEL_IDS = new Set([
   'imessage',
   'zalo',
   'clawbot',
+  // Long-lived relay connections
   'nostr',
 ]);
 

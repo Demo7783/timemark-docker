@@ -11,7 +11,7 @@ const app = new Hono();
 app.use('*', securityHeaders);
 app.use('*', httpsEnforcement);
 app.get('/cookie', (c) => {
-  setAuthCookies(c, 'unit-test-access-token', 'unit-test-refresh-token', false);
+  setAuthCookies(c, 'unit-test-access-token', 'unit-test-refresh-token');
   return c.text('ok');
 });
 app.get('/', (c) => c.text('ok'));

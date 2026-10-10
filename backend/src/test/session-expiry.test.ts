@@ -5,7 +5,7 @@ const mocks = vi.hoisted(() => ({ query: vi.fn() }));
 
 vi.mock('../db/index.js', () => ({ query: mocks.query }));
 
-import { getSessionByToken, rotateSessionRefreshToken } from '../services/session.service.js';
+import { getSessionByToken } from '../services/session.service.js';
 
 describe('session expiry checks', () => {
   afterEach(() => { vi.clearAllMocks(); });
@@ -41,13 +41,9 @@ describe('session expiry checks', () => {
       return { rows: [], rowCount: db.getRowsModified() };
     });
 
+    // v2.30 起刷新轮换改为 renewRememberedSession 机制，rotate 断言随旧 API 退役；
+    // 「过期会话必须被拒」这条行为保留。
     await expect(getSessionByToken('expired-session')).resolves.toBeNull();
-    await expect(
-      rotateSessionRefreshToken('expired-session', 'refresh-current', 'refresh-next'),
-    ).resolves.toBe(false);
-
-    const rows = db.exec('SELECT refresh_token_id FROM sessions WHERE token = \'expired-session\'');
-    expect(rows[0].values[0][0]).toBe('refresh-current');
     db.close();
   });
 });

@@ -142,50 +142,54 @@ function isRowReturningQuery(sql: string): boolean {
 export async function query(text: string, params: any[] = []): Promise<QueryResult> {
   const start = Date.now();
   const sqliteText = convertPgParamsToSqlite(text);
-  
+
   // Ensure database is ready
   await waitForDb();
-  
+
   try {
     const database = getDb();
-    
+
     if (isRowReturningQuery(sqliteText)) {
       const stmt = database.prepare(sqliteText);
       stmt.bind(params);
-      
+
       const rows: any[] = [];
       while (stmt.step()) {
         const row = stmt.getAsObject();
         rows.push(row);
       }
       stmt.free();
-      
+
       const duration = Date.now() - start;
-      
+
       if (LOG_QUERIES) {
         console.log('Executed query', { text, duration, rows: rows.length });
       }
-      
+
       return {
         rows,
         rowCount: rows.length,
       };
     }
-    
+
     database.run(sqliteText, params);
-    
+
     const lastId = database.exec('SELECT last_insert_rowid() as id')[0]?.values[0]?.[0];
     const changes = database.getRowsModified();
-    
+
     const duration = Date.now() - start;
-    
+
     if (LOG_QUERIES) {
       console.log('Executed query', { text, duration, rows: changes });
     }
-    
-    // Debounced save after writes (2-second delay, batches rapid writes)
-    debouncedSave();
-    
+
+    // Debounced save after writes (2-second delay, batches rapid writes).
+    // Skipped inside an open withTransaction block — the save happens after COMMIT
+    // so an export never captures uncommitted pages.
+    if (txDepth === 0) {
+      debouncedSave();
+    }
+
     return {
       rows: [],
       rowCount: changes,
@@ -233,4 +237,47 @@ export function getClient(): SqlJsDatabase {
   return getDb();
 }
 
-export default { query, db: { getClient }, waitForDb };
+/**
+ * Transaction-scoped client, shape-compatible with vercel 侧 `withTransaction` 的
+ * PoolClient 用法（调用方只对 client 调 `.query()`）。sql.js 是单连接内存库，
+ * BEGIN/COMMIT 作用于整个连接，因此嵌套调用共享同一事务。
+ */
+export type DbClient = {
+  query: (text: string, params?: any[]) => Promise<QueryResult>;
+};
+
+let txDepth = 0;
+
+/** Run `fn` with a client inside BEGIN…COMMIT; rolls back on throw (matches upstream semantics). */
+export async function withTransaction<T>(fn: (client: DbClient) => Promise<T>): Promise<T> {
+  await waitForDb();
+  const database = getDb();
+  if (txDepth === 0) {
+    database.exec('BEGIN TRANSACTION');
+  }
+  txDepth += 1;
+  const client: DbClient = {
+    query: (text: string, params: any[] = []) => query(text, params),
+  };
+  try {
+    const result = await fn(client);
+    txDepth -= 1;
+    if (txDepth === 0) {
+      database.exec('COMMIT');
+      debouncedSave();
+    }
+    return result;
+  } catch (error) {
+    txDepth -= 1;
+    if (txDepth === 0) {
+      try {
+        database.exec('ROLLBACK');
+      } catch {
+        // Preserve the original error.
+      }
+    }
+    throw error;
+  }
+}
+
+export default { query, db: { getClient }, waitForDb, withTransaction, queryTransaction };

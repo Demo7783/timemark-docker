@@ -4,7 +4,7 @@
  * 
  * 使用 nostr-tools 发送加密私信 (NIP-04 kind:4)
  */
-import { getBlessing } from '../../../../shared/src/blessings.js';
+import { getBlessing } from '@timemark/shared/blessings';
 import { finalizeEvent, getPublicKey } from 'nostr-tools/pure';
 import { encrypt } from 'nostr-tools/nip04';
 import { Relay } from 'nostr-tools/relay';

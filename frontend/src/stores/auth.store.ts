@@ -1,7 +1,9 @@
 import { create } from 'zustand';
 import { api } from '../lib/api';
+import { clearStaleBearerTokens } from '../lib/api';
 import type { User } from '@timemark/shared';
 
+const SESSION_ID_KEY = 'timemark_session_id';
 const DEVICE_ID_COOKIE = '__timemark_device_id';
 
 let cachedFingerprint: string | null = null;
@@ -75,77 +77,244 @@ async function getEnhancedFingerprint(): Promise<string> {
   return cachedFingerprint;
 }
 
+function applyLoginResponse(
+  response: {
+    accessToken?: string;
+    refreshToken?: string;
+    sessionId?: string;
+    user?: User;
+    mustChangePassword?: boolean;
+    authMode?: string;
+  },
+  rememberMe: boolean,
+) {
+  if (response.authMode === 'cookie') {
+    clearStaleBearerTokens();
+    if (response.sessionId) {
+      localStorage.setItem(SESSION_ID_KEY, response.sessionId);
+    }
+    if (rememberMe) {
+      localStorage.setItem('timemark_persistent_login', 'true');
+    } else {
+      localStorage.removeItem('timemark_persistent_login');
+    }
+  } else if (rememberMe) {
+    if (response.accessToken) localStorage.setItem('accessToken', response.accessToken);
+    if (response.refreshToken) localStorage.setItem('refreshToken', response.refreshToken);
+    if (response.sessionId) {
+      localStorage.setItem(SESSION_ID_KEY, response.sessionId);
+    }
+    localStorage.setItem('timemark_persistent_login', 'true');
+  } else {
+    if (response.accessToken) sessionStorage.setItem('accessToken', response.accessToken);
+    if (response.refreshToken) sessionStorage.setItem('refreshToken', response.refreshToken);
+    localStorage.removeItem('timemark_persistent_login');
+  }
+
+  const mustChangePassword = !!response.mustChangePassword;
+  if (mustChangePassword) {
+    sessionStorage.setItem('mustChangePassword', 'true');
+  }
+  useAuthStore.setState({
+    user: response.user ?? null,
+    isAuthenticated: true,
+    isLoading: false,
+    mustChangePassword,
+  });
+  return { mustChangePassword };
+}
+
 interface AuthState {
   user: User | null;
   isAuthenticated: boolean;
   isLoading: boolean;
+  mustChangePassword: boolean;
   setUser: (user: User | null) => void;
-  login: (username: string, password: string, rememberMe?: boolean) => Promise<void>;
+  login: (username: string, password: string, rememberMe?: boolean, extras?: { turnstileToken?: string; totpCode?: string }) => Promise<{ mustChangePassword: boolean }>;
+  loginPasskey: (username: string, rememberMe?: boolean, totpCode?: string) => Promise<{ mustChangePassword: boolean }>;
   logout: () => Promise<void>;
   checkAuth: () => Promise<void>;
+  clearMustChangePassword: () => void;
 }
 
 export const useAuthStore = create<AuthState>((set) => ({
   user: null,
   isAuthenticated: false,
   isLoading: true,
+  mustChangePassword: sessionStorage.getItem('mustChangePassword') === 'true',
 
   setUser: (user) => set({ user }),
+  clearMustChangePassword: () => {
+    sessionStorage.removeItem('mustChangePassword');
+    set({ mustChangePassword: false });
+  },
 
-  login: async (username, password, rememberMe = false) => {
+  login: async (username, password, rememberMe = false, extras = {}) => {
     const fingerprint = await getEnhancedFingerprint();
-    const response = await api.post<{ user: User }>('/auth/login', {
-      username, 
-      password, 
-      deviceFingerprint: fingerprint, 
-      rememberMe 
+    const response = await api.post<any>('/auth/login', {
+      username,
+      password,
+      deviceFingerprint: fingerprint,
+      rememberMe,
+      turnstileToken: extras.turnstileToken?.trim() || undefined,
+      totpCode: extras.totpCode?.trim() || undefined,
     });
+    return applyLoginResponse(response, rememberMe);
+  },
 
-    set({ user: response.user, isAuthenticated: true, isLoading: false });
+  loginPasskey: async (username, rememberMe = false, totpCode?: string) => {
+    const { loginWithPasskey } = await import('../lib/webauthn');
+    const response = await loginWithPasskey(username.trim(), rememberMe, totpCode);
+    return applyLoginResponse({ ...response, authMode: 'cookie', user: response.user as User | undefined }, rememberMe);
   },
 
   logout: async () => {
+    const sessionId = localStorage.getItem(SESSION_ID_KEY);
     try {
-      await api.post('/auth/logout');
+      await api.post('/auth/logout', { sessionId });
     } finally {
+      // Clear all storage
+      localStorage.removeItem('accessToken');
+      localStorage.removeItem('refreshToken');
+      localStorage.removeItem(SESSION_ID_KEY);
+      localStorage.removeItem('timemark_persistent_login');
       localStorage.removeItem('cachedUser');
+      sessionStorage.removeItem('accessToken');
+      sessionStorage.removeItem('refreshToken');
       sessionStorage.removeItem('cachedUser');
       sessionStorage.removeItem('lastPath');
-      set({ user: null, isAuthenticated: false, isLoading: false });
+      sessionStorage.removeItem('mustChangePassword');
+      set({ user: null, isAuthenticated: false, isLoading: false, mustChangePassword: false });
     }
   },
 
   checkAuth: async () => {
-    const timeoutPromise = new Promise((_, reject) => 
-      setTimeout(() => reject(new Error('Auth check timeout')), 5000)
-    );
-    try {
-      const user = await Promise.race([
-        api.get<User>('/auth/session'),
-        timeoutPromise,
-      ]);
-      localStorage.setItem('cachedUser', JSON.stringify(user));
-      sessionStorage.setItem('cachedUser', JSON.stringify(user));
-      set({ user, isAuthenticated: true, isLoading: false });
-    } catch (error: any) {
-      const errorMsg = error.message || '';
-      const isAuthError = errorMsg.includes('401') ||
-        errorMsg.includes('403') ||
-        errorMsg.includes('expired') ||
-        errorMsg.includes('Unauthorized') ||
-        errorMsg.includes('Invalid');
+    // Get tokens from appropriate storage
+    let accessToken = localStorage.getItem('accessToken');
+    let refreshToken = localStorage.getItem('refreshToken');
 
-      if (!isAuthError) {
-        const storedUser = localStorage.getItem('cachedUser') || sessionStorage.getItem('cachedUser');
-        if (storedUser) {
+    // If not in localStorage, check sessionStorage
+    if (!accessToken) {
+      accessToken = sessionStorage.getItem('accessToken');
+      refreshToken = sessionStorage.getItem('refreshToken');
+    }
+
+    const sessionId = localStorage.getItem(SESSION_ID_KEY);
+    if (sessionId) {
+      clearStaleBearerTokens();
+    }
+
+    // 12s (was 5s): a Vercel cold start on a free plan routinely exceeds 5s, and a
+    // timeout here used to be treated as "not logged in" — the #1 reason 勾了保持登录
+    // 仍被踢回登录页. The cookie stays valid either way.
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('Auth check timeout')), 12000)
+    );
+
+    if (accessToken) {
+      try {
+        // 使用 Promise.race 实现超时
+        const user = await Promise.race([
+          api.get<User>('/auth/session'),
+          timeoutPromise
+        ]);
+        set({ user, isAuthenticated: true, isLoading: false });
+        return;
+      } catch (error: any) {
+        // Only clear tokens on specific auth errors, not network errors
+        const errorMsg = error.message || '';
+        const isAuthError = errorMsg.includes('401') ||
+                          errorMsg.includes('403') ||
+                          errorMsg.includes('Token expired') ||
+                          errorMsg.includes('expired') ||
+                          errorMsg.includes('Unauthorized') ||
+                          errorMsg.includes('Invalid');
+
+        // Token expired or invalid, try to refresh
+        if (refreshToken && isAuthError) {
           try {
-            set({ user: JSON.parse(storedUser), isAuthenticated: true, isLoading: false });
+            await api.post('/auth/refresh', { refreshToken });
+            const user = await api.get<User>('/auth/session');
+            set({ user, isAuthenticated: true, isLoading: false });
             return;
-          } catch {}
+          } catch {
+            // Token refresh failed — clear session silently
+            // Only clear tokens if refresh also fails
+            localStorage.removeItem('accessToken');
+            localStorage.removeItem('refreshToken');
+            localStorage.removeItem(SESSION_ID_KEY);
+            localStorage.removeItem('timemark_persistent_login');
+            sessionStorage.removeItem('accessToken');
+            sessionStorage.removeItem('refreshToken');
+          }
+        }
+
+      }
+    } else {
+      // HttpOnly cookie session (no token in storage).
+      // Any failure — 401, 5xx, network hiccup, or the timeout above — gets ONE
+      // refresh attempt before giving up. Treating a cold start / tunnel error as
+      // "session over" is exactly how remembered users got logged out.
+      try {
+        const user = await Promise.race([
+          api.get<User>('/auth/session'),
+          timeoutPromise,
+        ]);
+        set({ user, isAuthenticated: true, isLoading: false });
+        return;
+      } catch {
+        try {
+          await api.post('/auth/refresh', {});
+          const user = await api.get<User>('/auth/session');
+          set({ user, isAuthenticated: true, isLoading: false });
+          return;
+        } catch {
+          // Both attempts failed — only now conclude the session is gone.
         }
       }
-
-      set({ user: null, isAuthenticated: false, isLoading: false });
     }
+
+    set({ user: null, isAuthenticated: false, isLoading: false });
   },
 }));
+
+const LAST_RENEW_KEY = 'timemark_last_renew';
+/** At most one background renewal every 12h, on tab focus / visibility. */
+const RENEW_INTERVAL_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * Tab-lifecycle wiring for "stay signed in":
+ *  - focus/visibility triggers a throttled silent refresh, which (a) re-mints the
+ *    access cookie before an idle tab's first request hits a 401 and (b) slides the
+ *    server-side 30-day remembered deadline forward — the backend renews on refresh.
+ *  - a `storage` event for the session id (another tab logged out) drops auth state
+ *    here too, instead of leaving this tab a zombie.
+ * Idempotent; call once from App.
+ */
+export function initAuthLifecycle() {
+  const renew = () => {
+    const hasSession =
+      !!localStorage.getItem(SESSION_ID_KEY) ||
+      localStorage.getItem('timemark_persistent_login') === 'true';
+    if (!hasSession) return;
+    const last = Number(localStorage.getItem(LAST_RENEW_KEY)) || 0;
+    if (Date.now() - last < RENEW_INTERVAL_MS) return;
+    localStorage.setItem(LAST_RENEW_KEY, String(Date.now()));
+    // Fire and forget: a failed renewal is invisible — the 401 path retries later.
+    api.post('/auth/refresh', {}).catch(() => {});
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') renew();
+  });
+  window.addEventListener('focus', renew);
+  window.addEventListener('storage', (e) => {
+    if (e.key === SESSION_ID_KEY && !e.newValue) {
+      useAuthStore.setState({
+        user: null,
+        isAuthenticated: false,
+        isLoading: false,
+        mustChangePassword: false,
+      });
+    }
+  });
+}

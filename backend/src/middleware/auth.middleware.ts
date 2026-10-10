@@ -3,10 +3,10 @@ import { verifyToken } from '../utils/jwt.js';
 import { getUserById } from '../services/auth.service.js';
 import { getSessionByToken } from '../services/session.service.js';
 import { getAccessTokenFromCookie } from '../utils/auth-cookies.js';
+import { apiKeyMiddleware } from './api-key.js';
 import type { User } from '@timemark/shared';
 
 export async function authMiddleware(c: Context<{ Variables: { user: User } }>, next: Next) {
-  // Skip if user already set (e.g. by API key middleware)
   const existingUser = c.get('user');
   if (existingUser) {
     await next();
@@ -16,20 +16,22 @@ export async function authMiddleware(c: Context<{ Variables: { user: User } }>, 
   const authHeader = c.req.header('Authorization');
   let token = authHeader?.replace(/^Bearer\s+/i, '').trim() || undefined;
   if (token === '') token = undefined;
-  let payload = token ? await verifyToken(token) : null;
-  if (payload?.tokenUse !== 'access') payload = null;
+  let payload = token ? await verifyToken(token, undefined, 'access') : null;
 
   // Bearer 无效或缺失时，回退 HttpOnly Cookie
   if (!payload) {
     const cookieToken = getAccessTokenFromCookie(c);
     if (cookieToken) {
       token = cookieToken;
-      payload = await verifyToken(cookieToken);
-      if (payload?.tokenUse !== 'access') payload = null;
+      payload = await verifyToken(cookieToken, undefined, 'access');
     }
   }
 
   if (!token) {
+    const apiKey = c.req.header('X-API-Key');
+    if (apiKey) {
+      return apiKeyMiddleware(c, next);
+    }
     return c.json({ success: false, error: 'Unauthorized' }, 401);
   }
 
@@ -37,7 +39,6 @@ export async function authMiddleware(c: Context<{ Variables: { user: User } }>, 
     return c.json({ success: false, error: 'Invalid token' }, 401);
   }
 
-  // 会话吊销检查：session 被删除/注销后令牌立即失效
   if (payload.sessionToken) {
     const session = await getSessionByToken(payload.sessionToken);
     if (!session) {

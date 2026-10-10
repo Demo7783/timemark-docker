@@ -1,12 +1,15 @@
 /**
  * 通知渠道定义和配置
- * 按照 OpenClaw 的方式组织渠道，分为三类：
- * - webhook: 只需要 Webhook URL
- * - token: 需要 Bot Token 和可选的其他参数
- * - plugin: 需要安装 npm 包并扫码授权
+ * 云端部署仅支持 webhook / token 类 HTTP 渠道
  */
 
+import { isSupportedChannel } from './supported-channels.js';
+import { CHANNEL_METADATA } from './channels.metadata.js';
+
 export type ChannelConfigMethod = 'webhook' | 'token' | 'plugin';
+
+/** notification_accounts 中实际存储配置值的四个列 */
+export type ChannelColumn = 'webhook' | 'token' | 'secret' | 'chat_id';
 
 export interface ChannelField {
   name: string;
@@ -15,6 +18,14 @@ export interface ChannelField {
   required: boolean;
   placeholder?: string;
   description?: string;
+  /** 该字段在 notification_accounts 中落库的列；缺省时与 name 相同（仅 matrix / pushover 例外） */
+  column?: ChannelColumn;
+  /** 英文标签（由 Docker 版渠道目录合并而来，用于双语配置手册） */
+  labelEn?: string;
+  /** 英文占位提示（同来源） */
+  placeholderEn?: string;
+  /** 字段级帮助文本（同来源） */
+  helpText?: string;
 }
 
 export interface ChannelTemplate {
@@ -29,6 +40,14 @@ export interface ChannelTemplate {
   pluginInstallCommand?: string;
   // 是否已内置实现（不需要额外npm包）
   isBuiltIn: boolean;
+  /** 英文名称（由 Docker 版渠道目录合并而来） */
+  nameEn?: string;
+  /** 英文描述（同来源） */
+  descriptionEn?: string;
+  /** 官方集成页面（同来源；缺省时使用 docsUrl） */
+  officialUrl?: string;
+  /** 渠道分类（applyChannelMetadata 统一注入，用于前端分组展示） */
+  category?: ChannelCategory;
 }
 
 // ============ Webhook-based Channels ============
@@ -239,6 +258,63 @@ const webhookChannels: ChannelTemplate[] = [
       }
     ],
     docsUrl: 'https://developer.mozilla.org/en-US/docs/Web/API/Webhooks'
+  },
+  {
+    id: 'rocketchat',
+    name: 'Rocket.Chat',
+    description: 'Rocket.Chat 频道消息推送（传入 Webhook）',
+    icon: 'MessageSquare',
+    configMethod: 'webhook',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'webhook',
+        label: 'Webhook URL',
+        type: 'text',
+        required: true,
+        placeholder: 'https://your-server/hooks/{integrationId}/{token}',
+        description: 'Rocket.Chat → 管理 → 集成 → 传入 Webhook，复制完整 URL'
+      }
+    ],
+    docsUrl: 'https://docs.rocket.chat/docs/integrations'
+  },
+  {
+    id: 'webex',
+    name: 'Webex',
+    description: 'Cisco Webex 空间 Incoming Webhook（团队提醒）',
+    icon: 'Globe',
+    configMethod: 'webhook',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'webhook',
+        label: 'Incoming Webhook URL',
+        type: 'text',
+        required: true,
+        placeholder: 'https://webexapis.com/v1/webhooks/incoming/...',
+        description: 'Webex Space 的 Incoming Webhook 完整 URL（Space → Integrations → Incoming Webhook 创建）'
+      }
+    ],
+    docsUrl: 'https://developer.webex.com/docs/webhooks-incoming'
+  },
+  {
+    id: 'notifiarr',
+    name: 'Notifiarr',
+    description: 'Notifiarr Passthrough 通知（Home Server / arr 栈常用）',
+    icon: 'Globe',
+    configMethod: 'webhook',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'webhook',
+        label: 'Passthrough 通道 URL',
+        type: 'text',
+        required: true,
+        placeholder: 'https://notifiarr.com/api/v1/notification/passthrough/...',
+        description: 'Notifiarr 自定义通知通道的完整 Passthrough URL（含 apiKey）'
+      }
+    ],
+    docsUrl: 'https://notifiarr.wiki/'
   }
 ];
 
@@ -268,6 +344,14 @@ const tokenChannels: ChannelTemplate[] = [
         required: false,
         placeholder: 'noreply@yourdomain.com',
         description: '已验证域名的邮箱地址，如 noreply@email.the37777777.top。留空使用测试地址 onboarding@resend.dev（仅能发送到自己的邮箱）'
+      },
+      {
+        name: 'chat_id',
+        label: '收件人邮箱',
+        type: 'text',
+        required: false,
+        placeholder: 'you@example.com',
+        description: '本渠道的默认收件地址。留空时将使用「设置 → 通知默认邮箱」中的默认测试邮箱'
       }
     ],
     docsUrl: 'https://resend.com/docs'
@@ -275,41 +359,41 @@ const tokenChannels: ChannelTemplate[] = [
   {
     id: 'smtp',
     name: 'SMTP 邮件',
-    description: 'SMTP 协议邮件推送（支持 Gmail、Outlook、自建邮箱等）',
+    description: '大厂邮箱 SMTP 发信（QQ / 163 / Gmail / Outlook / 腾讯企业邮 / 阿里企业邮等）',
     icon: 'Mail',
     configMethod: 'token',
     isBuiltIn: true,
     fields: [
       {
+        name: 'chat_id',
+        label: '发件人邮箱',
+        type: 'text',
+        required: true,
+        placeholder: 'yourname@qq.com',
+        description: '完整邮箱地址，同时作为 SMTP 登录用户名'
+      },
+      {
+        name: 'token',
+        label: '授权码 / 应用密码',
+        type: 'password',
+        required: true,
+        description: 'QQ/163 填授权码；Gmail 填应用专用密码；企业邮填邮箱密码或客户端密码'
+      },
+      {
         name: 'webhook',
         label: 'SMTP 服务器',
         type: 'text',
         required: true,
-        placeholder: 'smtp.gmail.com',
-        description: 'SMTP 服务器地址'
+        placeholder: 'smtp.qq.com',
+        description: '选择邮箱服务商后自动填充；自定义时可手动修改'
       },
       {
         name: 'secret',
         label: 'SMTP 端口',
         type: 'text',
         required: true,
-        placeholder: '587',
-        description: 'SMTP 端口号（通常 587 或 465）'
-      },
-      {
-        name: 'token',
-        label: '邮箱密码/授权码',
-        type: 'password',
-        required: true,
-        description: '邮箱密码或应用专用密码/授权码'
-      },
-      {
-        name: 'chat_id',
-        label: '发件人邮箱',
-        type: 'text',
-        required: true,
-        placeholder: 'user@gmail.com',
-        description: '发件人邮箱地址（也用作 SMTP 用户名和收件人）'
+        placeholder: '465',
+        description: '常用 465（SSL）或 587（STARTTLS）'
       }
     ],
     docsUrl: 'https://nodemailer.com/about/'
@@ -382,7 +466,8 @@ const tokenChannels: ChannelTemplate[] = [
         type: 'text',
         required: true,
         placeholder: 'https://matrix.org',
-        description: 'Matrix Homeserver 地址'
+        description: 'Matrix Homeserver 地址',
+        column: 'webhook'
       },
       {
         name: 'token',
@@ -398,7 +483,8 @@ const tokenChannels: ChannelTemplate[] = [
         type: 'text',
         required: true,
         placeholder: '!roomid:matrix.org',
-        description: '目标房间 ID'
+        description: '目标房间 ID',
+        column: 'chat_id'
       }
     ],
     docsUrl: 'https://matrix.org/docs/legacy/client-server-api/'
@@ -740,6 +826,73 @@ const tokenChannels: ChannelTemplate[] = [
     docsUrl: 'https://push.i-i.me/'
   },
   {
+    id: 'pushdeer',
+    name: 'PushDeer',
+    description: 'PushDeer 跨平台推送（iOS/Android）',
+    icon: 'BellRing',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: 'PushKey',
+        type: 'password',
+        required: true,
+        description: '从 PushDeer App 或官网获取的 PushKey'
+      },
+      {
+        name: 'webhook',
+        label: 'API 地址（可选）',
+        type: 'text',
+        required: false,
+        placeholder: 'https://api2.pushdeer.com',
+        description: '自建 PushDeer 服务地址，留空使用官方 API'
+      }
+    ],
+    docsUrl: 'https://www.pushdeer.com/'
+  },
+  {
+    id: 'twilio',
+    name: 'Twilio SMS',
+    description: '通过 Twilio 发送短信提醒',
+    icon: 'Phone',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: 'Account SID',
+        type: 'password',
+        required: true,
+        description: 'Twilio 控制台 Account SID',
+      },
+      {
+        name: 'secret',
+        label: 'Auth Token',
+        type: 'password',
+        required: true,
+        description: 'Twilio Auth Token',
+      },
+      {
+        name: 'webhook',
+        label: '发信号码 (From)',
+        type: 'text',
+        required: true,
+        placeholder: '+1234567890',
+        description: '已验证的 Twilio 发信号码',
+      },
+      {
+        name: 'chat_id',
+        label: '收件号码 (To)',
+        type: 'text',
+        required: true,
+        placeholder: '+8613800138000',
+        description: '接收短信的手机号',
+      },
+    ],
+    docsUrl: 'https://www.twilio.com/docs/sms',
+  },
+  {
     id: 'wecomapp',
     name: '企微应用 (WeComApp)',
     description: '企业微信应用消息推送',
@@ -827,6 +980,15 @@ const tokenChannels: ChannelTemplate[] = [
         type: 'password',
         required: true,
         description: 'Pushover 应用 API Token'
+      },
+      {
+        name: 'priority',
+        label: '优先级',
+        type: 'select',
+        required: false,
+        description: 'Pushover 消息优先级（-2 静默 ~ 2 紧急）',
+        placeholder: '0',
+        column: 'chat_id'
       }
     ],
     docsUrl: 'https://pushover.net/api'
@@ -857,203 +1019,799 @@ const tokenChannels: ChannelTemplate[] = [
       }
     ],
     docsUrl: 'https://github.com/caronc/apprise-api'
-  }
-];
-
-// ============ Plugin-based Channels ============
-
-const pluginChannels: ChannelTemplate[] = [
-  {
-    id: 'wechat_personal',
-    name: '微信个人号',
-    description: '微信个人号消息推送（扫码登录）',
-    icon: 'Smartphone',
-    configMethod: 'plugin',
-    isBuiltIn: true,
-    pluginPackage: 'wechaty',
-    fields: [
-      {
-        name: 'session_data',
-        label: '认证会话',
-        type: 'textarea',
-        required: false,
-        description: '扫码登录后自动填充的会话数据'
-      }
-    ],
-    docsUrl: 'https://wechaty.js.org/'
   },
   {
-    id: 'whatsapp',
-    name: 'WhatsApp',
-    description: 'WhatsApp 消息推送（扫码配对）',
-    icon: 'Phone',
-    configMethod: 'plugin',
+    id: 'serverchan3',
+    name: 'Server酱³ (SC3)',
+    description: 'Server酱³ 消息推送（SC3，与 Turbo 不同的新产品）',
+    icon: 'Radio',
+    configMethod: 'token',
     isBuiltIn: true,
-    pluginPackage: '@whiskeysockets/baileys',
     fields: [
       {
-        name: 'session_data',
-        label: '认证会话',
-        type: 'textarea',
+        name: 'token',
+        label: 'SendKey (sctp...)',
+        type: 'password',
+        required: true,
+        placeholder: 'sctp...t...',
+        description: 'SC3 的 SendKey（以 sctp 开头），不是 Turbo 的 SCT 开头 key'
+      },
+      {
+        name: 'webhook',
+        label: 'UID (可选)',
+        type: 'text',
         required: false,
-        description: '扫码配对后自动填充的会话数据'
+        placeholder: '1234',
+        description: '留空时自动从 SendKey 的 sctp<UID>t 段推导；推导失败会给出明确错误'
       }
     ],
-    docsUrl: 'https://github.com/WhiskeySockets/Baileys'
+    docsUrl: 'https://sct.ftqq.com/compare/'
   },
   {
-    id: 'qq_bot',
-    name: 'QQ Bot',
-    description: 'QQ 机器人消息推送（扫码登录）',
+    id: 'xizhi',
+    name: '息知 (XiZhi)',
+    description: '息知微信推送（xizhi.qqoq.net）',
     icon: 'MessageCircle',
-    configMethod: 'plugin',
+    configMethod: 'token',
     isBuiltIn: true,
-    pluginPackage: 'oicq',
     fields: [
       {
         name: 'token',
-        label: 'QQ 号码',
-        type: 'text',
+        label: '息知 Key',
+        type: 'password',
         required: true,
-        placeholder: '123456789',
-        description: '机器人的 QQ 号码'
-      },
-      {
-        name: 'session_data',
-        label: '认证会话',
-        type: 'textarea',
-        required: false,
-        description: '扫码登录后自动填充的会话数据'
+        description: '息知后台复制 key（推送地址 https://xizhi.qqoq.net/{key}.send 中的 {key}）'
       }
     ],
-    docsUrl: 'https://oicqjs.github.io/oicq/'
+    docsUrl: 'https://xz.qqoq.net/'
   },
   {
-    id: 'signal',
-    name: 'Signal',
-    description: 'Signal 消息推送（需安装 signal-cli）',
-    icon: 'Shield',
-    configMethod: 'plugin',
+    id: 'anpush',
+    name: 'AnPush',
+    description: 'AnPush 多渠道推送',
+    icon: 'BellRing',
+    configMethod: 'token',
     isBuiltIn: true,
-    pluginPackage: 'signal-cli',
-    pluginInstallCommand: '# 需安装 signal-cli 命令行工具',
     fields: [
       {
         name: 'token',
-        label: '电话号码',
-        type: 'text',
+        label: 'Push Token',
+        type: 'password',
         required: true,
-        placeholder: '+86138xxxxxxxx',
-        description: 'Signal 注册的手机号码'
+        description: 'AnPush 控制台获取的推送 Token'
       },
       {
-        name: 'session_data',
-        label: '认证会话',
-        type: 'textarea',
+        name: 'chat_id',
+        label: '通道 ID (可选)',
+        type: 'text',
         required: false,
-        description: '验证后自动填充的会话数据'
+        description: '指定推送通道 channel，留空使用 AnPush 默认通道'
       }
     ],
-    docsUrl: 'https://github.com/AsamK/signal-cli'
+    docsUrl: 'https://anpush.com/'
   },
   {
-    id: 'imessage',
-    name: 'iMessage',
-    description: 'iMessage 消息推送（需 BlueBubbles 服务器）',
-    icon: 'MessageSquare',
+    id: 'chanify',
+    name: 'Chanify',
+    description: 'Chanify iOS 推送（支持自建服务端）',
+    icon: 'Smartphone',
     configMethod: 'token',
     isBuiltIn: true,
     fields: [
       {
         name: 'webhook',
-        label: 'BlueBubbles 服务器 URL',
+        label: '服务器地址 (可选)',
         type: 'text',
-        required: true,
-        placeholder: 'https://your-bluebubbles-server.com',
-        description: 'BlueBubbles 服务器地址'
+        required: false,
+        placeholder: 'https://api.chanify.net',
+        description: '自建 Chanify 服务地址；留空使用官方公共服务'
       },
       {
         name: 'token',
-        label: 'API 密钥',
+        label: '设备 Token',
         type: 'password',
         required: true,
-        description: 'BlueBubbles 服务器的 API 密钥'
+        description: 'Chanify App → 通道 → 复制 Send Token'
+      }
+    ],
+    docsUrl: 'https://github.com/chanify/chanify-ios'
+  },
+  {
+    id: 'pushback',
+    name: 'Pushback',
+    description: 'Pushback 可回复通知',
+    icon: 'Bell',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: 'Access Token (at_...)',
+        type: 'password',
+        required: true,
+        placeholder: 'at_...',
+        description: 'Pushback 控制台获取的 access token'
       },
       {
         name: 'chat_id',
-        label: '接收人 ID',
+        label: 'User ID (User_...)',
         type: 'text',
         required: true,
-        placeholder: 'iMessage 地址或电话号码',
-        description: 'iMessage 接收人地址（邮箱或电话号码）'
+        placeholder: 'User_1234',
+        description: '接收通知的 User ID'
       }
     ],
-    docsUrl: 'https://bluebubbles.app/'
+    docsUrl: 'https://pushback.io/docs/getting-started'
   },
   {
-    id: 'zalo',
-    name: 'Zalo',
-    description: 'Zalo 消息推送（越南版微信）',
-    icon: 'MessageCircle',
-    configMethod: 'plugin',
+    id: 'simplepush',
+    name: 'SimplePush',
+    description: 'SimplePush 简单推送',
+    icon: 'Zap',
+    configMethod: 'token',
     isBuiltIn: true,
-    pluginPackage: 'zalo-messenger',
-    pluginInstallCommand: 'npm install axios',
     fields: [
       {
         name: 'token',
-        label: 'Access Token',
+        label: 'Key',
         type: 'password',
         required: true,
-        description: 'Zalo OA 后台获取的 Access Token'
-      },
-      {
-        name: 'session_data',
-        label: '认证会话',
-        type: 'textarea',
-        required: false,
-        description: '扫码登录后自动填充的会话数据'
+        description: 'SimplePush App 中显示的 key'
       }
     ],
-    docsUrl: 'https://developers.zalo.com/'
+    docsUrl: 'https://simplepush.io/'
   },
   {
-    id: 'clawbot',
-    name: '微信龙虾 (ClawBot)',
-    description: '微信龙虾机器人消息推送（扫码登录）',
-    icon: 'Bot',
-    configMethod: 'plugin',
+    id: 'zulip',
+    name: 'Zulip',
+    description: 'Zulip 流消息推送',
+    icon: 'Hash',
+    configMethod: 'token',
     isBuiltIn: true,
-    pluginPackage: 'ilink-clawbot-api',
     fields: [
       {
-        name: 'session_data',
-        label: '认证会话',
-        type: 'textarea',
-        required: false,
-        description: '扫码登录后自动填充的会话数据'
+        name: 'webhook',
+        label: '组织地址',
+        type: 'text',
+        required: true,
+        placeholder: 'https://your-org.zulipchat.com',
+        description: 'Zulip 组织 URL（只填到域名，不要带 /api 等路径）'
+      },
+      {
+        name: 'token',
+        label: 'API Key',
+        type: 'password',
+        required: true,
+        description: '机器人账号的 API Key（设置 → 账户与隐私 → 机器人）'
+      },
+      {
+        name: 'chat_id',
+        label: 'Bot 邮箱',
+        type: 'text',
+        required: true,
+        placeholder: 'bot@your-org.zulipchat.com',
+        description: '机器人账号邮箱（HTTP Basic 用户名）'
+      },
+      {
+        name: 'secret',
+        label: 'Stream 名称',
+        type: 'text',
+        required: true,
+        placeholder: 'time-reminders',
+        description: '接收消息的 stream'
       }
     ],
-    docsUrl: 'https://github.com/nicepkg/wechat-clawbot'
+    docsUrl: 'https://zulip.com/api/send-message'
+  },
+  {
+    id: 'fcm',
+    name: 'Firebase 推送 (FCM)',
+    description: 'Firebase Cloud Messaging HTTP v1',
+    icon: 'Flame',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: '服务账号 JSON',
+        type: 'textarea',
+        required: true,
+        placeholder: '{"type":"service_account", ...}',
+        description: 'Firebase 控制台 → 项目设置 → 服务账号 → 生成新的私钥，粘贴整份 JSON（AES 加密存储）'
+      },
+      {
+        name: 'chat_id',
+        label: '设备令牌 / topic',
+        type: 'text',
+        required: true,
+        placeholder: 'fcm-device-token 或 topic:alerts',
+        description: '设备注册令牌，或 topic:<主题名>'
+      }
+    ],
+    docsUrl: 'https://firebase.google.com/docs/cloud-messaging/send/v1-api'
+  },
+  {
+    id: 'twilio_whatsapp',
+    name: 'Twilio WhatsApp',
+    description: '通过 Twilio 发送 WhatsApp 消息',
+    icon: 'MessageCircle',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: 'Account SID',
+        type: 'password',
+        required: true,
+        description: 'Twilio 控制台 Account SID'
+      },
+      {
+        name: 'secret',
+        label: 'Auth Token',
+        type: 'password',
+        required: true,
+        description: 'Twilio Auth Token'
+      },
+      {
+        name: 'webhook',
+        label: '发信号码 (From)',
+        type: 'text',
+        required: true,
+        placeholder: '+14155238886',
+        description: 'Twilio WhatsApp 发信号码（发送时自动加 whatsapp: 前缀）'
+      },
+      {
+        name: 'chat_id',
+        label: '收件号码 (To)',
+        type: 'text',
+        required: true,
+        placeholder: '+8613800138000',
+        description: '接收 WhatsApp 消息的手机号（发送时自动加 whatsapp: 前缀）'
+      }
+    ],
+    docsUrl: 'https://www.twilio.com/docs/whatsapp/api'
+  },
+  // ============ v78 batch 3 ============
+  {
+    id: 'whatsapp_cloud',
+    name: 'WhatsApp 官方',
+    description: 'Meta WhatsApp Cloud API（官方直连，无需 Twilio）',
+    icon: 'MessageCircle',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: '永久访问令牌',
+        type: 'password',
+        required: true,
+        placeholder: 'EAAG...',
+        description: 'Meta 开发者后台生成的 System User 永久令牌'
+      },
+      {
+        name: 'secret',
+        label: 'Phone Number ID',
+        type: 'text',
+        required: true,
+        placeholder: '1234567890',
+        description: 'WhatsApp Business 账号的 Phone Number ID（不是 WABA ID）'
+      },
+      {
+        name: 'chat_id',
+        label: '收件手机号',
+        type: 'text',
+        required: true,
+        placeholder: '+8613800138000',
+        description: '接收消息的手机号（含国家码）；测试号需先在后台绑定该号码'
+      }
+    ],
+    docsUrl: 'https://developers.facebook.com/docs/whatsapp/cloud-api'
+  },
+  {
+    id: 'kook',
+    name: 'Kook',
+    description: 'Kook（开黑啦）频道机器人 Webhook',
+    icon: 'Bot',
+    configMethod: 'webhook',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'webhook',
+        label: 'Webhook 地址',
+        type: 'text',
+        required: true,
+        placeholder: 'https://www.kookapp.cn/api/v3/message/webhook/xxxx/xxxx',
+        description: 'Kook 频道 → 设置 → WebHook，复制完整地址'
+      }
+    ],
+    docsUrl: 'https://developer.kookapp.cn/doc/intro'
+  },
+  {
+    id: 'fanbook',
+    name: 'Fanbook',
+    description: 'Fanbook 频道机器人 Webhook',
+    icon: 'Bot',
+    configMethod: 'webhook',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'webhook',
+        label: 'Webhook 地址',
+        type: 'text',
+        required: true,
+        placeholder: 'https://bot.geekhub.cn/api/webhooks/xxxxxxxx',
+        description: 'Fanbook 服务器 → 频道设置 → Webhook，复制完整地址'
+      }
+    ],
+    docsUrl: 'https://fanbook.zhizhoui.com/'
+  },
+  {
+    id: 'homeassistant',
+    name: 'Home Assistant',
+    description: 'Home Assistant 通知服务（长驻 Home Assistant 实例）',
+    icon: 'House',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'webhook',
+        label: 'HA 地址',
+        type: 'text',
+        required: true,
+        placeholder: 'http://homeassistant.local:8123',
+        description: 'Home Assistant 实例的可访问地址（含端口）'
+      },
+      {
+        name: 'token',
+        label: '长期访问令牌',
+        type: 'password',
+        required: true,
+        description: 'HA 个人资料 → 安全 → 长期访问令牌'
+      },
+      {
+        name: 'chat_id',
+        label: '通知服务名',
+        type: 'text',
+        required: true,
+        placeholder: 'mobile_app_iphone',
+        description: 'notify 服务名（如 mobile_app_xxx，见 HA 开发者工具 → 服务）'
+      }
+    ],
+    docsUrl: 'https://www.home-assistant.io/integrations/notify/'
+  },
+  {
+    id: 'pushbullet',
+    name: 'PushBullet',
+    description: 'PushBullet 全平台推送（单 Access-Token）',
+    icon: 'BellRing',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: 'Access-Token',
+        type: 'password',
+        required: true,
+        description: 'PushBullet 账户设置页生成的 Access Token'
+      }
+    ],
+    docsUrl: 'https://docs.pushbullet.com/'
+  },
+  {
+    id: 'join',
+    name: 'Join',
+    description: 'Join (joaoapps) Android 设备推送',
+    icon: 'Smartphone',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: 'Api Key',
+        type: 'password',
+        required: true,
+        description: 'Join 的 API Key（joinjoaomgcd.appspot.com → Join API 页）'
+      },
+      {
+        name: 'chat_id',
+        label: 'Device ID（可选）',
+        type: 'text',
+        required: false,
+        placeholder: '留空 = 发到全部设备',
+        description: '目标设备的 Device ID（Join API 页可查）',
+        column: 'chat_id'
+      }
+    ],
+    docsUrl: 'https://joaoapps.com/join/api/'
+  },
+  {
+    id: 'pushsafer',
+    name: 'PushSafer',
+    description: 'PushSafer 跨平台推送（单 Private Key）',
+    icon: 'BellRing',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: 'Private Key',
+        type: 'password',
+        required: true,
+        description: 'PushSafer 仪表盘上的 Private（Alias）Key'
+      }
+    ],
+    docsUrl: 'https://www.pushsafer.com/en/pushapi'
+  },
+  // ============ v2.29 batch（wave4）：Guilded / IFTTT / Revolt / OneSignal / SendGrid /
+  // Mailgun / Vonage SMS / MessageBird / Alertzy / Awtrix ============
+  {
+    id: 'guilded',
+    name: 'Guilded',
+    description: 'Guilded 服务器频道消息推送（Incoming Webhook，Discord 同构）',
+    icon: 'Hash',
+    configMethod: 'webhook',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'webhook',
+        label: 'Webhook URL',
+        type: 'text',
+        required: true,
+        placeholder: 'https://media.guilded.gg/webhooks/xxx/yyy',
+        description: '服务器 → 频道设置 → 集成 → Webhook 创建后复制的完整 URL'
+      }
+    ],
+    docsUrl: 'https://www.guilded.gg/docs/api/webhook/Webhook'
+  },
+  {
+    id: 'ifttt',
+    name: 'IFTTT',
+    description: 'IFTTT Webhooks 触发器（联动数千个 Applet）',
+    icon: 'Zap',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: 'Webhooks Key',
+        type: 'password',
+        required: true,
+        description: 'ifttt.com/maker_webhooks 页面 Documentation 标签下的 Key'
+      },
+      {
+        name: 'webhook',
+        label: '触发事件名',
+        type: 'text',
+        required: true,
+        placeholder: 'timemark_reminder',
+        description: 'Applet 中 Webhooks 触发器配置的事件名（Event Name）',
+        column: 'webhook'
+      }
+    ],
+    docsUrl: 'https://ifttt.com/maker_webhooks'
+  },
+  {
+    id: 'revolt',
+    name: 'Revolt',
+    description: 'Revolt 开源聊天平台频道消息推送（Bot Token）',
+    icon: 'MessagesSquare',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: 'Bot Token',
+        type: 'password',
+        required: true,
+        description: 'Revolt 开发者后台创建 Bot 后的 Token（需授予机器人发消息权限）'
+      },
+      {
+        name: 'chat_id',
+        label: '频道 ID',
+        type: 'text',
+        required: true,
+        placeholder: '01HXXXXXXXXXXXXXXXXXXXXXXX',
+        description: '目标频道的 ID（Revolt 客户端频道设置 → 复制 ID）',
+        column: 'chat_id'
+      }
+    ],
+    docsUrl: 'https://developers.revolt.chat/'
+  },
+  {
+    id: 'onesignal',
+    name: 'OneSignal',
+    description: 'OneSignal 跨平台推送（REST API Key + App ID）',
+    icon: 'Radio',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: 'REST API Key',
+        type: 'password',
+        required: true,
+        description: 'OneSignal 后台 Settings → Keys & IDs 的 REST API Key'
+      },
+      {
+        name: 'secret',
+        label: 'App ID',
+        type: 'password',
+        required: true,
+        description: 'OneSignal 后台 Settings → Keys & IDs 的 OneSignal App ID',
+        column: 'secret'
+      },
+      {
+        name: 'chat_id',
+        label: 'Subscription ID（可选）',
+        type: 'text',
+        required: false,
+        placeholder: '留空 = 发给全部 Subscribed Users',
+        description: '目标订阅的 Subscription ID',
+        column: 'chat_id'
+      }
+    ],
+    docsUrl: 'https://documentation.onesignal.com/docs/onesignal-api'
+  },
+  {
+    id: 'sendgrid',
+    name: 'SendGrid',
+    description: 'SendGrid 事务邮件发送（API Key）',
+    icon: 'Mail',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: 'API Key',
+        type: 'password',
+        required: true,
+        description: 'SendGrid 后台 Settings → API Keys 生成的密钥（需 Mail Send 权限）'
+      },
+      {
+        name: 'secret',
+        label: '发件人邮箱',
+        type: 'text',
+        required: true,
+        placeholder: 'noreply@example.com',
+        description: '已在 SendGrid 完成验证的发件人地址（Sender Authentication）',
+        column: 'secret'
+      },
+      {
+        name: 'chat_id',
+        label: '收件人邮箱',
+        type: 'text',
+        required: true,
+        placeholder: 'you@example.com',
+        description: '接收提醒邮件的地址',
+        column: 'chat_id'
+      }
+    ],
+    docsUrl: 'https://www.twilio.com/docs/sendgrid/for-developers/sending-email/api-getting-started'
+  },
+  {
+    id: 'mailgun',
+    name: 'Mailgun',
+    description: 'Mailgun 事务邮件发送（API Key + 发信域名）',
+    icon: 'Mail',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: 'API Key',
+        type: 'password',
+        required: true,
+        description: 'Mailgun 后台 Settings → API Security 的 Private API Key'
+      },
+      {
+        name: 'webhook',
+        label: '发信域名',
+        type: 'text',
+        required: true,
+        placeholder: 'mg.example.com（或沙箱域名 sandbox-xxx.mailgun.org）',
+        description: 'Mailgun 已验证的发信域名',
+        column: 'webhook'
+      },
+      {
+        name: 'chat_id',
+        label: '收件人邮箱',
+        type: 'text',
+        required: true,
+        placeholder: 'you@example.com',
+        description: '接收提醒邮件的地址',
+        column: 'chat_id'
+      }
+    ],
+    docsUrl: 'https://documentation.mailgun.com/docs/mailgun/user-manual/sending-messages/'
+  },
+  {
+    id: 'vonage_sms',
+    name: 'Vonage SMS',
+    description: 'Vonage (Nexmo) 国际短信发送（API Key + Secret）',
+    icon: 'Phone',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: 'API Key',
+        type: 'password',
+        required: true,
+        description: 'Vonage 控制台首页的 API Key'
+      },
+      {
+        name: 'secret',
+        label: 'API Secret',
+        type: 'password',
+        required: true,
+        description: 'Vonage 控制台首页的 API Secret',
+        column: 'secret'
+      },
+      {
+        name: 'chat_id',
+        label: '收件人手机号',
+        type: 'text',
+        required: true,
+        placeholder: '8613800138000',
+        description: 'E.164 格式（含国家码，不带 + 号）',
+        column: 'chat_id'
+      }
+    ],
+    docsUrl: 'https://developer.vonage.com/en/messaging/sms/guides/inbound-sms'
+  },
+  {
+    id: 'messagebird',
+    name: 'MessageBird',
+    description: 'MessageBird 国际短信发送（Access Key）',
+    icon: 'Phone',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: 'Access Key',
+        type: 'password',
+        required: true,
+        description: 'MessageBird 后台 Developers → API Access 的 Live Key'
+      },
+      {
+        name: 'chat_id',
+        label: '收件人手机号',
+        type: 'text',
+        required: true,
+        placeholder: '8613800138000',
+        description: 'E.164 格式（含国家码，不带 + 号）',
+        column: 'chat_id'
+      }
+    ],
+    docsUrl: 'https://developers.messagebird.com/quickstarts/sms-overview/'
+  },
+  {
+    id: 'alertzy',
+    name: 'Alertzy',
+    description: 'Alertzy 手机推送（单 Account Key，iOS/Android）',
+    icon: 'BellRing',
+    configMethod: 'token',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'token',
+        label: 'Account Key',
+        type: 'password',
+        required: true,
+        description: 'Alertzy 官网注册后 Dashboard 显示的 Account Key'
+      }
+    ],
+    docsUrl: 'https://alertzy.app/'
+  },
+  {
+    id: 'awtrix',
+    name: 'Awtrix 3',
+    description: 'Awtrix 3 像素时钟显示提醒（局域网设备地址）',
+    icon: 'MonitorSmartphone',
+    configMethod: 'webhook',
+    isBuiltIn: true,
+    fields: [
+      {
+        name: 'webhook',
+        label: '设备地址',
+        type: 'text',
+        required: true,
+        placeholder: 'http://192.168.1.50',
+        description: 'Awtrix 3 固件的局域网地址（Ulanzi TC001 等设备），需与 TimeMark 服务同网络可达',
+        helpText: '填设备 IP 或主机名，无需路径；系统会自动调用 /api/notify 接口'
+      }
+    ],
+    docsUrl: 'https://blueforcer.github.io/awtrix3/'
   }
 ];
 
+// ============ 渠道分类（v2.29）：前端向导按类分组展示 ============
+
+export type ChannelCategory = 'im' | 'push' | 'email' | 'sms' | 'smart' | 'automation' | 'other';
+
+export const CHANNEL_CATEGORY_LABELS: Record<ChannelCategory, string> = {
+  im: '即时通讯',
+  push: '推送通知',
+  email: '邮件',
+  sms: '短信 / 电话',
+  smart: '智能家居 / 自托管',
+  automation: '自动化平台',
+  other: '其他',
+};
+
+/** 渠道 id → 分类。新增渠道时必须登记，未登记的落入 other。 */
+const CHANNEL_CATEGORY_MAP: Record<string, ChannelCategory> = {
+  // 即时通讯
+  discord: 'im', slack: 'im', feishu: 'im', wecom: 'im', dingtalk: 'im', googlechat: 'im',
+  irc: 'im', synologychat: 'im', twitch: 'im', rocketchat: 'im', webex: 'im', matrix: 'im',
+  mattermost: 'im', msteams: 'im', nextcloud_talk: 'im', line: 'im', telegram: 'im',
+  guilded: 'im', revolt: 'im', kook: 'im', fanbook: 'im', zulip: 'im', qmsg: 'im',
+  // 推送通知
+  wxpusher: 'push', serverchan: 'push', serverchan3: 'push', pushplus: 'push', bark: 'push',
+  gotify: 'push', meow: 'push', pushme: 'push', pushdeer: 'push', ntfy: 'push',
+  pushover: 'push', pushbullet: 'push', join: 'push', pushsafer: 'push', chanify: 'push',
+  pushback: 'push', simplepush: 'push', xizhi: 'push', anpush: 'push', alertzy: 'push',
+  fcm: 'push', wecomapp: 'push', onesignal: 'push',
+  // 邮件
+  resend: 'email', smtp: 'email', sendgrid: 'email', mailgun: 'email',
+  // 短信 / 电话
+  twilio: 'sms', twilio_whatsapp: 'sms', whatsapp_cloud: 'sms', vonage_sms: 'sms', messagebird: 'sms',
+  // 智能家居 / 自托管
+  homeassistant: 'smart', apprise: 'smart', awtrix: 'smart', generic_webhook: 'smart',
+  // 自动化平台
+  ifttt: 'automation', notifiarr: 'automation',
+};
+
+export function getChannelCategory(id: string): ChannelCategory {
+  return CHANNEL_CATEGORY_MAP[id] ?? 'other';
+}
+
 // ============ All Channel Templates ============
+
+/**
+ * 合并 Docker 版渠道目录的展示元数据（officialUrl / 英文标签 / helpText）。
+ * R5.2：`shared/src/channels.ts` 已删除，这里是唯一权威渠道目录；
+ * 元数据缺失时按原模板返回（可正常降级）。
+ */
+function applyChannelMetadata(template: ChannelTemplate): ChannelTemplate {
+  const meta = CHANNEL_METADATA[template.id];
+  const category = getChannelCategory(template.id);
+  if (!meta) return { ...template, category };
+  return {
+    ...template,
+    category,
+    nameEn: meta.nameEn ?? template.nameEn,
+    descriptionEn: meta.descriptionEn ?? template.descriptionEn,
+    officialUrl: meta.officialUrl ?? template.officialUrl,
+    fields: template.fields.map((field) => {
+      const fieldMeta = meta.fields?.[field.name];
+      return fieldMeta ? { ...field, ...fieldMeta } : field;
+    }),
+  };
+}
 
 export const allChannelTemplates: ChannelTemplate[] = [
   ...webhookChannels,
-  ...tokenChannels,
-  ...pluginChannels
-];
+  ...tokenChannels.filter((c) => c.id !== 'nostr'),
+].map(applyChannelMetadata);
+
+export function getSupportedChannelTemplates(): ChannelTemplate[] {
+  return allChannelTemplates.filter((c) => c.configMethod !== 'plugin' && isSupportedChannel(c.id));
+}
+
+export function getSupportedChannelsByMethod(method: ChannelConfigMethod): ChannelTemplate[] {
+  return getSupportedChannelTemplates().filter((c) => c.configMethod === method);
+}
 
 // ============ Channel Helpers ============
 
 export function getChannelTemplate(channelId: string): ChannelTemplate | undefined {
-  return allChannelTemplates.find(c => c.id === channelId);
+  return getSupportedChannelTemplates().find((c) => c.id === channelId);
 }
 
 export function getChannelsByMethod(method: ChannelConfigMethod): ChannelTemplate[] {
-  return allChannelTemplates.filter(c => c.configMethod === method);
+  return getSupportedChannelsByMethod(method);
 }
 
 export function isBuiltInChannel(channelId: string): boolean {
@@ -1077,9 +1835,7 @@ export const legacyChannelToAccountType: Record<string, string> = {
   'slack': 'slack',
   'wechat': 'wxpusher',
   'wechat_official': 'wxpusher',
-  'wechat_personal': 'wechat_personal',
   'qq': 'qmsg',
-  'qq_bot': 'qmsg',
   'email': 'email',
   'resend': 'resend',
 };
