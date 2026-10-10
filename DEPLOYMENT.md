@@ -34,24 +34,28 @@
 
 ---
 
-## 🚀 v2.16.0 新版特性（同步 vercel v2.7–v2.16）
+## 🚀 v2.30.0 新版特性（变基合入 vercel v2.17–v2.30）
+
+> 本版本以 timemark-vercel@v2.30.0 源码树为基底完成变基，一次合入 14 个版本的上游功能；
+> SQLite 适配层升级为中心方言转换器，迁移 v34→v81 全量 SQLite 化。逐项账本见
+> [docs/PORT-LEDGER-v2.30.md](docs/PORT-LEDGER-v2.30.md)。
 
 | 特性 | 说明 |
 |------|------|
-| **单容器部署** | 只需一个镜像，无需 PostgreSQL + Redis |
-| **内置数据库** | SQLite (sql.js) 自动初始化，开箱即用 |
-| **更轻量** | 内存占用从 ~800MB 降至 ~256MB |
-| **43+ 通知渠道** | 覆盖 IM/Webhook/移动推送/协议/插件；同渠道多账户 |
-| **Inbox 全链路** | 通知成功写入收件箱 + `notification_queue` 指数退避 5m→30m→2h→6h |
-| **Integrations** | 入站 Webhook / ICS 订阅 Feed / 外部 ICS 同步 / CalDAV |
-| **固定联系人** | 多邮箱/手机/Telegram/QQ/WxPusher 带标签（v30 `contact_methods` JSONB） |
-| **待办与完成历史** | 提醒窗口待办打勾完成（v29 `todo_completions`），过期自动移出，365 天清理 |
-| **日历三视图** | 年/月/日视图 + 公历/农历/双历精准同步与闰月修复 |
-| **时区与 NTP** | 默认 `Asia/Shanghai`，WorldTimeAPI/timeapi.io 校正漂移，按用户 IANA 时区 |
-| **零信任 & 安全** | 移除 X-API-Key bypass · Passkey 强制 Turnstile · SSRF `isSafePublicUrl` · HSTS · SMTP TLS 587 requireTLS |
-| **安全加固** | 登录锁定 + 安全告警 + 登录日志 + JWT + 限流 + CSRF + XSS · 密钥脱敏 `tokenConfigured` |
-| **通知模板** | 13 种预设 + 自定义模板，按事件类型分组 |
-| **ICS 日历** | Dashboard 一键导出 ICS，支持 Google/Apple Calendar 订阅 |
+| **通知渠道 38 → 69** | 61 个上游渠道（分类体系/二维码绑定/三步向导/健康总览）+ 8 个 docker 独有插件渠道（微信/WhatsApp/QQ/Signal/iMessage/Zalo/ClawBot/Nostr） |
+| **生活领域** | 到期订阅/库存/保养/文档/习惯/目标/用药/照护/宠物/车辆/愿望单/家务清单 |
+| **后台 AI 运行时** | 持久任务队列（租约+幂等+死信）、调度链、决策卡、MCP、Worker 协议；进程内调度器开箱即用 |
+| **AI 日报/周报** | AI 叙述+PDF+收件箱归档，用户本地时区到点+同期号查重 |
+| **对外 REST API** | `/api/v1/*` 六端点 + tmt_ Token 门户（系统导航入口） |
+| **AI 层** | AI 网关与 NL 解析、三档模型、浏览器端本地推理（WebGPU）、AI 生日祝福、多轮追问 |
+| **全链路硬化** | 发送链崩溃兜底、Turnstile 三维体检、收件箱集群、Cron 监控健康分、新设备告警、未读徽标 |
+
+### ⬆️ 从 v2.16 升级注意
+
+- **旧库无损升级**：容器启动时自动从 v33 迁移到 v81，无需手动操作；升级前照常备份数据卷。
+- **管理员密码策略**：生产环境 `DEFAULT_ADMIN_PASSWORD` 现要求**至少 12 位**（上游更严策略）；已有账户不受影响，仅影响全新初始化。
+- **插件渠道**：微信/WhatsApp/QQ/Signal/iMessage/Zalo/ClawBot/Nostr 仅自托管可用（原 v2.16 行为）；可选依赖（wechaty/baileys/oicq）默认不安装，需要时在镜像内 `pnpm install` 对应包。
+- **附件存储**：本地磁盘为默认生产形态（持久卷）；设 `BLOB_READ_WRITE_TOKEN` 可切 Blob 远程存储，`ATTACHMENT_REQUIRE_BLOB=1` 恢复「无 token 拒写」语义。
 
 ---
 
