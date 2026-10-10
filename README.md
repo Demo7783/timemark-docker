@@ -4,13 +4,13 @@
 
 <h1>🎂 TimeMark</h1>
 
-<h3>智能事件提醒系统 | 38+ 通知渠道 | 农历转换 | 关系映射</h3>
+<h3>智能事件提醒系统 | 69 通知渠道 | 农历转换 | 关系映射</h3>
 
 <p>一个为生日、纪念日等重要日期打造的全功能提醒系统。<br/>单容器部署，开箱即用，支持飞牛OS / 群晖 / 威联通 / 铁威马等 NAS 平台。</p>
 
 ---
 
-[![Version](https://img.shields.io/badge/Version-2.16.0-blue?style=flat&color=2563eb)](https://github.com/WXFffff666/timemark-docker)
+[![Version](https://img.shields.io/badge/Version-2.30.0-blue?style=flat&color=2563eb)](https://github.com/WXFffff666/timemark-docker)
 [![Docker Pulls](https://img.shields.io/docker/pulls/xfffff666/timemark?style=flat&color=0ea5e9)](https://hub.docker.com/r/xfffff666/timemark)
 [![Docker Image Size](https://img.shields.io/docker/image-size/xfffff666/timemark/latest?style=flat&color=6366f1)](https://hub.docker.com/r/xfffff666/timemark)
 [![GitHub Stars](https://img.shields.io/github/stars/WXFffff666/timemark-docker?style=flat&color=f59e0b)](https://github.com/WXFffff666/timemark-docker/stargazers)
@@ -30,18 +30,31 @@
 
 ## ☁️ 姊妹项目：Vercel Serverless 版
 
-不想维护服务器？同一个 TimeMark 还有云原生版 **[timemark-vercel](https://github.com/WXFffff666/timemark-vercel)** —— 部署在 Vercel Serverless，PostgreSQL 存储，零运维、Hobby 免费套餐即可运行，覆盖 30+ 云端可用 HTTP 渠道。
+不想维护服务器？同一个 TimeMark 还有云原生版 **[timemark-vercel](https://github.com/WXFffff666/timemark-vercel)** —— 部署在 Vercel Serverless，PostgreSQL 存储，零运维、Hobby 免费套餐即可运行，覆盖 61 个云端可用 HTTP 渠道。
 
 | 对比项 | 🐳 Docker 版（本仓库） | ☁️ [Vercel 版](https://github.com/WXFffff666/timemark-vercel) |
 |:------:|:---------------------:|:----------------------------------------------------------:|
 | 部署平台 | Docker / NAS | Vercel Serverless |
 | 数据库 | SQLite (sql.js，内置) | PostgreSQL (Vercel Postgres / Neon) |
-| 定时任务 | Croner（进程内每分钟检查） | Vercel Cron + cron-job.org |
-| 通知渠道 | **38 个全部可用** | 30+ 云端可用 HTTP 渠道 |
+| 定时任务 | Croner（进程内调度，含日报/周报/后台 AI） | Vercel Cron + cron-job.org |
+| 通知渠道 | **69 个**（61 HTTP 渠道 + 8 插件/本地渠道） | 61 个云端可用 HTTP 渠道 |
 | 运维成本 | 需自备服务器 | 零运维，免费套餐可用 |
 | 适合场景 | 数据完全自持 / 内网 / NAS | 公网访问 / 免服务器 / 快速上线 |
 
-> 两版共享同一套功能内核（通知模板、农历双历、待办、Inbox、Integrations、零信任安全加固等），按运行环境自由选择。
+> 两版共享同一套功能内核（通知模板、农历双历、待办、Inbox、Integrations、后台 AI、日报/周报、对外 API、零信任安全加固等），按运行环境自由选择。
+
+---
+
+## 🎉 v2.30.0 — 变基合入 vercel v2.17→v2.30 全部功能
+
+本版本以 timemark-vercel@v2.30.0 源码树为基底完成变基，一次合入 14 个版本、153 个提交的上游功能（生活领域 / 后台 AI / 通知渠道 / AI 网关 / 日报周报 / 对外 API 门户等），同时完整保留 docker 增量层：
+
+- 🗄️ **数据库**：SQLite (sql.js) 适配层升级为中心方言转换器（PG→SQLite），迁移 v34→v81 全量 SQLite 化，旧库无损升级
+- 🔔 **渠道 38 → 69**：61 个上游渠道（分类体系 / 二维码绑定 / 三步向导 / 健康总览）+ 8 个 docker 独有插件渠道（微信 / WhatsApp / QQ / Signal / iMessage / Zalo / ClawBot / Nostr）
+- 🤖 **后台 AI + 日报/周报**：进程内调度器内化外部 cron，开箱即用
+- 🔐 **安全加固全保留**：零信任 / TRUSTED_PROXIES / DNS 钉扎 SSRF 守卫 / 按协议 Secure Cookie / NAS 明文部署逃生门
+
+逐项账本见 [docs/PORT-LEDGER-v2.30.md](docs/PORT-LEDGER-v2.30.md)，完整变更见 [CHANGELOG](CHANGELOG.md)。
 
 ---
 
@@ -49,7 +62,7 @@
 
 v2.0 是一次彻底的架构重构，从三容器方案精简为单容器部署，同时大幅强化了安全性和性能。v2.4.x 在此基础上增加了通知模板、重复事件等重要功能。
 
-| 对比项 | v1.x | v2.16.0 |
+| 对比项 | v1.x | v2.30.0 |
 |:------:|:----:|:------:|
 | 数据库 | PostgreSQL + Redis | **SQLite (内置，零配置)** |
 | 容器数量 | 3 个 | **1 个** |
@@ -162,7 +175,7 @@ docker compose up -d
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                TimeMark v2.16.0                  │
+│                TimeMark v2.30.0                  │
 │       单容器 · 零依赖 · 首次启动需设置管理员密码       │
 ├─────────────────────────────────────────────────┤
 │                                                  │
@@ -425,7 +438,7 @@ TimeMark 支持 38+ 通知渠道，覆盖国内外主流通讯平台。所有渠
 
 ## 🛡️ 安全特性（v2.16.0 零信任加固）
 
-TimeMark v2.16.0 内置多层安全防护：
+TimeMark v2.30.0 内置多层安全防护：
 
 | 特性 | 说明 |
 |------|------|

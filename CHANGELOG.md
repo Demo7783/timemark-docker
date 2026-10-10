@@ -1,5 +1,34 @@
 # Changelog
 
+## v2.30.0 (2026-10-07) — 变基合入 vercel v2.17→v2.30 全部功能（153 提交 / 14 个版本）
+
+> 策略：**变基**——以 timemark-vercel@v2.30.0 源码树为新基底，重新施加 docker 增量层
+> （sql.js 适配 / 安全加固 / Docker 基建），逐项账本见 `docs/PORT-LEDGER-v2.30.md`。
+
+### 合入的上游功能（v2.17→v2.30，节选）
+
+- **生活领域**：到期订阅/库存/保养/文档/习惯/目标/用药/照护/宠物/车辆/愿望单/家务清单
+- **后台 AI 运行时**：持久任务队列（租约+幂等+死信）、调度链、决策卡、反馈记忆、Worker 协议、MCP
+- **通知渠道 38→69**：61 个 vercel 渠道（分类体系+二维码绑定+三步向导+健康总览）+ 8 个 docker 独有插件渠道
+- **AI 层**：AI 网关与 NL 解析、三档模型、浏览器端本地推理（WebGPU）、AI 生日祝福、多轮追问
+- **日报/周报**（v2.30 方向 A）：AI 叙述+PDF+收件箱归档，用户本地时区到点+同期号查重；docker 由内置调度器内化外部 cron
+- **对外 REST API**（v2.30 方向 B）：`/api/v1/*` 六端点 + tmt_ Token 门户 + 调用流水
+- **全链路硬化**：发送链崩溃兜底、Turnstile 三维体检、收件箱集群、Cron 监控健康分、新设备告警、未读徽标
+
+### docker 增量层（重新施加并强化）
+
+- **PG→SQLite 中心方言转换器**（backend/src/db/index.ts）：`$n` 乱序参数重排、数值/文本类 `::cast` 分流（文本类必须丢弃，SQLite affinity 会把时间串截成数字）、`= ANY` → `json_each`、`NOW()/INTERVAL/make_interval` → `datetime()`、`ILIKE`、`to_char/date_trunc` → `strftime`、`jsonb_*` → `json_*`、`FOR UPDATE` 剥离、部分索引 conflict target 保留（SQLite 3.35+ 原生支持）、读取侧时间戳 ISO-Z 归一化（修 8 小时偏移）与 JSON 自动解析（补齐 node-pg jsonb 语义）。经 `backend/scripts/probe-queue-sql.mjs` 队列全链路探针验证
+- **保留的 docker 安全加固**（上游较弱，择强而留）：TRUSTED_PROXIES CIDR 校验的 client-ip、DNS 钉扎 SSRF 守卫（url-safety/safe-http）、按请求协议判定的 Cookie Secure/HSTS/CSP（NAS/LAN 明文部署不死锁）、allowed-origins 凭据 CORS 清洗（拒绝通配符授权）、HTTPS 全局强制 + ALLOW_INSECURE_HTTP 逃生门、回环族 IP 封禁短路、CalDAV 拒绝 3xx
+- **调度器**：docker 常驻 croner 调度器接手 vercel 外部 cron 职责（提醒/备份/会话清理/通知重试/日报周报/后台 AI 调度泵），`/api/stats/scheduler` 端点恢复
+- **附件存储**：本地磁盘升格为合法生产形态（持久卷）；`BLOB_READ_WRITE_TOKEN` 可切 Blob 远程存储；`ATTACHMENT_REQUIRE_BLOB=1` 恢复拒写语义
+- **迁移**：v34→v81 全量 SQLite 化（48 条），全新库 schema.sql → v81 一条龙，旧库（≤v33）无损升级
+
+### 升级注意
+
+- 默认管理员密码策略对齐上游：生产环境 `DEFAULT_ADMIN_PASSWORD` 至少 12 位（原 8 位）
+- 渠道目录 69 个（61 上游 + 8 docker 独有）；插件渠道（微信/WhatsApp/QQ/Signal/iMessage/Zalo/ClawBot/Nostr）仅自托管可用，vercel 语义的 serverless 过滤仅在 VERCEL 运行时生效
+- 3 个旧轮换机制测试与 2 个 v2.16 契约断言随上游重构退役/改写（上游 session-renewal/jwt-token-type 等测试已覆盖）
+
 ## v2.16.0 (2026-07-31)
 
 ### 双历与农历
