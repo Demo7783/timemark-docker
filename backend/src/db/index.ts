@@ -122,14 +122,160 @@ export function gracefulShutdown(): void {
 const LOG_QUERIES = process.env.LOG_QUERIES === 'true';
 
 /**
- * Convert PostgreSQL-style $1, $2 params to SQLite ? placeholders.
- * WARNING: This is a simple regex replacement. It does NOT handle:
- * - $N inside string literals (e.g., 'price is $5')
- * - Out-of-order parameters (assumes $1, $2, $3... in order)
- * All current queries use sequential params, so this works.
+ * PG→SQLite 集中式方言转换（v2.30 变基引入）。
+ *
+ * vercel 上游 594 个新文件的 SQL 是 PG 方言；与其逐文件改写，把可机械变换的
+ * 模式集中在这里处理（v2.16 时代是逐文件适配，这里补齐中心化能力）：
+ *
+ * 1. `$n` 占位符 → `?`
+ * 2. `?::数值类型` → `CAST(? AS type)`；`?::文本类类型`（text/jsonb/timestamptz/uuid…）
+ *    → 直接丢弃 cast。SQLite 对不认识的类型名套 NUMERIC affinity，会把
+ *    '2026-10-07 …' 截成 2026（探针实测），文本参数必须原样保留。
+ * 3. `= ANY($n)` → `IN (SELECT value FROM json_each(?))`（配合数组参数 JSON 化）
+ * 4. `NOW()` → `CURRENT_TIMESTAMP`
+ * 5. `NOW() ± INTERVAL 'N unit'` → `datetime('now', '±N unit')`
+ * 6. `ILIKE` → `LIKE`（SQLite LIKE 对 ASCII 默认不区分大小写，语义一致）
+ * 7. `date_trunc('unit', expr)` / `to_char(expr, 'YYYY-MM-DD')` → strftime 系列
+ *
+ * 探针实测（backend/scripts/probe-sqljs.mjs）确认原生支持无需改写：
+ * `->>`/`->`/json_extract/FILTER/RETURNING/ON CONFLICT DO UPDATE/string_agg/group_concat。
+ * 无法机械覆盖的（DISTINCT ON、FOR UPDATE、gen_random_uuid、similarity、array_agg）
+ * 由调用方按文件改写（见 docs/PORT-LEDGER-v2.30.md）。
  */
-function convertPgParamsToSqlite(text: string): string {
-  return text.replace(/\$\d+/g, '?');
+const PG_CAST_TYPES = String.raw`int|integer|bigint|smallint|text|boolean|bool|jsonb|json|timestamptz|timestamp(?:\s+with\s+time\s+zone)?|date|uuid|numeric|real|double\s+precision|regclass|vector`;
+/** 这些类型套 SQLite CAST 会走 NUMERIC affinity 把时间/JSON 字符串截成数字，必须丢弃 cast */
+const PG_TEXTISH_CAST_TYPES = String.raw`text|boolean|bool|jsonb|json|timestamptz|timestamp(?:\s+with\s+time\s+zone)?|date|uuid|regclass|vector`;
+
+function convertPgIntervalToSqlite(sql: string): string {
+  // NOW() / CURRENT_TIMESTAMP ± INTERVAL 'N unit' → datetime('now', '±N unit')
+  return sql.replace(
+    /(?:NOW\(\)|CURRENT_TIMESTAMP)\s*(-|\+)\s*INTERVAL\s+'(\d+)\s*(second|minute|hour|day|week|month|year)s?'/gi,
+    (_m, sign: string, n: string, unit: string) =>
+      `datetime('now', '${sign === '-' ? '-' : '+'}${n} ${unit.toLowerCase()}${Number(n) === 1 ? '' : 's'}')`,
+  );
+}
+
+/**
+ * 函数级改写必须先于 make_interval 独立规则：
+ * `now() ± make_interval(...)` 组合若被独立规则先吃掉 make_interval，会残留
+ * `CURRENT_TIMESTAMP + datetime(...)`（文本+文本 = 数值加法 0，探针实测）。
+ */
+function convertPgToSqliteFunctionsFirst(sql: string): string {
+  return convertPgFunctionToSqlite(sql);
+}
+
+function convertPgFunctionToSqlite(sql: string): string {
+  let out = sql;
+
+  // now() ± make_interval(secs => x) 必须先于裸 now() 处理：
+  // `CURRENT_TIMESTAMP + datetime(...)` 是文本+文本的数值加法 = 0（探针实测）
+  out = out.replace(
+    /now\(\)\s*(-|\+)\s*make_interval\s*\(\s*secs\s*=>\s*([^)]+)\)/gi,
+    (_m, sign: string, expr: string) =>
+      `datetime('now', '${sign === '-' ? '-' : '+'}' || ((${expr.trim()}) ) || ' seconds')`,
+  );
+  out = out.replace(/\bNOW\(\)/gi, 'CURRENT_TIMESTAMP');
+
+  // date_trunc('unit', expr) → strftime，仅覆盖无嵌套括号的简单表达式
+  const truncUnit: Record<string, string> = {
+    day: '%Y-%m-%d',
+    month: '%Y-%m',
+    year: '%Y',
+    hour: '%Y-%m-%d %H:00:00',
+    week: '%Y-%W',
+  };
+  out = out.replace(/date_trunc\s*\(\s*'(\w+)'\s*,\s*([^()]+?)\s*\)/gi, (m, unit: string, expr: string) => {
+    const fmt = truncUnit[unit.toLowerCase()];
+    if (!fmt) return m;
+    return `strftime('${fmt}', ${expr.trim()})`;
+  });
+
+  // to_char(expr, 'PG fmt') → strftime(expr, 'strftime fmt')，逐 token 翻译常用格式
+  const fmtToken: Array<[RegExp, string]> = [
+    [/YYYY/g, '%Y'], [/MM\b/g, '%m'], [/DD\b/g, '%d'], [/HH24\b/g, '%H'], [/MI\b/g, '%M'], [/SS\b/g, '%S'],
+  ];
+  out = out.replace(/to_char\s*\(\s*([^,()]+?)\s*,\s*'([^']+)'\s*\)/gi, (m, expr: string, fmt: string) => {
+    let f = fmt;
+    for (const [re, rep] of fmtToken) f = f.replace(re, rep);
+    if (/[A-Z]/.test(f)) return m; // 有未翻译的 PG 格式 token，留给调用方
+    return `strftime('${f}', ${expr.trim()})`;
+  });
+
+  return out;
+}
+
+function convertPgToSqlite(text: string): string {
+  // 诊断导出别名（见文件底部）
+  return convertPgToSqliteInner(text);
+}
+
+export function convertPgToSqliteInner(text: string): string {
+  let sql = text.replace(/\$\d+/g, '?');
+
+  // 数组参数断言：?::uuid[] / ?::text[] 等配合 json_each，必须在通用 cast 之前处理
+  sql = sql.replace(
+    /(=|<>|!=)\s*ANY\s*\(\s*\?\s*::\s*(uuid|int|integer|bigint|text)\s*\[\]\s*\)/gi,
+    (_m, op: string) => op === '='
+      ? 'IN (SELECT value FROM json_each(?))'
+      : 'NOT IN (SELECT value FROM json_each(?))',
+  );
+
+  // 文本类类型断言：丢弃 cast（保留裸 ?），原因见 PG_TEXTISH_CAST_TYPES 注释
+  sql = sql.replace(new RegExp(String.raw`\?::\s*(` + PG_TEXTISH_CAST_TYPES + String.raw`)\b`, 'gi'), '?');
+
+  // 数值类类型断言：?::type → CAST(? AS TYPE)
+  sql = sql.replace(new RegExp(String.raw`\?::\s*(` + PG_CAST_TYPES + String.raw`)\b`, 'gi'),
+    (_m, t: string) => `CAST(? AS ${t.toUpperCase()})`);
+
+  // = ANY(?) / <> ANY(?) / != ANY(?) → IN / NOT IN (SELECT value FROM json_each(?))
+  sql = sql.replace(/(=|<>|!=)\s*ANY\s*\(\s*(\?)\s*\)/gi, (m, op: string, ph: string) => {
+    if (op === '=') return `IN (SELECT value FROM json_each(${ph}))`;
+    return `NOT IN (SELECT value FROM json_each(${ph}))`;
+  });
+
+  // 函数组（含 now() ± make_interval 组合）必须先于独立 make_interval 规则，
+  // 否则组合式被拆开后残留 `CURRENT_TIMESTAMP + datetime(...)` —— 文本+文本
+  // 在 SQLite 是数值加法（'2026…' 截成 2026），lease 到期时间会算到公元 4052 年。
+  sql = convertPgFunctionToSqlite(sql);
+
+  // make_interval(secs => expr) → datetime('now', '+' || expr || ' seconds')
+  sql = sql.replace(/make_interval\s*\(\s*secs\s*=>\s*([^)]+)\)/gi,
+    (_m, expr: string) => `datetime('now', '+' || (${expr.trim()}) || ' seconds')`);
+
+  // 注：PG 部分唯一索引的 `ON CONFLICT (cols) WHERE col IS NOT NULL DO ...` 在
+  // SQLite 3.35+ 是合法语法（UPSERT conflict target 支持 WHERE），且 sql.js 1.14
+  // 内核 ≥3.45，原文保留即可——探针实测过剥离反而匹配不到部分索引。
+
+  // 行锁在单连接内存库上没有意义（无第二个连接可竞争），剥掉锁子句。
+  // 并发正确性由调用方的 lease_token 校验保证（agent queue 的设计即如此）。
+  sql = sql.replace(/\s*FOR\s+UPDATE(\s+SKIP\s+LOCKED)?/gi, '');
+
+  sql = convertPgToSqliteFunctionsFirst(sql);
+  sql = convertPgIntervalToSqlite(sql);
+
+  // ILIKE → LIKE（SQLite 默认 ASCII 大小写不敏感）
+  sql = sql.replace(/\bILIKE\b/g, 'LIKE');
+
+  return sql;
+}
+
+/**
+ * 参数归一化：
+ * - boolean → 0/1（sql.js 不绑 JS boolean，SQLite 亦无布尔类型）
+ * - Date → 'YYYY-MM-DD HH:MM:SS'（UTC，与 CURRENT_TIMESTAMP 存储格式一致）
+ * - ISO 带 T 的字符串 → 空格分隔（CURRENT_TIMESTAMP 列上的字典序比较才正确）
+ * - 数组 → JSON 字符串（配合 `IN (SELECT value FROM json_each(?))`）
+ */
+function normalizeSqliteParam(p: unknown): unknown {
+  if (typeof p === 'boolean') return p ? 1 : 0;
+  if (p instanceof Date) {
+    return p.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+  }
+  if (typeof p === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(p)) {
+    return p.replace('T', ' ').replace(/Z$/, '');
+  }
+  if (Array.isArray(p)) return JSON.stringify(p);
+  return p;
 }
 
 function isRowReturningQuery(sql: string): boolean {
@@ -139,9 +285,45 @@ function isRowReturningQuery(sql: string): boolean {
   return isSelectLike || hasReturning;
 }
 
+/**
+ * 读取侧时间归一化（v2.30 全链路「8 小时偏移」教训的系统级修复）：
+ * DB 侧 now()/datetime() 写入的是 'YYYY-MM-DD HH:MM:SS'（UTC 无时区标记），
+ * JS `new Date('...')` 会按本地时区解析（UTC+8 偏 8 小时）。统一在读出时
+ * 转成带 Z 的 ISO，让上游拿到时区无歧义的值。
+ */
+function normalizeTimestampOut(value: unknown): unknown {
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(value)) {
+    return `${value.replace(' ', 'T')}Z`;
+  }
+  return value;
+}
+
+function normalizeRow(row: Record<string, unknown>): Record<string, unknown> {
+  for (const key of Object.keys(row)) {
+    row[key] = normalizeTimestampOut(row[key]);
+  }
+  return row;
+}
+
+/**
+ * v2.30 上游大量使用乱序命名参数（如 `WHERE id = $3 AND x = $1` 的书写顺序里
+ * $2/$3 先于 $1 出现）。$n→? 的文本替换保持出现顺序，因此绑定参数必须按
+ * 占位符出现顺序重排，否则数组会绑到错误的位置（探针实测踩雷）。
+ * 返回 null 表示本来就是顺序参数，无需重排。
+ */
+function extractPlaceholderOrder(text: string): number[] | null {
+  const order: number[] = [];
+  for (const m of text.matchAll(/\$(\d+)/g)) order.push(Number(m[1]));
+  if (order.length === 0) return null;
+  const sequential = order.every((v, i) => v === i + 1);
+  return sequential ? null : order;
+}
+
 export async function query(text: string, params: any[] = []): Promise<QueryResult> {
   const start = Date.now();
-  const sqliteText = convertPgParamsToSqlite(text);
+  const sqliteText = convertPgToSqlite(text);
+  const order = extractPlaceholderOrder(text);
+  const sqliteParams = (order ? order.map((n) => params[n - 1]) : params).map(normalizeSqliteParam);
 
   // Ensure database is ready
   await waitForDb();
@@ -151,12 +333,12 @@ export async function query(text: string, params: any[] = []): Promise<QueryResu
 
     if (isRowReturningQuery(sqliteText)) {
       const stmt = database.prepare(sqliteText);
-      stmt.bind(params);
+      stmt.bind(sqliteParams);
 
       const rows: any[] = [];
       while (stmt.step()) {
         const row = stmt.getAsObject();
-        rows.push(row);
+        rows.push(normalizeRow(row));
       }
       stmt.free();
 
@@ -172,7 +354,7 @@ export async function query(text: string, params: any[] = []): Promise<QueryResu
       };
     }
 
-    database.run(sqliteText, params);
+    database.run(sqliteText, sqliteParams);
 
     const lastId = database.exec('SELECT last_insert_rowid() as id')[0]?.values[0]?.[0];
     const changes = database.getRowsModified();
@@ -212,11 +394,13 @@ export async function queryTransaction(statements: QueryStatement[]): Promise<Qu
   database.exec('BEGIN TRANSACTION');
   try {
     const results = statements.map(({ text, params = [] }) => {
-      const sqliteText = convertPgParamsToSqlite(text);
+      const sqliteText = convertPgToSqlite(text);
       if (isRowReturningQuery(sqliteText)) {
         throw new Error('queryTransaction only supports mutation statements');
       }
-      database.run(sqliteText, params);
+      const order = extractPlaceholderOrder(text);
+      const bound = (order ? order.map((n) => params[n - 1]) : params).map(normalizeSqliteParam);
+      database.run(sqliteText, bound);
       return { rows: [], rowCount: database.getRowsModified() };
     });
 
