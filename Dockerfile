@@ -3,7 +3,7 @@
 # Or pre-build: pnpm -r build && docker build -t timemark:latest .
 
 # Stage 1: Build (compile TypeScript)
-FROM node:22-alpine AS builder
+FROM node:22.23.4-alpine AS builder
 
 WORKDIR /app
 
@@ -23,7 +23,7 @@ COPY backend/ ./backend/
 RUN pnpm build:shared && pnpm build:backend
 
 # Stage 2: Runtime (minimal production image)
-FROM node:22-alpine
+FROM node:22.23.4-alpine
 
 # icu-data-full: Required for correct Chinese date formatting (Intl.DateTimeFormat)
 # dumb-init: Proper PID 1 signal handling in containers
