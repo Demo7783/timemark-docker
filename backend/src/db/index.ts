@@ -331,9 +331,29 @@ export function convertPgToSqliteInner(text: string): string {
   // jsonb_* 函数族 → json_*（jsonb_array_length/jsonb_extract 等；SQLite json1 同名无 b）
   sql = sql.replace(/\bjsonb_(array_length|extract|each|set|insert|object|agg|tuple)\b/gi, 'json_$1');
 
+  // EXTRACT(unit FROM expr) → CAST(strftime('%Y|%m|%d', expr) AS INTEGER)
+  // （stats/on-this-day 的「N 年前的今天」用 EXTRACT(YEAR FROM date)::int）
+  const extractMap: Record<string, string> = { year: '%Y', month: '%m', day: '%d', hour: '%H', minute: '%M' };
+  sql = sql.replace(/\bEXTRACT\s*\(\s*(\w+)\s+FROM\s+([^()]+?)\s*\)/gi,
+    (_m, unit: string, expr: string) => {
+      const fmt = extractMap[unit.toLowerCase()];
+      if (!fmt) return _m; // 未支持的单位原样保留,交给残留探测告警
+      return `CAST(strftime('${fmt}', ${expr.trim()}) AS INTEGER)`;
+    });
+
+  // CURRENT_DATE ± (expr * INTERVAL '1 day') → date(CURRENT_DATE, '±' || (expr) || ' days')
+  // （inventory 的「N 天内到期」用 CURRENT_DATE + ($2::int * INTERVAL '1 day')；cast 会先被
+  //  前面的规则翻成 CAST(? AS INT)，所以 expr 段必须允许一层嵌套括号）
+  sql = sql.replace(
+    /CURRENT_DATE\s*([+-])\s*\(\s*((?:CAST\([^()]*\)|[^()])+?)\s*\*\s*INTERVAL\s*'1\s*(second|minute|hour|day|week|month|year)'\s*\)/gi,
+    (_m, sign: string, expr: string, unit: string) =>
+      `date(CURRENT_DATE, '${sign === '-' ? '-' : '+'}' || (${expr.trim()}) || ' ${unit.toLowerCase()}s')`,
+  );
+
   // 兜底体检：翻译后仍残留的 PG 专属语法。不阻断执行（交给 sqlite 自己报错），
   // 但把 SQL 打到日志里，让下一次「方言缺口」在日志里就能看到原文，
   // 不用再靠 500 + 翻栈定位。每条唯一 SQL 只告警一次。
+  // 注意：必须放在所有改写规则之后，否则会把「即将被翻译」的语法误报成残留。
   if (PG_RESIDUAL_PATTERN.test(sql)) {
     const key = sql.slice(0, 400);
     if (!warnedResidualSql.has(key)) {
@@ -347,7 +367,7 @@ export function convertPgToSqliteInner(text: string): string {
 
 /** PG 专属语法残留探测（仅用于日志体检，不改写 SQL）。 */
 const PG_RESIDUAL_PATTERN = new RegExp(
-  String.raw`\bLATERAL\b|\bunnest\s*\(|\bgenerate_series\s*\(|\bmake_interval\s*\(|\barray_agg\s*\(|\bstring_agg\s*\(|\bjson_agg\s*\(|\bLEFT\s*\(|\bRIGHT\s*\(|::\s*\w+|\s~\s`,
+  String.raw`\bLATERAL\b|\bunnest\s*\(|\bgenerate_series\s*\(|\bmake_interval\s*\(|\barray_agg\s*\(|\bstring_agg\s*\(|\bjson_agg\s*\(|\bLEFT\s*\(|\bRIGHT\s*\(|\bEXTRACT\s*\(|\bINTERVAL\s*'|::\s*\w+|\s~\s`,
   'i',
 );
 const warnedResidualSql = new Set<string>();
