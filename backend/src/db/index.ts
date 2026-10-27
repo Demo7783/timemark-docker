@@ -226,7 +226,11 @@ function convertPgFunctionToSqlite(sql: string): string {
   out = out.replace(/to_char\s*\(\s*([^,()]+?)\s*,\s*'([^']+)'\s*\)/gi, (m, expr: string, fmt: string) => {
     let f = fmt;
     for (const [re, rep] of fmtToken) f = f.replace(re, rep);
-    if (/[A-Z]/.test(f)) return m; // 有未翻译的 PG 格式 token，留给调用方
+    // 上游此处写的是 `/[A-Z]/.test(f)` —— 而 strftime 的指令本身就是大写(%Y/%m/%H/%M/%S),
+    // 于是「已翻译」的结果永远被判成「有未翻译 token」,to_char 从来没真正生效过
+    // (提醒历史页 500 = no such function: to_char 的根因)。改为先剥掉 %X 指令再找残留字母。
+    const leftover = f.replace(/%[A-Za-z]/g, '');
+    if (/[A-Za-z]/.test(leftover)) return m; // 有未翻译的 PG 格式 token，留给调用方
     return `strftime('${f}', ${expr.trim()})`;
   });
 
@@ -311,11 +315,42 @@ export function convertPgToSqliteInner(text: string): string {
   // ILIKE → LIKE（SQLite 默认 ASCII 大小写不敏感）
   sql = sql.replace(/\bILIKE\b/g, 'LIKE');
 
+  // PG 字符串截断函数 → SQLite substr（SQLite 没有 LEFT/RIGHT）。
+  // 注意不能误伤 `LEFT JOIN`：规则要求函数名后紧跟 `(`，且 JOIN 后不会接括号表达式。
+  sql = sql.replace(/\bLEFT\s*\(\s*([\w."]+)\s*,\s*([^(),]+?)\s*\)/gi,
+    (_m, expr: string, n: string) => `substr(${expr}, 1, ${n})`);
+  sql = sql.replace(/\bRIGHT\s*\(\s*([\w."]+)\s*,\s*([^(),]+?)\s*\)/gi,
+    (_m, expr: string, n: string) => `substr(${expr}, -1 * (${n}))`);
+
+  // array_agg(x [ORDER BY y]) → json_group_array(x)
+  // （data-health 的重名联系人分组用；SQLite 的 group_concat 不支持 ORDER BY，
+  //  这里取 json_group_array，调用方按 JSON 数组消费）
+  sql = sql.replace(/\barray_agg\s*\(\s*([\w."]+)(?:\s+ORDER\s+BY\s+[^)]+)?\s*\)/gi,
+    (_m, expr: string) => `json_group_array(${expr})`);
+
   // jsonb_* 函数族 → json_*（jsonb_array_length/jsonb_extract 等；SQLite json1 同名无 b）
   sql = sql.replace(/\bjsonb_(array_length|extract|each|set|insert|object|agg|tuple)\b/gi, 'json_$1');
 
+  // 兜底体检：翻译后仍残留的 PG 专属语法。不阻断执行（交给 sqlite 自己报错），
+  // 但把 SQL 打到日志里，让下一次「方言缺口」在日志里就能看到原文，
+  // 不用再靠 500 + 翻栈定位。每条唯一 SQL 只告警一次。
+  if (PG_RESIDUAL_PATTERN.test(sql)) {
+    const key = sql.slice(0, 400);
+    if (!warnedResidualSql.has(key)) {
+      warnedResidualSql.add(key);
+      console.warn('[db] 翻译后仍含 PG 专属语法，SQLite 可能报错：', key.replace(/\s+/g, ' '));
+    }
+  }
+
   return sql;
 }
+
+/** PG 专属语法残留探测（仅用于日志体检，不改写 SQL）。 */
+const PG_RESIDUAL_PATTERN = new RegExp(
+  String.raw`\bLATERAL\b|\bunnest\s*\(|\bgenerate_series\s*\(|\bmake_interval\s*\(|\barray_agg\s*\(|\bstring_agg\s*\(|\bjson_agg\s*\(|\bLEFT\s*\(|\bRIGHT\s*\(|::\s*\w+|\s~\s`,
+  'i',
+);
+const warnedResidualSql = new Set<string>();
 
 /**
  * 参数归一化：

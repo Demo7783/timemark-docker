@@ -317,7 +317,18 @@ export async function getEventsByUserId(userId: string): Promise<Event[]> {
         }
       })(),
       calendarType: row.calendar_type as CalendarType,
-      lunarDate: row.lunar_date ? (() => { try { return JSON.parse(row.lunar_date); } catch { return undefined; } })() : undefined,
+      // sql.js 适配层的 normalizeJsonOut() 已把 JSON 列解析成对象(node-pg 的 jsonb 语义),
+      // 这里若直接 JSON.parse 会对对象抛错 → catch 吞掉 → lunarDate 丢失(农历标签消失、
+      // 编辑保存后 next_occurrence 按公历漂移)。读前先判类型。
+      lunarDate: row.lunar_date
+        ? (() => {
+            try {
+              return typeof row.lunar_date === 'string' ? JSON.parse(row.lunar_date) : row.lunar_date;
+            } catch {
+              return undefined;
+            }
+          })()
+        : undefined,
       reminderConfig,
       recurringConfig,
       nextOccurrence: row.next_occurrence || null,
@@ -366,7 +377,18 @@ export function mapEventRow(row: EventRow): Event {
       }
     })(),
     calendarType: row.calendar_type as CalendarType,
-    lunarDate: row.lunar_date ? (() => { try { return JSON.parse(row.lunar_date); } catch { return undefined; } })() : undefined,
+    // sql.js 适配层的 normalizeJsonOut() 已把 JSON 列解析成对象(node-pg 的 jsonb 语义),
+      // 这里若直接 JSON.parse 会对对象抛错 → catch 吞掉 → lunarDate 丢失(农历标签消失、
+      // 编辑保存后 next_occurrence 按公历漂移)。读前先判类型。
+      lunarDate: row.lunar_date
+        ? (() => {
+            try {
+              return typeof row.lunar_date === 'string' ? JSON.parse(row.lunar_date) : row.lunar_date;
+            } catch {
+              return undefined;
+            }
+          })()
+        : undefined,
     reminderConfig: parseReminderConfig(row),
     recurringConfig: parseRecurringConfig(row),
     nextOccurrence: row.next_occurrence || null,
@@ -582,7 +604,7 @@ export async function updateEvent(id: string, userId: string, data: UpdateEventD
       let lunarDate = data.lunarDate ?? undefined;
       if (!lunarDate && row?.lunar_date) {
         try {
-          lunarDate = JSON.parse(row.lunar_date);
+          lunarDate = typeof row.lunar_date === 'string' ? JSON.parse(row.lunar_date) : (row.lunar_date as any);
         } catch {
           lunarDate = undefined;
         }
