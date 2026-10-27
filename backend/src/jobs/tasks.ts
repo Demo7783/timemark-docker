@@ -768,7 +768,15 @@ export async function sendCadenceReminders(
   now: Date = getSyncedNow(DEFAULT_SYNC_TIMEZONE),
 ): Promise<CadenceReminderStats> {
   const result = await query(
-    `SELECT fc.id, fc.user_id, fc.name, fc.nickname, fc.relationship,
+    // SQLite 无 LATERAL（上游 PG 版用 `LEFT JOIN LATERAL (...) latest ON TRUE`）。
+    // 等价改写：窗口函数取每个 contact 的最新一条 interaction，再按 rn = 1 左连。
+    // 只用一次 interactions 扫描，比三个关联子查询便宜；SQLite 3.25+ 支持窗口函数。
+    `WITH latest AS (
+       SELECT user_id, contact_id, occurred_at, summary,
+              ROW_NUMBER() OVER (PARTITION BY user_id, contact_id ORDER BY occurred_at DESC) AS rn
+       FROM interactions
+     )
+     SELECT fc.id, fc.user_id, fc.name, fc.nickname, fc.relationship,
             fc.cadence_days, fc.last_contact_at, fc.profile_id,
             latest.occurred_at AS effective_last_contact_at,
             latest.summary AS last_interaction_summary,
@@ -776,18 +784,11 @@ export async function sendCadenceReminders(
      FROM fixed_contacts fc
      LEFT JOIN user_configs uc ON uc.user_id = fc.user_id
      LEFT JOIN profiles p ON p.id = fc.profile_id
-     LEFT JOIN LATERAL (
-       SELECT i.occurred_at, i.summary
-       FROM interactions i
-       WHERE i.user_id = fc.user_id AND i.contact_id = fc.id
-       ORDER BY i.occurred_at DESC
-       LIMIT 1
-     ) latest ON TRUE
+     LEFT JOIN latest ON latest.user_id = fc.user_id AND latest.contact_id = fc.id AND latest.rn = 1
      WHERE COALESCE(fc.cadence_enabled, FALSE) = TRUE
        AND fc.cadence_days IS NOT NULL
        AND COALESCE(latest.occurred_at, fc.last_contact_at) IS NOT NULL
-       AND COALESCE(latest.occurred_at, fc.last_contact_at)
-           + make_interval(days => fc.cadence_days) <= $1`,
+       AND datetime(COALESCE(latest.occurred_at, fc.last_contact_at), '+' || fc.cadence_days || ' days') <= $1`,
     [now],
   );
 

@@ -61,3 +61,6 @@ test-api*.ps1
 
 # Commit message
 commit-msg.txt
+
+# keep our Dockerfile variants in build context
+!Dockerfile.our

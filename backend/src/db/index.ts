@@ -35,6 +35,24 @@ async function initDatabase(): Promise<SqlJsDatabase> {
     db = new SQL.Database();
   }
   
+  // Register PostgreSQL-style REGEXP support.
+  //
+  // Upstream SQL uses the PG operator `expr ~ 'pattern'` in several places
+  // (event trigger_date prefix guards, patterns.service snooze detection).
+  // SQLite parses `X REGEXP Y` only when a function named `regexp` exists;
+  // the operator hands the arguments to it as (pattern, value) — Y first.
+  // convertPgToSqlite() rewrites `~` into `REGEXP`, so this closure is what
+  // actually runs. Invalid patterns degrade to "no match" instead of throwing,
+  // matching PG's ERROR-free behaviour for these guarded prefix checks.
+  db.create_function('regexp', (pattern: string, value: string | null) => {
+    if (value === null || value === undefined || pattern === null) return 0;
+    try {
+      return new RegExp(String(pattern)).test(String(value)) ? 1 : 0;
+    } catch {
+      return 0;
+    }
+  });
+
   dbReady = true;
   startAutoSave();
   return db;
@@ -258,9 +276,26 @@ export function convertPgToSqliteInner(text: string): string {
   // 在 SQLite 是数值加法（'2026…' 截成 2026），lease 到期时间会算到公元 4052 年。
   sql = convertPgFunctionToSqlite(sql);
 
-  // make_interval(secs => expr) → datetime('now', '+' || expr || ' seconds')
+  // make_interval(secs|mins|minutes|hours|days|weeks|months|years => expr)
+  // → datetime('now', '+' || (expr) || ' <unit>')
+  // 上游 docker 版多处用非 secs 单位（cadence 用 days、job-hardening 用 mins、
+  // run-observability/feedback 用 days），只翻 secs 会残留 PG 语法直接炸查询。
   sql = sql.replace(/make_interval\s*\(\s*secs\s*=>\s*([^)]+)\)/gi,
     (_m, expr: string) => `datetime('now', '+' || (${expr.trim()}) || ' seconds')`);
+  sql = sql.replace(/make_interval\s*\(\s*(mins|minutes|hours|days|weeks|months|years)\s*=>\s*([^)]+)\)/gi,
+    (_m, unit: string, expr: string) => {
+      const u = unit.toLowerCase();
+      const norm = u === 'mins' || u === 'minutes' ? 'minutes' : u;
+      return `datetime('now', '+' || (${expr.trim()}) || ' ${norm}')`;
+    });
+
+  // PG 正则操作符 → REGEXP（sql.js 侧由 initDatabase() 注册的 regexp() 实现，
+  // 参数顺序是 (pattern, value)，SQLite 的 `X REGEXP Y` 会按此调用）。
+  // 顺序：先匹配带 ^ 前缀的锚定形态与 !~（否定），再兜通用形态，避免 `!~` 被吃成 `!REGEXP`。
+  sql = sql.replace(/([\w."]+(?:\([^()]*\))?)\s*!~\s*'((?:[^']|'')*)'/g,
+    (_m, expr: string, pat: string) => `${expr} NOT REGEXP '${pat}'`);
+  sql = sql.replace(/([\w."]+(?:\([^()]*\))?)\s*~\s*'((?:[^']|'')*)'/g,
+    (_m, expr: string, pat: string) => `${expr} REGEXP '${pat}'`);
 
   // 注：PG 部分唯一索引的 `ON CONFLICT (cols) WHERE col IS NOT NULL DO ...` 在
   // SQLite 3.35+ 是合法语法（UPSERT conflict target 支持 WHERE），且 sql.js 1.14

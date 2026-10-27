@@ -48,7 +48,7 @@ export function PageHeader({
   const handleBack = onBack ?? (backTo ? () => navigate(backTo) : back === 'smart' ? smartBack : () => navigate(-1));
 
   return (
-    <header className={`sticky top-6 z-40 px-4 ${maxWidth ?? 'max-w-4xl'} mx-auto ${className ?? ''}`}>
+    <header className={`sticky top-6 z-40 mt-6 px-4 ${maxWidth ?? 'max-w-4xl'} mx-auto ${className ?? ''}`}>
       <div className="glass-panel rounded-full px-6 py-3.5 flex justify-between items-center gap-3 ring-1 ring-black/5 dark:ring-white/10 shadow-xs">
         <div className="flex items-center gap-4 min-w-0">
           <Button

@@ -31,6 +31,11 @@ declare module 'sql.js' {
     getRowsModified(): number;
     export(): Uint8Array;
     close(): void;
+    /**
+     * 注册自定义 SQL 函数（sql.js 运行时 API，官方 shim 未声明）。
+     * 本项目用它实现 PG 兼容的 `REGEXP` 操作符（见 db/index.ts initDatabase）。
+     */
+    create_function(name: string, func: (...args: any[]) => any): void;
   }
 
   export default function initSqlJs(config?: any): Promise<SqlJsStatic>;
