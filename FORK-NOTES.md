@@ -14,8 +14,11 @@ make_interval(secs=>) / date_trunc / to_char / ILIKE / FOR UPDATE / jsonb_*,而�
 | 缺口 | 上游用法 | 现象 |
 |---|---|---|
 | `expr ~ 'regex'` | 提醒历史 `trigger_date ~ '^[0-9]{4}-...'`、patterns 的 snooze 判定 | `near "~": syntax error` → `/api/events/reminder-logs` 500 |
+| `to_char(expr,'fmt')` | 提醒历史的时间格式化 | **上游有翻译规则但判据写错**(`/[A-Z]/` 恒真,见下)→ `no such function: to_char` |
+| `LEFT(x,n)` / `RIGHT(x,n)` | 提醒历史、stats-daily、features 路由的日期前缀截断 | `no such function: LEFT` |
 | `make_interval(days\|mins\|… => x)` | cadence 提醒、job-hardening、run-observability | 只翻 secs,其他单位残留 PG 语法 |
 | `LATERAL` | cadence 取最近一次互动、stats-daily、medication 的 `unnest`、todos 的 `generate_series` | `near "SELECT": syntax error`,cadence 提醒每轮报错 |
+| `array_agg(x ORDER BY y)` | data-health 重名联系人分组 | `no such function: array_agg` |
 
 靠 docker 只读挂载逐个补 dist 是打地鼠,所以改为 fork 自维护、自己出镜像。
 
@@ -27,6 +30,15 @@ make_interval(secs=>) / date_trunc / to_char / ILIKE / FOR UPDATE / jsonb_*,而�
    - `convertPgToSqliteInner()` 新增:
      - `make_interval(<unit> => expr)` 全单位翻译(mins/minutes/hours/days/weeks/months/years)
      - `expr ~ 'p'` → `expr REGEXP 'p'`,`!~` → `NOT REGEXP`(先匹配 `!~`,否则被吃成 `!REGEXP`)
+     - `LEFT(x,n)` → `substr(x,1,n)`、`RIGHT(x,n)` → `substr(x,-1*(n))`
+     - `array_agg(x [ORDER BY y])` → `json_group_array(x)`
+   - `convertPgFunctionToSqlite()` 的 `to_char` 判据修正:
+     上游写 `if (/[A-Z]/.test(f)) return m`,但 strftime 指令本身就是 `%Y/%m/%d/%H`
+     **大写**,判据恒真 → to_char 从来没被翻译过。改为先 `f.replace(/%[A-Za-z]/g,'')`
+     再判残留字母。
+   - 新增 PG 残留语法探测(只告警不改写):翻译后若仍含 `LATERAL` / `unnest(` /
+     `generate_series(` / `make_interval(` / `::type` / ` ~ ` 等,按唯一 SQL 打一次
+     `[db] 翻译后仍含 PG 专属语法`,下次缺口不用再翻 500 栈。
    - **配套**:`backend/src/types/sql.js.d.ts` 补 `create_function` 声明(官方 shim 缺)。
 
 2. **`backend/src/jobs/tasks.ts`**(cadence)
@@ -35,13 +47,20 @@ make_interval(secs=>) / date_trunc / to_char / ILIKE / FOR UPDATE / jsonb_*,而�
    - `COALESCE(...) + make_interval(days => fc.cadence_days)` →
      `datetime(COALESCE(...), '+' || fc.cadence_days || ' days')`。
 
-3. **`frontend/src/components/layout/PageHeader.tsx`**
+3. **`backend/src/services/event.service.ts`**(农历)
+   - 3 处 `JSON.parse(row.lunar_date)` 加类型守卫:sql.js 适配层的 `normalizeJsonOut()`
+     已把 JSON 列解析成对象(node-pg 的 jsonb 语义),二次 parse 会抛错并被 catch 吞掉 →
+     `lunarDate` 丢失 → 农历标签消失、编辑保存后 `next_occurrence` 按公历漂移。
+
+4. **`frontend/src/components/layout/PageHeader.tsx`**
    - `<header>` 加 `mt-6`:原布局里 header 是 `sticky top-6` 但流内盒在 y=0,
      视觉下移 24px 压住了紧邻内容,导致页面头部胶囊与首屏卡片间距为 0。加 mt-6 后
      静态位置与吸附位置一致,下方内容自然让出 24px。
 
-4. **`Dockerfile.our`**
+5. **`Dockerfile.our`**
    - `NPM_REGISTRY` 构建参数(默认 npmmirror,容器内直连 npmjs 会超时)
+   - apk 源换 aliyun(`dl-cdn.alpinelinux.org` 在本机 TLS 不通)
+   - 补 `addgroup -S app && adduser -S app -G app`(上游有,漏写则 chown 失败)
    - CMD 修正:`./backend/dist/backend/src/index.js`(不存在)→ `./backend/dist/index.js`
 
 ## 构建与部署
