@@ -41,25 +41,32 @@ todos.get('/stats', async (c) => {
   const userId = Number(c.get('user').id);
   const { query } = await import('../db/index.js');
   const result = await query(
-    `WITH due AS (
-       SELECT e.id AS event_id, d::date AS occurrence_date
+    // SQLite 版：上游用 `CROSS JOIN LATERAL generate_series(CURRENT_DATE-29, CURRENT_DATE, 1 day)`
+    // 生成近 30 天的日期序列。SQLite 没有 generate_series，改用递归 CTE 生成同一序列；
+    // `d::date` 直接就是 'YYYY-MM-DD' 文本，`e.date::date` → date(e.date)，
+    // `->> '...'::boolean IS TRUE` → json_extract 取布尔（JSON true → 1）。
+    `WITH RECURSIVE days(d) AS (
+       SELECT date('now', 'localtime', '-29 day')
+       UNION ALL
+       SELECT date(d, '+1 day') FROM days WHERE d < date('now', 'localtime')
+     ),
+     due AS (
+       SELECT e.id AS event_id, days.d AS occurrence_date
        FROM events e
-       CROSS JOIN LATERAL generate_series(
-         CURRENT_DATE - 29, CURRENT_DATE, INTERVAL '1 day'
-       ) AS d
+       CROSS JOIN days
        WHERE e.user_id = $1
-         AND e.date::date <= d::date
+         AND date(e.date) <= days.d
          -- 口径：一次性事件只在其日期当天应完成；daily 循环事件每天应完成；
          -- 其他循环频率近似只按事件日期计（略低估，不虚高分母）。
          AND (
-           d::date = e.date::date
-           OR ((e.recurring_config ->> 'enabled')::boolean IS TRUE
-               AND e.recurring_config ->> 'frequency' = 'daily')
+           days.d = date(e.date)
+           OR (json_extract(e.recurring_config, '$.enabled') = 1
+               AND json_extract(e.recurring_config, '$.frequency') = 'daily')
          )
      )
      SELECT
-       (SELECT COUNT(*)::int FROM due) AS expected,
-       (SELECT COUNT(*)::int FROM due
+       (SELECT COUNT(*) FROM due) AS expected,
+       (SELECT COUNT(*) FROM due
           JOIN todo_completions tc
             ON tc.event_id = due.event_id
            AND tc.occurrence_date = due.occurrence_date

@@ -245,89 +245,219 @@ export async function deleteMedication(userId: number, id: number): Promise<bool
 /* ------------------------------------------------------------------ */
 
 /**
- * 为某一天物化剂量（幂等）：每个 schedule_times 生成一�?pending�? * 时区取档案优先、否则用户时区。`schedule_days` �?/ 起止日期外的药品不生成�? * 返回新插入的行数（已存在的不计）�? */
-export async function materializeDosesForDate(targetYmd: string, userId?: number): Promise<number> {
-  const result = await query(
-    `INSERT INTO medication_doses (medication_id, user_id, scheduled_for, status)
-     SELECT m.id, m.user_id,
-            (($1::date + t.time::time) AT TIME ZONE COALESCE(p.timezone, uc.timezone, $3)) AS scheduled_for,
-            'pending'
+ * 用药剂量物化 / 补记 missed（SQLite 版）
+ *
+ * 上游 docker 版这三段是 PostgreSQL 专用语法：`CROSS JOIN LATERAL unnest(schedule_times)`
+ * 展开时刻、`generate_series` 展开日期、`(ymd + time) AT TIME ZONE tz` 换算绝对时刻。
+ * SQLite 三者都没有，所以把「展开」与「墙钟 → 绝对时刻」搬到 JS：数据量很小
+ * （药品数 × 时间点数 × 天数），每剂一次 INSERT，幂等仍由
+ * UNIQUE(medication_id, scheduled_for) 保证。
+ */
+
+/** 某时区在某绝对时刻的 UTC 偏移（毫秒）。用 Intl 反解，避开夏令时手算。 */
+function zonedOffsetMs(instant: Date, timeZone: string): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).formatToParts(instant);
+  const pick = (type: string): number => Number(parts.find((item) => item.type === type)?.value ?? '0');
+  const hour = pick('hour') % 24; // en-US 在午夜可能给 24
+  const asUtc = Date.UTC(pick('year'), pick('month') - 1, pick('day'), hour, pick('minute'), pick('second'));
+  return asUtc - Math.floor(instant.getTime() / 1000) * 1000;
+}
+
+/** 「某时区的 ymd + HH:mm 墙钟」→ 绝对时刻，等价 PG 的 `(ymd + time) AT TIME ZONE tz`。 */
+function wallClockToInstant(ymd: string, hhmm: string, timeZone: string): Date | null {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const [hh, mi] = hhmm.split(':').map(Number);
+  if (![y, m, d, hh, mi].every((v) => Number.isFinite(v))) return null;
+  if (hh < 0 || hh > 23 || mi < 0 || mi > 59) return null;
+  const guess = Date.UTC(y, m - 1, d, hh, mi, 0);
+  let ts = guess - zonedOffsetMs(new Date(guess), timeZone);
+  ts = guess - zonedOffsetMs(new Date(ts), timeZone); // 第二轮收敛夏令时边界
+  return new Date(ts);
+}
+
+/** ymd 的星期（0=周日，与 PG EXTRACT(DOW) 同口径） */
+function localDow(ymd: string): number | null {
+  const [y, m, d] = ymd.split('-').map(Number);
+  if (![y, m, d].every((v) => Number.isFinite(v))) return null;
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+}
+
+type MedRow = {
+  id: number;
+  user_id: number;
+  schedule_times: unknown;
+  schedule_days: unknown;
+  start_date: string | null;
+  end_date: string | null;
+  tz: string;
+};
+
+/** $TZ$ 占位符在调用处替换成实际参数位。 */
+function medSelectSql(userId?: number): { sql: string; params: Array<number | string> } {
+  const tzIndex = userId != null ? '$2' : '$1';
+  const sql =
+    `SELECT m.id, m.user_id, m.schedule_times, m.schedule_days, m.start_date, m.end_date,
+            COALESCE(NULLIF(p.timezone, ''), NULLIF(uc.timezone, ''), ${tzIndex}) AS tz
      FROM medications m
      LEFT JOIN user_configs uc ON uc.user_id = m.user_id
      LEFT JOIN profiles p ON p.id = m.profile_id
-     CROSS JOIN LATERAL unnest(m.schedule_times) AS t(time)
-     WHERE m.is_active = TRUE
-       AND array_length(m.schedule_times, 1) IS NOT NULL
-       AND m.start_date <= $1::date
-       AND (m.end_date IS NULL OR m.end_date >= $1::date)
-       AND (m.schedule_days IS NULL OR EXTRACT(DOW FROM $1::date)::int = ANY (m.schedule_days))
-       AND ($2::int IS NULL OR m.user_id = $2)
+     WHERE m.is_active = TRUE` + (userId != null ? ' AND m.user_id = $1' : '');
+  return { sql, params: userId != null ? [userId, DEFAULT_TZ] : [DEFAULT_TZ] };
+}
+
+function parseTimes(raw: unknown): string[] {
+  let value: unknown = raw;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => String(item ?? '').trim())
+    .filter((item) => /^\d{1,2}:\d{2}$/.test(item))
+    .map((item) => (item.length === 4 ? `0${item}` : item));
+}
+
+function parseDays(raw: unknown): number[] | null {
+  let value: unknown = raw;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  if (!Array.isArray(value)) return null;
+  const days = value.map((item) => Number(item)).filter((item) => Number.isInteger(item));
+  return days.length ? days : null;
+}
+
+async function insertDose(medicationId: number, medUserId: number, instant: Date): Promise<boolean> {
+  const result = await query(
+    `INSERT INTO medication_doses (medication_id, user_id, scheduled_for, status)
+     VALUES ($1, $2, $3, 'pending')
      ON CONFLICT (medication_id, scheduled_for) DO NOTHING
      RETURNING id`,
-    [targetYmd, userId ?? null, DEFAULT_TZ],
+    [medicationId, medUserId, instant],
   );
-  return result.rows.length;
+  return result.rows.length > 0;
 }
 
 /**
- * 每日物化：为每支药品在它自己的时区里物化「今�?.. 今天+daysAhead」的剂量
- * （默认覆盖今天与明天，供提醒�?/today 直接命中）。幂等：UNIQUE 冲突直接跳过�? * 若给�?userId，只处理该用户的药品�? */
-export async function materializeUpcomingDoses(userId?: number, daysAhead = 1): Promise<number> {
-  const result = await query(
-    `INSERT INTO medication_doses (medication_id, user_id, scheduled_for, status)
-     SELECT m.id, m.user_id,
-            (
-              (((now() AT TIME ZONE COALESCE(p.timezone, uc.timezone, $1))::date + g.n) + t.time::time)
-              AT TIME ZONE COALESCE(p.timezone, uc.timezone, $1)
-            ) AS scheduled_for,
-            'pending'
-     FROM medications m
-     LEFT JOIN user_configs uc ON uc.user_id = m.user_id
-     LEFT JOIN profiles p ON p.id = m.profile_id
-     CROSS JOIN generate_series(0, $2::int) AS g(n)
-     CROSS JOIN LATERAL unnest(m.schedule_times) AS t(time)
-     WHERE m.is_active = TRUE
-       AND array_length(m.schedule_times, 1) IS NOT NULL
-       AND m.start_date <= ((now() AT TIME ZONE COALESCE(p.timezone, uc.timezone, $1))::date + g.n)
-       AND (m.end_date IS NULL OR m.end_date >= ((now() AT TIME ZONE COALESCE(p.timezone, uc.timezone, $1))::date + g.n))
-       AND (m.schedule_days IS NULL OR EXTRACT(DOW FROM ((now() AT TIME ZONE COALESCE(p.timezone, uc.timezone, $1))::date + g.n))::int = ANY (m.schedule_days))
-       AND ($3::int IS NULL OR m.user_id = $3)
-     ON CONFLICT (medication_id, scheduled_for) DO NOTHING
-     RETURNING id`,
-    [DEFAULT_TZ, Math.max(0, Math.trunc(daysAhead)), userId ?? null],
-  );
-  return result.rows.length;
+ * 为某一天物化剂量（幂等）：每个 schedule_times 生成一剂 pending。
+ * 时区取档案优先、否则用户时区；schedule_days / 起止日期外的药品不生成。
+ * 返回新插入的行数（已存在的不计）。
+ */
+export async function materializeDosesForDate(targetYmd: string, userId?: number): Promise<number> {
+  const { sql, params } = medSelectSql(userId);
+  const result = await query(sql, params);
+  const dow = localDow(targetYmd);
+  let inserted = 0;
+  for (const row of result.rows as MedRow[]) {
+    const times = parseTimes(row.schedule_times);
+    if (!times.length) continue;
+    if (row.start_date && targetYmd < row.start_date) continue;
+    if (row.end_date && targetYmd > row.end_date) continue;
+    const days = parseDays(row.schedule_days);
+    if (days && (dow == null || !days.includes(dow))) continue;
+    const tz = row.tz || DEFAULT_TZ;
+    for (const time of times) {
+      const instant = wallClockToInstant(targetYmd, time, tz);
+      if (instant && (await insertDose(row.id, row.user_id, instant))) inserted += 1;
+    }
+  }
+  return inserted;
 }
 
-/** 365 天剂量历史保留（�?todo_completions / habit_logs 一致），由 daily-maintenance 调用 */
+/**
+ * 每日物化：为每支药品在它自己的时区里物化「今天 … 今天+daysAhead」的剂量
+ * （默认覆盖今天与明天，供提醒与 /today 直接命中）。幂等：UNIQUE 冲突直接跳过。
+ */
+export async function materializeUpcomingDoses(userId?: number, daysAhead = 1): Promise<number> {
+  const { sql, params } = medSelectSql(userId);
+  const result = await query(sql, params);
+  const now = new Date();
+  const horizon = Math.max(0, Math.trunc(daysAhead));
+  let inserted = 0;
+  for (const row of result.rows as MedRow[]) {
+    const times = parseTimes(row.schedule_times);
+    if (!times.length) continue;
+    const tz = row.tz || DEFAULT_TZ;
+    const today = localTodayYmd(now, tz);
+    const days = parseDays(row.schedule_days);
+    for (let offset = 0; offset <= horizon; offset += 1) {
+      const ymd = shiftCalendarDays(today, offset);
+      if (!ymd) continue;
+      if (row.start_date && ymd < row.start_date) continue;
+      if (row.end_date && ymd > row.end_date) continue;
+      if (days) {
+        const dow = localDow(ymd);
+        if (dow == null || !days.includes(dow)) continue;
+      }
+      for (const time of times) {
+        const instant = wallClockToInstant(ymd, time, tz);
+        if (instant && (await insertDose(row.id, row.user_id, instant))) inserted += 1;
+      }
+    }
+  }
+  return inserted;
+}
+
+/** 365 天剂量历史保留（与 todo_completions / habit_logs 一致），由 daily-maintenance 调用 */
 export async function purgeOldMedicationDoses(retentionDays = 365): Promise<number> {
   const result = await query(
-    `DELETE FROM medication_doses WHERE scheduled_for < now() - ($1::int * interval '1 day')`,
+    `DELETE FROM medication_doses
+      WHERE scheduled_for < datetime('now', '-' || $1 || ' days')`,
     [Math.max(1, Math.trunc(retentionDays))],
   );
   return result.rowCount ?? 0;
 }
 
 /**
- * 每日收尾：把「所属用户时区里今天已经开始」之前仍 pending 的剂量补记为 missed�? * 今天尚未结束（用户本地当天）�?pending 不处理，提醒仍有机会发出�? */
+ * 每日收尾：把「所属用户时区里今天已经开始」之前仍 pending 的剂量补记为 missed。
+ * 今天尚未结束（用户本地当天）的 pending 不处理，提醒仍有机会发出。
+ */
 export async function markMissedDoses(): Promise<number> {
-  const result = await query(
-    `UPDATE medication_doses d
-     SET status = 'missed'
+  const tzResult = await query(
+    `SELECT DISTINCT COALESCE(NULLIF(p.timezone, ''), NULLIF(uc.timezone, ''), $1) AS tz
      FROM medications m
      LEFT JOIN user_configs uc ON uc.user_id = m.user_id
      LEFT JOIN profiles p ON p.id = m.profile_id
-     WHERE d.medication_id = m.id
-       AND d.status = 'pending'
-       AND d.scheduled_for < (
-         date_trunc('day', now() AT TIME ZONE COALESCE(p.timezone, uc.timezone, $1))
-         AT TIME ZONE COALESCE(p.timezone, uc.timezone, $1)
-       )
-     RETURNING d.id`,
+     WHERE m.is_active = TRUE`,
     [DEFAULT_TZ],
   );
-  return result.rows.length;
+  const now = new Date();
+  let total = 0;
+  for (const row of tzResult.rows as Array<{ tz: string }>) {
+    const tz = row.tz || DEFAULT_TZ;
+    const midnight = wallClockToInstant(localTodayYmd(now, tz), '00:00', tz);
+    if (!midnight) continue;
+    const result = await query(
+      `UPDATE medication_doses SET status = 'missed'
+        WHERE status = 'pending'
+          AND scheduled_for < $1
+          AND medication_id IN (
+            SELECT m.id FROM medications m
+            LEFT JOIN user_configs uc ON uc.user_id = m.user_id
+            LEFT JOIN profiles p ON p.id = m.profile_id
+            WHERE m.is_active = TRUE
+              AND COALESCE(NULLIF(p.timezone, ''), NULLIF(uc.timezone, ''), $2) = $3
+          )`,
+      [midnight, DEFAULT_TZ, tz],
+    );
+    total += result.rowCount ?? 0;
+  }
+  return total;
 }
+
 
 /**
  * 「今天」的剂量：先幂等物化今天，再按时区窗口取回（含药品摘要），按时间升序�? */
@@ -340,19 +470,22 @@ export async function getTodayDoses(
   const today = localTodayYmd(now, timeZone);
   await materializeDosesForDate(today, userId);
 
-  const params: unknown[] = [userId, timeZone];
+  // SQLite 无 AT TIME ZONE：本地日窗口边界在 JS 里算成绝对时刻再传参。
+  const dayStart = wallClockToInstant(today, '00:00', timeZone);
+  const dayEnd = wallClockToInstant(shiftCalendarDays(today, 1) ?? today, '00:00', timeZone);
+  const params: unknown[] = [userId, dayStart, dayEnd];
   let profileClause = '';
   if (opts.profileId != null) {
     params.push(opts.profileId);
-    profileClause = ' AND m.profile_id = $3';
+    profileClause = ' AND m.profile_id = $4';
   }
   const result = await query(
     `SELECT d.*, m.name, m.dosage, m.form, m.units_per_dose, m.stock_unit, m.is_critical, m.profile_id
      FROM medication_doses d
      JOIN medications m ON m.id = d.medication_id
      WHERE d.user_id = $1
-       AND d.scheduled_for >= (date_trunc('day', now() AT TIME ZONE $2) AT TIME ZONE $2)
-       AND d.scheduled_for < ((date_trunc('day', now() AT TIME ZONE $2) + interval '1 day') AT TIME ZONE $2)
+       AND d.scheduled_for >= $2
+       AND d.scheduled_for < $3
        ${profileClause}
      ORDER BY d.scheduled_for ASC, d.id ASC`,
     params,
@@ -524,21 +657,23 @@ export async function getAdherence(
   opts: { profileId?: number | null } = {},
 ): Promise<AdherenceReport> {
   const timeZone = await getMedicationTimezone(userId, opts.profileId ?? null);
-  const params: unknown[] = [userId, timeZone, from, to];
+  // SQLite 无 AT TIME ZONE：本地日窗口边界在 JS 里算成绝对时刻；
+  // 剂量所属「本地日」也在 JS 里按 tz 归算（等价 PG 的 `(scheduled_for AT TIME ZONE tz)::date`）。
+  const fromInstant = wallClockToInstant(from, '00:00', timeZone);
+  const toInstant = wallClockToInstant(shiftCalendarDays(to, 1) ?? to, '00:00', timeZone);
+  const params: unknown[] = [userId, fromInstant, toInstant];
   let profileClause = '';
   if (opts.profileId != null) {
     params.push(opts.profileId);
-    profileClause = ' AND m.profile_id = $5';
+    profileClause = ' AND m.profile_id = $4';
   }
   const result = await query(
-    `SELECT d.medication_id, m.name,
-            to_char((d.scheduled_for AT TIME ZONE $2)::date, 'YYYY-MM-DD') AS dose_date,
-            d.status
+    `SELECT d.medication_id, m.name, d.scheduled_for, d.status
      FROM medication_doses d
      JOIN medications m ON m.id = d.medication_id
      WHERE d.user_id = $1
-       AND d.scheduled_for >= ($3::date AT TIME ZONE $2)
-       AND d.scheduled_for < (($4::date + interval '1 day') AT TIME ZONE $2)
+       AND d.scheduled_for >= $2
+       AND d.scheduled_for < $3
        ${profileClause}
      ORDER BY d.medication_id ASC, d.scheduled_for ASC`,
     params,
@@ -551,7 +686,9 @@ export async function getAdherence(
   for (const row of result.rows as Raw[]) {
     const medicationId = Number(row.medication_id);
     const name = String(row.name ?? '');
-    const date = parseYmdText(row.dose_date);
+    const scheduledText = parseIsoText(row.scheduled_for);
+    const scheduledAt = scheduledText ? new Date(scheduledText) : null;
+    const date = scheduledAt && !Number.isNaN(scheduledAt.getTime()) ? localTodayYmd(scheduledAt, timeZone) : null;
     const status = String(row.status ?? 'pending');
     if (!date) continue;
 
@@ -603,34 +740,42 @@ export async function getAdherenceDaily(
   opts: { profileId?: number | null } = {},
 ): Promise<AdherenceDailyPoint[]> {
   const timeZone = await getMedicationTimezone(userId, opts.profileId ?? null);
-  const params: unknown[] = [userId, timeZone, from, to];
+  const fromInstant = wallClockToInstant(from, '00:00', timeZone);
+  const toInstant = wallClockToInstant(shiftCalendarDays(to, 1) ?? to, '00:00', timeZone);
+  const params: unknown[] = [userId, fromInstant, toInstant];
   let profileClause = '';
   if (opts.profileId != null) {
     params.push(opts.profileId);
-    profileClause = ' AND m.profile_id = $5';
+    profileClause = ' AND m.profile_id = $4';
   }
+  // 逐行取回后在 JS 里按「本地日」分桶（SQLite 无法在 SQL 内做时区归日）
   const result = await query(
-    `SELECT to_char((d.scheduled_for AT TIME ZONE $2)::date, 'YYYY-MM-DD') AS dose_date,
-            COUNT(*) FILTER (WHERE d.status = 'taken')::int AS taken,
-            COUNT(*) FILTER (WHERE d.status = 'skipped')::int AS skipped,
-            COUNT(*) FILTER (WHERE d.status = 'missed')::int AS missed
+    `SELECT d.scheduled_for, d.status
      FROM medication_doses d
      JOIN medications m ON m.id = d.medication_id
      WHERE d.user_id = $1
-       AND d.scheduled_for >= ($3::date AT TIME ZONE $2)
-       AND d.scheduled_for < (($4::date + interval '1 day') AT TIME ZONE $2)
+       AND d.scheduled_for >= $2
+       AND d.scheduled_for < $3
        AND d.status IN ('taken', 'skipped', 'missed')
-       ${profileClause}
-     GROUP BY 1
-     ORDER BY 1 ASC`,
+       ${profileClause}`,
     params,
   );
-  return (result.rows as Raw[]).map((row) => ({
-    date: parseYmdText(row.dose_date) ?? '',
-    taken: Number(row.taken ?? 0),
-    skipped: Number(row.skipped ?? 0),
-    missed: Number(row.missed ?? 0),
-  }));
+  const buckets = new Map<string, { taken: number; skipped: number; missed: number }>();
+  for (const row of result.rows as Raw[]) {
+    const scheduledText = parseIsoText(row.scheduled_for);
+    if (!scheduledText) continue;
+    const scheduledAt = new Date(scheduledText);
+    if (Number.isNaN(scheduledAt.getTime())) continue;
+    const day = localTodayYmd(scheduledAt, timeZone);
+    const status = String(row.status ?? '');
+    if (status !== 'taken' && status !== 'skipped' && status !== 'missed') continue;
+    const bucket = buckets.get(day) ?? { taken: 0, skipped: 0, missed: 0 };
+    bucket[status] += 1;
+    buckets.set(day, bucket);
+  }
+  return [...buckets.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([day, bucket]) => ({ date: day, ...bucket }));
 }
 
 /* ------------------------------------------------------------------ */
