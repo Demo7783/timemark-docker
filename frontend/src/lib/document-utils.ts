@@ -60,6 +60,7 @@ export const DOCUMENT_KIND_LABELS: Record<string, string> = {
   certificate: '证明',
   policy: '保单',
   contract: '合同',
+  bank_card: '银行卡',
   other: '其它',
 };
 

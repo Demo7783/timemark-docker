@@ -2,7 +2,11 @@
  * 证件与文档（D2 证件保险箱）— Zod 校验与类型
  *
  * 领域：护照 (passport)、身份证 (id_card)、驾照 (driver_license)、签证 (visa)、
- * 证明 (certificate)、保单 (policy)、合同 (contract)、其它 (other)。
+ * 证明 (certificate)、保单 (policy)、合同 (contract)、银行卡 (bank_card)、其它 (other)。
+ *
+ * `bank_card` 为本 fork 增补（v82 迁移重建 documents 表放开 kind CHECK）。
+ * 只存卡号/发卡行/有效期等**非密码**信息；取款密码、CVV、网银密码一律不进本表
+ * （密码归 KeePass，本表只做载体归属与到期提醒）。
  *
  * `documentNumber` 永不落库明文：服务端用 `@timemark/shared/crypto` 的 AES-256-GCM
  * 加密为 `document_number_encrypted`（与通知凭证同一套 MASTER_KEY 约定）。
@@ -23,6 +27,7 @@ export const DOCUMENT_KINDS = [
   'certificate',
   'policy',
   'contract',
+  'bank_card',
   'other',
 ] as const;
 export type DocumentKind = (typeof DOCUMENT_KINDS)[number];

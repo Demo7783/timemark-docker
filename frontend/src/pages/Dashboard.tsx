@@ -12,7 +12,7 @@ import { TimezoneSelector } from '@/components/TimezoneSelector';
 import { ProfileSwitcher } from '@/components/ProfileSwitcher';
 import { useProfileStore } from '@/stores/profile.store';
 import type { Event, CreateEventRequest } from '@timemark/shared';
-import { Settings, Bell, Plus, Download, Calendar, BarChart2, ListChecks, Shield, Upload, Users, Mail, Inbox, AlarmClock, Package, Wrench, Target } from 'lucide-react';
+import { Settings, Bell, Plus, Download, Calendar, BarChart2, ListChecks, Shield, Upload, Users, Mail, Inbox, AlarmClock, Package, Wrench, Target, FileText } from 'lucide-react';
 import { MobileBottomNav } from '@/components/MobileBottomNav';
 import { Skeleton } from '@/components/ui/skeleton-card';
 import { api } from '@/lib/api';
@@ -373,6 +373,17 @@ export function Dashboard() {
           >
             <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1"><Target size={12} />目标</p>
             <p className="text-sm font-medium text-violet-600">管理 →</p>
+          </div>
+          <div
+            className="glass-panel rounded-2xl p-4 cursor-pointer hover:ring-2 hover:ring-cyan-400/50 transition"
+            onClick={() => navigate('/documents')}
+            role="button"
+            tabIndex={0}
+            data-testid="nav-documents"
+            onKeyDown={(e) => e.key === 'Enter' && navigate('/documents')}
+          >
+            <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1"><FileText size={12} />证件</p>
+            <p className="text-sm font-medium text-cyan-600">管理 →</p>
           </div>
         </div>
         <div className="mb-6">

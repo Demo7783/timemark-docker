@@ -2450,6 +2450,47 @@ CREATE INDEX IF NOT EXISTS idx_trigger_user_created ON event_trigger_logs(user_i
         await tryExec('v81 user_configs.digest_weekly_time', `ALTER TABLE user_configs ADD COLUMN digest_weekly_time TEXT NOT NULL DEFAULT '09:00'`);
       },
     },
+    {
+      // v82（本 fork 增补，非上游）: 证件类型放开 `bank_card`。
+      //
+      // 上游 documents.kind 的 CHECK 只有 8 个值，没有银行卡。SQLite 无法修改已有
+      // CHECK 约束，只能重建表（官方 12-step 的简化版：建新表 → 显式列拷贝 → 删旧 →
+      // 改名 → 重建索引）。显式列名而不是 `SELECT *`，避免列顺序漂移导致串列。
+      //
+      // 语义边界：本表只存卡号/发卡行/有效期等非密码信息，卡号仍走
+      // document_number_encrypted（AES-256-GCM）。取款密码、CVV、网银密码一律归
+      // KeePass，不写入本表。
+      version: 82,
+      name: 'documents_bank_card_v82',
+      sql: `CREATE TABLE IF NOT EXISTS documents_v82 (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  profile_id INTEGER,
+  kind TEXT NOT NULL CHECK (kind IN ('passport', 'id_card', 'driver_license', 'visa', 'certificate', 'policy', 'contract', 'other', 'bank_card')),
+  title TEXT NOT NULL,
+  issuer TEXT,
+  document_number_encrypted TEXT,
+  issued_at TEXT,
+  expires_at TEXT,
+  country TEXT,
+  notes TEXT,
+  reminder_config TEXT,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+INSERT OR IGNORE INTO documents_v82
+  (id, user_id, profile_id, kind, title, issuer, document_number_encrypted,
+   issued_at, expires_at, country, notes, reminder_config, is_active, created_at, updated_at)
+SELECT id, user_id, profile_id, kind, title, issuer, document_number_encrypted,
+       issued_at, expires_at, country, notes, reminder_config, is_active, created_at, updated_at
+FROM documents;
+DROP TABLE documents;
+ALTER TABLE documents_v82 RENAME TO documents;
+CREATE INDEX IF NOT EXISTS idx_documents_user_expires ON documents(user_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_documents_user_kind ON documents(user_id, kind);
+CREATE INDEX IF NOT EXISTS idx_documents_active_expires ON documents(user_id, expires_at) WHERE is_active = 1;`,
+    },
   ];
 
   for (const migration of migrations) {
