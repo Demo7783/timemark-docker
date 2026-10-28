@@ -63,6 +63,24 @@ make_interval(secs=>) / date_trunc / to_char / ILIKE / FOR UPDATE / jsonb_*,而�
    - 补 `addgroup -S app && adduser -S app -G app`(上游有,漏写则 chown 失败)
    - CMD 修正:`./backend/dist/backend/src/index.js`(不存在)→ `./backend/dist/index.js`
 
+6. **`backend/src/services/stats-daily.service.ts`**
+   - `LEFT JOIN LATERAL (...)` → 先按 `user_id` 聚合的派生表 + `ON t.user_id = u.id`；
+     `CURRENT_DATE` → `date('now','localtime')`，`LEFT(trigger_date,10)` → `substr(...)`。
+
+7. **`backend/src/routes/todos.ts`**
+   - `CROSS JOIN LATERAL generate_series(..., INTERVAL '1 day')` → 递归 CTE `days(d)`；
+     `d::date`/`e.date::date` → `days.d` / `date(e.date)`；
+     `->> 'enabled'::boolean IS TRUE` → `json_extract(e.recurring_config,'$.enabled') = 1`。
+
+8. **`backend/src/services/medication.service.ts`**
+   - 三个物化/补记函数 + 两个依从性查询全部去掉 PG-only 语法：
+     `CROSS JOIN LATERAL unnest(schedule_times)`、`generate_series`、`AT TIME ZONE`、
+     `array_length`、`ANY(schedule_days)`、`to_char(... AT TIME ZONE ...)`。
+   - 新增 `zonedOffsetMs()` / `wallClockToInstant()` / `localDow()`：用 Intl 反解时区偏移，
+     把「本地墙钟 + tz」换成绝对时刻（等价 PG `AT TIME ZONE`）；展开在 JS 完成，
+     幂等仍靠 `UNIQUE(medication_id, scheduled_for)`。
+   - 依从性的「所属本地日」也在 JS 归算（SQLite 无法在 SQL 内做时区归日）。
+
 ## 构建与部署
 
 ```sh
